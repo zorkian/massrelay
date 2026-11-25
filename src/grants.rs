@@ -43,6 +43,12 @@ pub struct Access {
     pub target: Option<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RemovedGrant {
+    Persistent,
+    Exposure,
+}
+
 impl Grants {
     pub fn access(&self, peer: EndpointId, service: Service, generation: u64) -> Option<Access> {
         let (grant, target) = match self.exposed.get(&(peer, service)) {
@@ -127,33 +133,49 @@ impl Grants {
     }
 
     /// End one exposure, leaving any grant that has since replaced it.
-    pub fn withdraw(&mut self, peer: EndpointId, service: Service, instance: u64) {
+    pub fn withdraw(&mut self, peer: EndpointId, service: Service, instance: u64) -> bool {
         if self.is_exposed(peer, service, instance) {
-            self.exposed.remove(&(peer, service));
+            return self.exposed.remove(&(peer, service)).is_some();
         }
+        false
     }
 
-    /// Remove either kind of grant. Returns whether saved state changed.
-    pub fn disable(&mut self, peer: EndpointId, service: Service) -> bool {
-        self.exposed.remove(&(peer, service));
-        let Some(services) = self.persistent.get_mut(&peer) else {
-            return false;
-        };
+    pub fn disable(&mut self, peer: EndpointId, service: Service) -> Option<RemovedGrant> {
+        if self.exposed.remove(&(peer, service)).is_some() {
+            return Some(RemovedGrant::Exposure);
+        }
+        let services = self.persistent.get_mut(&peer)?;
         let removed = services.remove(&service).is_some();
         if services.is_empty() {
             self.persistent.remove(&peer);
         }
-        removed
+        removed.then_some(RemovedGrant::Persistent)
     }
 
     /// Drop every grant for which the peer and pairing generation are no longer current.
-    pub fn retain(&mut self, current: impl Fn(EndpointId, u64) -> bool) {
+    pub fn retain(
+        &mut self,
+        current: impl Fn(EndpointId, u64) -> bool,
+    ) -> Vec<(EndpointId, Service, RemovedGrant)> {
+        let mut removed = Vec::new();
         self.persistent.retain(|peer, services| {
-            services.retain(|_, grant| current(*peer, grant.generation));
+            services.retain(|service, grant| {
+                let keep = current(*peer, grant.generation);
+                if !keep {
+                    removed.push((*peer, *service, RemovedGrant::Persistent));
+                }
+                keep
+            });
             !services.is_empty()
         });
-        self.exposed
-            .retain(|(peer, _), exposure| current(*peer, exposure.grant.generation));
+        self.exposed.retain(|(peer, service), exposure| {
+            let keep = current(*peer, exposure.grant.generation);
+            if !keep {
+                removed.push((*peer, *service, RemovedGrant::Exposure));
+            }
+            keep
+        });
+        removed
     }
 
     /// Every grant, ordered by service, then peer name, then endpoint ID.

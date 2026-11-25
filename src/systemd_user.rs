@@ -91,7 +91,7 @@ pub fn install(dir: &Path) -> Result<()> {
         return Err(error);
     }
     println!("Started {unit}");
-    println!("Connection log  {}", log.display());
+    println!("Event log       {}", log.display());
     println!("Service log     journalctl --user -u {unit}");
     Ok(())
 }

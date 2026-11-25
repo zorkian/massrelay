@@ -27,7 +27,7 @@ use tokio::{
 use crate::{
     bind_endpoint,
     connection_log::{ConnectionLog, Direction, Session},
-    grants::{Access, Grants},
+    grants::{Access, Grants, RemovedGrant},
     local, storage, tcp, terminal, tunnel, udp,
     wire::{
         self, Decision, LocalReply, LocalRequest, Member, Peer, Refusal, Reply, Request, Roster,
@@ -126,15 +126,19 @@ struct Device {
 impl Device {
     /// Whether both devices currently approve this pairing generation.
     fn paired(&self, id: EndpointId, network: &str, generation: u64) -> bool {
-        !self.revoked
-            && self.roster.network == network
-            && self.approvals.get(&id) == Some(&generation)
+        self.roster.network == network
             && self.roster.peers.iter().any(|peer| {
                 peer.member.id == id
                     && peer.pair.generation == generation
-                    && peer.pair.ours == Some(Decision::Approve)
-                    && peer.pair.theirs == Some(Decision::Approve)
+                    && self.peer_is_paired(peer)
             })
+    }
+
+    fn peer_is_paired(&self, peer: &Peer) -> bool {
+        !self.revoked
+            && self.approvals.get(&peer.member.id) == Some(&peer.pair.generation)
+            && peer.pair.ours == Some(Decision::Approve)
+            && peer.pair.theirs == Some(Decision::Approve)
     }
 
     /// Both mutual pairing and a grant for this peer and service are required.
@@ -177,7 +181,7 @@ impl Device {
     }
 
     /// Forget grants made under a pairing that has since ended.
-    fn prune_grants(&mut self) {
+    fn prune_grants(&mut self) -> Vec<(EndpointId, Service, RemovedGrant)> {
         let (revoked, declines, peers) = (self.revoked, &self.pending_declines, &self.roster.peers);
         self.grants.retain(|id, generation| {
             !revoked
@@ -185,7 +189,7 @@ impl Device {
                 && peers
                     .iter()
                     .any(|peer| peer.member.id == id && peer.pair.generation == generation)
-        });
+        })
     }
 }
 
@@ -356,7 +360,8 @@ pub async fn run(
 ) -> Result<()> {
     let _lock = storage::lock(&dir)?;
     let mut device = load_device(&dir)?;
-    let connection_log = ConnectionLog::open(log_file.as_deref())?;
+    let log_file = log_file.unwrap_or_else(|| dir.join("connections.jsonl"));
+    let connection_log = ConnectionLog::open(Some(&log_file))?;
     let bind_device = |addr| {
         bind_endpoint(
             SecretKey::from_bytes(&device.identity.key),
@@ -393,6 +398,8 @@ pub async fn run(
         changed: watch::channel(()).0,
     });
     eprintln!("MassRelay running as {}", node.endpoint.id());
+    eprintln!("MassRelay event log at {}", log_file.display());
+    node.connection_log.state("device_started", None, None);
     let mut tasks = JoinSet::new();
     let sync_node = node.clone();
     tasks.spawn(async move {
@@ -439,6 +446,7 @@ pub async fn run(
     };
     node.endpoint.close().await;
     tasks.shutdown().await;
+    node.connection_log.state("device_stopped", None, None);
     result
 }
 
@@ -578,7 +586,7 @@ impl Node {
             }
             _ => bail!("unexpected membership reply"),
         }
-        next.prune_grants();
+        let removed = next.prune_grants();
         let changed = !same_membership(&state, &next)?;
         let saved = if changed || state.dirty {
             self.save_restrictions(&mut next)
@@ -590,6 +598,10 @@ impl Node {
             next.approvals
                 .retain(|id, generation| state.approvals.get(id) == Some(generation));
         }
+        if changed || !removed.is_empty() {
+            self.log_membership_changes(&state, &next);
+            self.log_pruned_grants(&state, removed);
+        }
         *state = next;
         if changed {
             self.changed.send_replace(());
@@ -597,6 +609,74 @@ impl Node {
         saved?;
         ensure!(!state.revoked, "this device has been revoked");
         Ok(())
+    }
+
+    fn log_membership_changes(&self, before: &Device, after: &Device) {
+        if after.revoked && !before.revoked {
+            self.connection_log.state("device_revoked", None, None);
+        }
+        let mut previous: BTreeMap<_, _> = before
+            .roster
+            .peers
+            .iter()
+            .map(|peer| (peer.member.id, peer))
+            .collect();
+        for peer in &after.roster.peers {
+            let id = peer.member.id;
+            let member = Some(&peer.member);
+            let old = previous.remove(&id);
+            if old.is_none() {
+                self.connection_log.state("peer_joined", member, None);
+            }
+            if let Some(decision) = peer.pair.theirs
+                && old.and_then(|peer| peer.pair.theirs) != Some(decision)
+            {
+                let event = match decision {
+                    Decision::Approve => "peer_approved",
+                    Decision::Decline => "peer_declined",
+                };
+                self.connection_log.state(event, member, None);
+            }
+            if after.approvals.get(&id) != before.approvals.get(&id)
+                && after.approvals.contains_key(&id)
+            {
+                self.connection_log.state("approval_granted", member, None);
+            }
+            match (
+                old.is_some_and(|peer| before.peer_is_paired(peer)),
+                after.peer_is_paired(peer),
+            ) {
+                (false, true) => self
+                    .connection_log
+                    .state("pairing_established", member, None),
+                (true, false) => self.connection_log.state("pairing_ended", member, None),
+                _ => {}
+            }
+        }
+        for peer in previous.into_values() {
+            let member = Some(&peer.member);
+            if before.peer_is_paired(peer) {
+                self.connection_log.state("pairing_ended", member, None);
+            }
+            self.connection_log.state("peer_removed", member, None);
+        }
+    }
+
+    fn log_removed_grant(&self, member: &Member, service: Service, grant: RemovedGrant) {
+        let event = match grant {
+            RemovedGrant::Persistent => "service_disabled",
+            RemovedGrant::Exposure => "exposure_ended",
+        };
+        self.connection_log
+            .state(event, Some(member), Some(service));
+    }
+
+    fn log_pruned_grants(&self, state: &Device, removed: Vec<(EndpointId, Service, RemovedGrant)>) {
+        for (id, service, grant) in removed {
+            if let Some(peer) = state.roster.peers.iter().find(|peer| peer.member.id == id) {
+                self.log_removed_grant(&peer.member, service, grant);
+            }
+        }
     }
 
     async fn lookup(&self, name: &str) -> Result<Peer> {
@@ -659,15 +739,22 @@ impl Node {
                 self.save_restrictions(&mut next)?;
                 *state = next;
             }
+            if added {
+                self.connection_log
+                    .state("service_enabled", Some(&member), Some(*service));
+            }
             return Ok(LocalReply::Done);
         }
         if let LocalRequest::Disable { service, peer } = &request {
-            let id = self.lookup(peer).await?.member.id;
+            let member = self.lookup(peer).await?.member;
             let mut state = self.state.lock().await;
             // Access closes now, even if saving fails.
-            let removed = state.grants.disable(id, *service);
+            let removed = state.grants.disable(member.id, *service);
+            if let Some(grant) = removed {
+                self.log_removed_grant(&member, *service, grant);
+            }
             self.changed.send_replace(());
-            if removed || state.dirty {
+            if removed == Some(RemovedGrant::Persistent) || state.dirty {
                 self.save_restrictions(&mut state)?;
             }
             return Ok(LocalReply::Done);
@@ -680,12 +767,24 @@ impl Node {
             let peer = self.lookup(peer).await?;
             let id = peer.member.id;
             let mut state = self.state.lock().await;
+            let was_paired = state.paired(id, &state.roster.network, peer.pair.generation);
             state.approvals.remove(&id);
+            if !state.pending_declines.contains_key(&id)
+                && peer.pair.ours != Some(Decision::Decline)
+            {
+                self.connection_log
+                    .state("approval_declined", Some(&peer.member), None);
+            }
+            if was_paired {
+                self.connection_log
+                    .state("pairing_ended", Some(&peer.member), None);
+            }
             state
                 .pending_declines
                 .entry(id)
                 .or_insert(peer.pair.generation);
-            state.prune_grants();
+            let removed = state.prune_grants();
+            self.log_pruned_grants(&state, removed);
             self.changed.send_replace(());
             self.save_restrictions(&mut state)?;
             return Ok(LocalReply::Done);
@@ -862,6 +961,8 @@ impl Node {
         let instance = state
             .grants
             .expose(member.id, &member.name, service, generation, target)?;
+        self.connection_log
+            .state("exposure_started", Some(&member), Some(service));
         Ok((member, instance))
     }
 
@@ -896,11 +997,12 @@ impl Node {
         }
         .await;
         // Every way out of the wait removes this grant and closes its sessions.
-        self.state
-            .lock()
-            .await
-            .grants
-            .withdraw(member.id, service, instance);
+        {
+            let mut state = self.state.lock().await;
+            if state.grants.withdraw(member.id, service, instance) {
+                self.log_removed_grant(&member, service, RemovedGrant::Exposure);
+            }
+        }
         self.changed.send_replace(());
         let reply = if stopped? {
             LocalReply::Done
@@ -1536,7 +1638,10 @@ mod grant_tests {
         });
         tokio::pin!(startup);
         assert!(poll_fn(|cx| Poll::Ready(startup.as_mut().poll(cx).is_pending())).await);
-        assert!(state.grants.disable(id, request.service));
+        assert_eq!(
+            state.grants.disable(id, request.service),
+            Some(RemovedGrant::Persistent)
+        );
         drop(state);
         assert_eq!(startup.await, Err(Refusal::ServiceNotEnabled));
         node.endpoint.close().await;

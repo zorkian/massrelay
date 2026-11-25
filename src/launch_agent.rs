@@ -100,7 +100,7 @@ pub fn install(dir: &Path) -> Result<()> {
         return Err(error);
     }
     println!("Loaded {} for this login session", job.label);
-    println!("Connection log  {}", job.events.display());
+    println!("Event log       {}", job.events.display());
     println!("Service log     {}", job.log.display());
     Ok(())
 }

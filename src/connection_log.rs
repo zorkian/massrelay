@@ -13,7 +13,7 @@ use chrono::{SecondsFormat, Utc};
 use iroh::EndpointId;
 use serde::Serialize;
 
-use crate::wire::Service;
+use crate::wire::{Member, Service};
 
 pub struct ConnectionLog {
     file: Option<Mutex<File>>,
@@ -31,13 +31,19 @@ pub enum Direction {
 struct Event<'a> {
     timestamp: String,
     pid: u32,
-    session: u64,
-    direction: Direction,
     event: &'static str,
     peer_id: Option<String>,
     peer_name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     service: Option<Service>,
+}
+
+#[derive(Serialize)]
+struct SessionEvent<'a> {
+    #[serde(flatten)]
+    details: Event<'a>,
+    session: u64,
+    direction: Direction,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -67,7 +73,7 @@ impl ConnectionLog {
                     opts.mode(0o600);
                 }
                 opts.open(path)
-                    .with_context(|| format!("open connection log {}", path.display()))
+                    .with_context(|| format!("open event log {}", path.display()))
                     .map(Mutex::new)
             })
             .transpose()?;
@@ -95,21 +101,52 @@ impl ConnectionLog {
         }
     }
 
-    fn write(&self, event: Event<'_>) {
-        let result = (|| -> Result<()> {
-            let mut line = serde_json::to_vec(&event)?;
-            line.push(b'\n');
-            match &self.file {
-                Some(file) => file
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("connection log lock poisoned"))?
-                    .write_all(&line)?,
-                None => io::stderr().lock().write_all(&line)?,
+    pub fn state(&self, event: &'static str, member: Option<&Member>, service: Option<Service>) {
+        self.write(Event::new(
+            event,
+            member.map(|member| member.id),
+            member.map(|member| member.name.as_str()),
+            service,
+        ));
+    }
+
+    fn write(&self, event: impl Serialize) {
+        let mut line = match serde_json::to_vec(&event) {
+            Ok(line) => line,
+            Err(error) => {
+                eprintln!("massrelay: could not serialize event: {error:#}");
+                return;
             }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            eprintln!("massrelay: could not write connection event: {error:#}");
+        };
+        line.push(b'\n');
+        if let Some(file) = &self.file {
+            let result = file
+                .lock()
+                .map_err(|_| anyhow::anyhow!("event log lock poisoned"))
+                .and_then(|mut file| file.write_all(&line).map_err(Into::into));
+            if let Err(error) = result {
+                eprintln!("massrelay: could not write event log: {error:#}");
+            }
+        }
+        // Keep events visible in the supervisor log even with a separate event file.
+        let _ = io::stderr().lock().write_all(&line);
+    }
+}
+
+impl<'a> Event<'a> {
+    fn new(
+        event: &'static str,
+        peer_id: Option<EndpointId>,
+        peer_name: Option<&'a str>,
+        service: Option<Service>,
+    ) -> Self {
+        Self {
+            timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            pid: std::process::id(),
+            event,
+            peer_id: peer_id.map(|id| id.to_string()),
+            peer_name,
+            service,
         }
     }
 }
@@ -140,15 +177,10 @@ impl Session<'_> {
     }
 
     fn record(&self, event: &'static str, reason: Option<&'static str>, exit_code: Option<i32>) {
-        self.log.write(Event {
-            timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-            pid: std::process::id(),
+        self.log.write(SessionEvent {
+            details: Event::new(event, self.peer_id, self.peer_name.as_deref(), self.service),
             session: self.id,
             direction: self.direction,
-            event,
-            peer_id: self.peer_id.map(|id| id.to_string()),
-            peer_name: self.peer_name.as_deref(),
-            service: self.service,
             reason,
             exit_code,
         });

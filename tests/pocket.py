@@ -224,18 +224,24 @@ def exercise(binary, root):
 
     def run_peer(name):
         # Explicit shell avoids invoking the host user's login startup files.
-        return start(name, "run", "--shell", "/bin/sh", "--bind", "127.0.0.1:0",
-                     "--log-file", str(root / f"{name}-connections.jsonl"))
+        opts = ("--log-file", str(root / f"{name}-connections.jsonl")) if name != "a" else ()
+        return start(name, "run", "--shell", "/bin/sh", "--bind", "127.0.0.1:0", *opts)
 
-    def connection_events(name):
-        data = (root / f"{name}-connections.jsonl").read_text()
+    def connection_events(name, supervisor=False):
+        if supervisor:
+            path = root / f"{name}.log"
+        elif name == "a":
+            path = root / name / "connections.jsonl"
+        else:
+            path = root / f"{name}-connections.jsonl"
+        data = path.read_text()
         assert "MASSRELAY_SMOKE" not in data
-        return [json.loads(line) for line in data.splitlines()]
+        return [json.loads(line) for line in data.splitlines() if not supervisor or line.startswith("{")]
 
-    def recorded_session(local, peer, direction, exit_code=None):
+    def recorded_session(local, peer, direction, exit_code=None, supervisor=False):
         events = [
-            event for event in connection_events(local)
-            if event["direction"] == direction
+            event for event in connection_events(local, supervisor)
+            if event.get("direction") == direction
             and event["peer_id"] == endpoint_id(peer)
             and event["peer_name"] == peer
         ]
@@ -456,7 +462,7 @@ def exercise(binary, root):
             reasons = {
                 (event["event"], event.get("reason"))
                 for event in connection_events(node)
-                if event["direction"] == direction and event.get("service") == one
+                if event.get("direction") == direction and event.get("service") == one
             }
             assert {("connected", None), ("disconnected", "grant_removed")} <= reasons, reasons
 
@@ -786,10 +792,25 @@ def exercise(binary, root):
             shell_refused(source, target, "service_not_enabled")
         for source, target in pairs:
             grant(target, source)
+        # Re-enabling the same grant does not record a state change a second time.
+        grant("b", "a")
+        for supervisor in (False, True):
+            events = connection_events("b", supervisor)
+            matches = [
+                event for event in events if event["event"] == "service_enabled"
+                and event["peer_id"] == endpoint_id("a") and event.get("service") == "shell"
+            ]
+            assert len(matches) == 1 and matches[0]["peer_name"] == "a", matches
+            assert any(event["event"] == "pairing_established" and event["peer_name"] == "a"
+                       for event in events)
         for source, target in pairs:
             terminal(source, target, True)
         eventually(lambda: recorded_session("a", "b", "outbound"), "outbound connection log")
         eventually(lambda: recorded_session("b", "a", "inbound", 7), "inbound connection log")
+        eventually(lambda: recorded_session("a", "b", "outbound", supervisor=True),
+                   "outbound session mirrored")
+        eventually(lambda: recorded_session("b", "a", "inbound", 7, supervisor=True),
+                   "inbound session mirrored")
         terminal("a", "c", False)
         terminal("c", "a", False)
 
@@ -800,6 +821,8 @@ def exercise(binary, root):
         terminal("a", "b", True)
         # Grants are local decisions, so they change while the relay is away.
         cli("b", "disable", "shell", "a")
+        assert any(event["event"] == "service_disabled" and event["peer_name"] == "a"
+                   and event.get("service") == "shell" for event in connection_events("b", True))
         shell_refused("a", "b", "service_not_enabled")
         grant("b", "a")
         terminal("a", "b", True)

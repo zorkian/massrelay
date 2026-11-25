@@ -97,7 +97,7 @@ enum Command {
         /// Use this shell executable instead of the account's default.
         #[arg(long)]
         shell: Option<PathBuf>,
-        /// Append connection events to this file. Defaults to stderr.
+        /// Append events to this file. Defaults to connections.jsonl in the device state directory.
         #[arg(long)]
         log_file: Option<PathBuf>,
         #[arg(long, default_value = "0.0.0.0:0")]
