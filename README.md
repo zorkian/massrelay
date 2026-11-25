@@ -4,7 +4,7 @@ MassRelay connects your own machines in a pocket network. Enrolled devices can s
 
 ## Install
 
-[MassRelay v0.3.8](https://github.com/zorkian/massrelay/releases/tag/v0.3.8) makes the service list easier to read. If you're upgrading from v0.2.0 or earlier, see [the upgrade instructions](#upgrade-from-v020-or-earlier).
+[MassRelay v0.3.9](https://github.com/zorkian/massrelay/releases/tag/v0.3.9) adds `massrelay status` and groups the CLI help by task. If you're upgrading from v0.2.0 or earlier, see [the upgrade instructions](#upgrade-from-v020-or-earlier).
 
 On Linux or macOS, sign in with `gh auth login` using an account that has access to this repository. Then install the latest release to `~/.local/bin/massrelay`.
 
@@ -39,61 +39,9 @@ gh release download --repo zorkian/massrelay --pattern massrelay-windows-x86_64.
 
 Release binaries and their checksums are also available on the [Releases page](https://github.com/zorkian/massrelay/releases).
 
-## Build from source
-
-Install stable Rust and a platform C toolchain, then run `cargo build --locked --release`. The executable is `target/release/massrelay` or `target\release\massrelay.exe` on Windows.
-
-Pushing a tag that matches the Cargo version, such as `v0.3.0`, builds and publishes the release binaries through GitHub Actions.
-
-Pushes to `main` that change Cargo's manifests, configuration, toolchain, or the release workflow warm the Rust dependency cache for each platform. To warm the caches on demand, run the Release workflow manually on `main`.
-
-## Start a shared relay
-
-On a Linux host with systemd, pass `--relay` to the installer to install the binary and start a user service.
-
-```sh
-gh api repos/zorkian/massrelay/contents/install.sh -H 'Accept: application/vnd.github.raw+json' |
-  sh -s -- --relay
-```
-
-The installer detects the public IP for a new relay and prints its public locator. To supply the address yourself, append `--public-ip ADDRESS` to the installer arguments. The service keeps its identity and membership under `${XDG_DATA_HOME:-$HOME/.local/share}/massrelay-relay`. Rerunning the relay installer updates the binary and restarts the service with the saved address. UDP `4433` and TCP `3340` must be reachable on that address.
-
-`systemctl --user status massrelay-relay.service` shows the service status. To start it at boot and keep it running after logout, the service account needs systemd lingering enabled.
-
-### Start the relay manually
-
-One shared relay serves any number of independent pocket networks. On a reachable host, start it with the addresses that devices will use to reach it.
-
-```sh
-massrelay --state-dir ./relay-state relay \
-  --public-udp 203.0.113.10:4433 --url http://relay.example.com:3340
-```
-
-Replace the example public IP and port and the relay URL. The first start creates the relay's key and saves these addresses and the shared mode in the state directory. Later, `massrelay --state-dir ./relay-state relay` is enough. Repeating the two flags with the saved values also works. A start with different values fails, as does adding the flags to a ticket-only relay. Keep the state directory private and preserve it across restarts.
-
-The advertised addresses do not choose where the relay listens. By default it binds UDP `0.0.0.0:4433` for authenticated enrollment and membership traffic, and TCP `0.0.0.0:3340` for the Iroh relay. Use `--udp-bind` and `--relay-bind` for other addresses, on every start. Both ports must be reachable. `create` and `join` connect directly to the advertised UDP address, so a new device currently needs outbound UDP to it. After enrollment, control requests and shells can use the TCP relay if a direct path is unavailable. For an HTTPS relay URL, terminate TLS in front of the TCP listener with a reverse proxy that supports WebSocket upgrades.
-
-A shared relay is open: anyone who can reach it can create a pocket network and relay their devices' traffic through it. It has no quotas or rate limits. Devices can see and pair with only the members of their own network. Use a [ticket-only relay](#run-a-ticket-only-relay) to control who creates networks.
-
-The relay prints its public locator to stderr at each start. This command prints it to stdout, including while the relay runs.
-
-```sh
-massrelay --state-dir ./relay-state relay-info
-```
-
-MassRelay uses three kinds of strings.
-
-| String | Starts with | Secret | Purpose |
-| --- | --- | --- | --- |
-| Relay locator | `mrrelay1_` | No | Names a shared relay by its key, UDP address, and URL. Used to create a network. |
-| Operator creation ticket | `mr1_` | Yes, one use | Lets its holder create one network. |
-| Join invite | `mr1_` | Yes, one use, ten minutes | Adds one device to one network. |
-
-The locator determines which relay key your device trusts, so get it from the relay's operator over a channel you trust.
-
 ## Pair two machines
 
-On the first machine, set the locator once for your shell and create a pocket network. No creation ticket or running `massrelay` process is needed.
+Run `massrelay status` any time to check enrollment, see your own endpoint ID, or find the next step. To create a pocket network, ask the relay operator for its public locator, or [start your own relay](#start-a-shared-relay). On the first machine, set the locator and create the network.
 
 ```sh
 export MASSRELAY_RELAY=mrrelay1_...
@@ -108,7 +56,9 @@ On the second machine, join with the invite. It already identifies the relay.
 massrelay join mr1_...
 ```
 
-Each device is named after the first part of its machine's hostname, with unsupported characters replaced by hyphens. If no usable hostname is available, the name is derived from the device key. Add `--name NAME` to either command to choose a name, for example when two machines share a hostname. Names may contain ASCII letters, digits, hyphens, and underscores. To keep an invite out of your shell history and process list, omit it and paste it on stdin.
+To keep the invite out of shell history and process lists, run `massrelay join` and paste it at the prompt instead.
+
+Each device is named after the first part of its machine's hostname, with unsupported characters replaced by hyphens. If no usable hostname is available, the name is derived from the device key. Add `--name NAME` to either command to choose a name, for example when two machines share a hostname. Names may contain ASCII letters, digits, hyphens, and underscores.
 
 The complete forms are:
 
@@ -132,7 +82,7 @@ massrelay approve workstation
 massrelay approve laptop
 ```
 
-Compare the endpoint ID shown by `approve` with the one that `massrelay run` prints on the other device. With a background service, look for `MassRelay running as` in its service log. To script an approval, pass the verified endpoint ID instead of the name.
+When prompted to approve, run `massrelay status` on the other device and compare its full endpoint ID. To script an approval, pass the verified endpoint ID instead of the name.
 
 Pairing alone gives no access. To open a shell from the laptop, allow it on the workstation.
 
@@ -144,7 +94,7 @@ massrelay enable shell laptop
 massrelay shell workstation
 ```
 
-Use `massrelay peers` to see everyone in the pocket network, recent presence, and your pairing status. Any enrolled device can invite another with `massrelay invite` while `massrelay run` is running. Invites can be used once and expire after ten minutes. Use `massrelay decline NAME` to decline or unpair, or `massrelay revoke NAME` to remove another device from the network. Name matching is case-insensitive, and commands accept endpoint IDs as well.
+Use `massrelay peers` to see devices in the network, recent presence, and pairing status. Use `massrelay peers --full` for full endpoint IDs in the terminal. Any enrolled device can run `massrelay invite` while its service is running. Invites can be used once and expire after ten minutes. Use `massrelay decline NAME` to decline or unpair, or `massrelay revoke NAME` to remove another device from the network. Name matching is case-insensitive, and commands accept full endpoint IDs as well.
 
 Run `massrelay run` under your ordinary account in a terminal or supervisor of your choice. Use `--shell /path/to/shell` to override the account's default shell executable, for example to use PowerShell on Windows.
 
@@ -264,6 +214,50 @@ Devices also audit enrollment, local commands and authentication failures, membe
 
 The relay writes `relay-events.jsonl` in its state directory and mirrors events to stderr. It audits network creation, enrollment, invite issuance, operator ticket reads, approvals, declines, revocations, control errors, and authenticated relay connection decisions and disconnects. The default systemd relay service mirrors stderr to `journalctl --user -u massrelay-relay.service`. Relay transport events include an ID for matching a connection with its disconnect. The device logs provide the peer and service information for end-to-end sessions. Routine successful roster heartbeats are omitted. Audit records use authenticated endpoint IDs when known and fixed reason codes so credentials, raw requests, and data payloads stay out of the logs.
 
+## Start a shared relay
+
+On a Linux host with systemd, pass `--relay` to the installer to install the binary and start a user service.
+
+```sh
+gh api repos/zorkian/massrelay/contents/install.sh -H 'Accept: application/vnd.github.raw+json' |
+  sh -s -- --relay
+```
+
+The installer detects the public IP for a new relay and prints its public locator. To supply the address yourself, append `--public-ip ADDRESS` to the installer arguments. The service keeps its identity and membership under `${XDG_DATA_HOME:-$HOME/.local/share}/massrelay-relay`. Rerunning the relay installer updates the binary and restarts the service with the saved address. UDP `4433` and TCP `3340` must be reachable on that address.
+
+`systemctl --user status massrelay-relay.service` shows the service status. To start it at boot and keep it running after logout, the service account needs systemd lingering enabled.
+
+### Start the relay manually
+
+One shared relay serves any number of independent pocket networks. On a reachable host, start it with the addresses that devices will use to reach it.
+
+```sh
+massrelay --state-dir ./relay-state relay \
+  --public-udp 203.0.113.10:4433 --url http://relay.example.com:3340
+```
+
+Replace the example public IP and port and the relay URL. The first start creates the relay's key and saves these addresses and the shared mode in the state directory. Later, `massrelay --state-dir ./relay-state relay` is enough. Repeating the two flags with the saved values also works. A start with different values fails, as does adding the flags to a ticket-only relay. Keep the state directory private and preserve it across restarts.
+
+The advertised addresses do not choose where the relay listens. By default it binds UDP `0.0.0.0:4433` for authenticated enrollment and membership traffic, and TCP `0.0.0.0:3340` for the Iroh relay. Use `--udp-bind` and `--relay-bind` for other addresses, on every start. Both ports must be reachable. `create` and `join` connect directly to the advertised UDP address, so a new device currently needs outbound UDP to it. After enrollment, control requests and shells can use the TCP relay if a direct path is unavailable. For an HTTPS relay URL, terminate TLS in front of the TCP listener with a reverse proxy that supports WebSocket upgrades.
+
+A shared relay is open: anyone who can reach it can create a pocket network and relay their devices' traffic through it. It has no quotas or rate limits. Devices can see and pair with only the members of their own network. Use a [ticket-only relay](#run-a-ticket-only-relay) to control who creates networks.
+
+The relay prints its public locator to stderr at each start. This command prints it to stdout, including while the relay runs.
+
+```sh
+massrelay --state-dir ./relay-state relay-info
+```
+
+MassRelay uses three kinds of strings.
+
+| String | Starts with | Secret | Purpose |
+| --- | --- | --- | --- |
+| Relay locator | `mrrelay1_` | No | Names a shared relay by its key, UDP address, and URL. Used to create a network. |
+| Operator creation ticket | `mr1_` | Yes, one use | Lets its holder create one network. |
+| Join invite | `mr1_` | Yes, one use, ten minutes | Adds one device to one network. |
+
+The locator determines which relay key your device trusts, so get it from the relay's operator over a channel you trust.
+
 ## Run a ticket-only relay
 
 A ticket-only relay creates a network only for the holder of an operator creation ticket. Initialize its state directory, save the one-use ticket printed to stdout, and start it.
@@ -285,6 +279,14 @@ Iroh authenticates peer keys and encrypts both directions of every session. It c
 If the relay goes offline, cached approvals and grants still work over a reachable direct path. MassRelay saves peer address candidates, reuses its UDP port when possible, and uses local multicast discovery. Use a fixed `--bind` address and port if a device has a stable direct address you want it to keep. Behind NAT, establishing a new direct path can require the relay. Presence becomes unknown as the last heartbeat ages. Revocations take effect on each device when it next learns about them. A decline closes access locally as soon as you make it and syncs to the relay when it returns.
 
 Keep the device state directory to preserve keys, approvals, and grants across restarts. If you lose every enrolled device, create a new pocket network. A plain shell ends on disconnection. Use the destination's terminal multiplexer if you need work to outlive a connection.
+
+## Build from source
+
+Install stable Rust and a platform C toolchain, then run `cargo build --locked --release`. The executable is `target/release/massrelay` or `target\release\massrelay.exe` on Windows.
+
+Pushing a tag that matches the Cargo version, such as `v0.3.0`, builds and publishes the release binaries through GitHub Actions.
+
+Pushes to `main` that change Cargo's manifests, configuration, toolchain, or the release workflow warm the Rust dependency cache for each platform. To warm the caches on demand, run the Release workflow manually on `main`.
 
 ## Verification
 

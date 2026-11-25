@@ -17,6 +17,7 @@ mod udp;
 mod wire;
 
 use std::{
+    fmt::Write as _,
     io::{self, IsTerminal, Write},
     net::SocketAddr,
     num::NonZeroU16,
@@ -24,7 +25,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use directories::ProjectDirs;
 use iroh::{
     Endpoint, EndpointId, RelayUrl, SecretKey,
@@ -35,7 +36,10 @@ use iroh_mdns_address_lookup::MdnsAddressLookup;
 use wire::{Decision, LocalReply, LocalRequest, ServerAddr, Service, Ticket};
 
 #[derive(Parser)]
-#[command(version, about)]
+#[command(
+    version,
+    about = "Connect your own machines for shells and port forwarding."
+)]
 struct Cli {
     /// Override the per-user state directory (use a separate directory for the relay).
     #[arg(long, global = true, env = "MASSRELAY_STATE_DIR")]
@@ -46,7 +50,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Initialize a ticket-only relay and print a one-use network creation ticket.
+    /// Initialize a ticket-only relay and print its creation ticket.
     RelayInit {
         #[arg(long)]
         public_udp: SocketAddr,
@@ -70,7 +74,7 @@ enum Command {
     RelayInfo,
     /// Print the relay's current one-use network creation ticket.
     RelayTicket,
-    /// Create a pocket network on a shared relay and print an invite for the next device.
+    /// Create a network on a shared relay and print its first invite.
     Create {
         /// Device name for an operator creation ticket, which is read from stdin.
         #[arg(value_name = "NAME", conflicts_with_all = ["relay", "name"])]
@@ -92,7 +96,7 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Make this device reachable while the foreground process runs.
+    /// Run this device in the foreground.
     Run {
         /// Use this shell executable instead of the account's default.
         #[arg(long)]
@@ -115,26 +119,32 @@ enum Command {
     /// Stop this device's installed background service for this login.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Stop,
-    /// List devices, recent presence, and pairing status.
-    Peers,
+    /// Show this device's enrollment, service state, and endpoint ID.
+    Status,
+    /// List peers and see which devices have approved access.
+    Peers {
+        /// Show full endpoint IDs in the terminal.
+        #[arg(long)]
+        full: bool,
+    },
     /// Issue a one-use invite valid for ten minutes.
     Invite,
     /// Approve a pairing by device name or endpoint ID.
     Approve { peer: String },
-    /// Decline or remove a pairing. Both devices must reapprove to pair again.
+    /// Decline an approval request or end an existing pairing.
     Decline { peer: String },
     /// Remove another device from the entire network.
     Revoke { peer: String },
     /// Open an interactive shell on a paired device that has enabled it.
     Shell { peer: String },
-    /// Let one peer use a service on this device, until disabled or the pairing ends.
+    /// Grant a peer persistent access to a service on this device.
     Enable {
         /// shell, tcp:PORT, or udp:PORT. Ports forward to loopback on this device.
         service: Service,
         /// Peer name or endpoint ID.
         peer: String,
     },
-    /// Remove one peer's grant or exposure of a service, and close its sessions.
+    /// Revoke a peer's access to a service and close its sessions.
     Disable {
         /// shell, tcp:PORT, or udp:PORT.
         service: Service,
@@ -192,7 +202,9 @@ fn target(text: &str) -> Result<String, String> {
 
 #[tokio::main]
 async fn main() {
-    match execute(Cli::parse()).await {
+    let cli =
+        Cli::from_arg_matches(&grouped_cli().get_matches()).unwrap_or_else(|error| error.exit());
+    match execute(cli).await {
         Ok(0) => {}
         Ok(code) => std::process::exit(code),
         Err(error) => {
@@ -200,6 +212,42 @@ async fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn grouped_cli() -> clap::Command {
+    let command = Cli::command();
+    let groups: &[(&str, &[&str])] = &[
+        ("Set up a network", &["create", "join", "invite"]),
+        (
+            "Manage this device",
+            &["status", "install", "start", "restart", "stop", "run"],
+        ),
+        (
+            "Find and pair devices",
+            &["peers", "approve", "decline", "revoke"],
+        ),
+        ("Connect to a peer", &["shell", "connect"]),
+        (
+            "Share services from this device",
+            &["list", "enable", "disable", "expose"],
+        ),
+        (
+            "Operate a relay",
+            &["relay", "relay-info", "relay-init", "relay-ticket"],
+        ),
+    ];
+    let mut help = String::from("{about-with-newline}\n{usage-heading} {usage}\n");
+    for &(heading, names) in groups {
+        writeln!(help, "\n{heading}:").expect("write to string");
+        for &name in names {
+            if let Some(subcommand) = command.find_subcommand(name) {
+                let description = subcommand.get_about().expect("command description");
+                writeln!(help, "  {name:12}  {description}").expect("write to string");
+            }
+        }
+    }
+    help.push_str("\nOptions:\n{options}\n\nRun 'massrelay help <command>' for details.\n");
+    command.help_template(help)
 }
 
 async fn execute(cli: Cli) -> Result<i32> {
@@ -228,7 +276,14 @@ async fn execute(cli: Cli) -> Result<i32> {
                      To use MASSRELAY_RELAY instead, run massrelay create --name NAME."
                 );
             }
-            device::enroll(&dir, read_ticket()?, Some(name), true).await?
+            device::enroll(
+                &dir,
+                read_ticket("Paste the operator creation ticket: ")?,
+                Some(name),
+                true,
+            )
+            .await?;
+            eprintln!("Created a pocket network. Run 'massrelay status' for the next step.");
         }
         Command::Create { relay, name, .. } => {
             let locator = relay.or_else(env_relay).context(
@@ -239,7 +294,8 @@ async fn execute(cli: Cli) -> Result<i32> {
             let (name, invite) = device::create(&dir, server, name).await?;
             eprintln!(
                 "Created a pocket network. This device is {}. \
-                 The invite works once and expires ten minutes after issue.",
+                 Use the invite with 'massrelay join' on another device. It works once and expires in ten minutes. \
+                 Run 'massrelay status' for this device's next step.",
                 visible(&name)
             );
             println!("{invite}");
@@ -249,7 +305,8 @@ async fn execute(cli: Cli) -> Result<i32> {
             name,
         } => {
             let (ticket, name) = join_input(invite_or_name, name)?;
-            device::enroll(&dir, ticket, name, false).await?
+            device::enroll(&dir, ticket, name, false).await?;
+            eprintln!("Joined the pocket network. Run 'massrelay status' for the next step.");
         }
         Command::Run {
             shell,
@@ -264,12 +321,14 @@ async fn execute(cli: Cli) -> Result<i32> {
         Command::Restart => background_service::control(&dir, ServiceAction::Restart)?,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         Command::Stop => background_service::control(&dir, ServiceAction::Stop)?,
-        Command::Peers => {
+        Command::Status => device::status(&dir).await?,
+        Command::Peers { full } => {
             let LocalReply::Peers(peers) = local::command(&dir, LocalRequest::Peers).await? else {
                 bail!("unexpected roster reply");
             };
-            println!("NAME\tPRESENCE\tPAIRING\tENDPOINT");
-            for peer in peers {
+            let terminal = io::stdout().is_terminal();
+            let mut rows = vec![["NAME", "PRESENCE", "PAIRING", "ENDPOINT"].map(String::from)];
+            rows.extend(peers.into_iter().map(|peer| {
                 let online = peer
                     .member
                     .last_seen
@@ -283,18 +342,25 @@ async fn execute(cli: Cli) -> Result<i32> {
                     (_, Some(Decision::Approve)) => "approval requested",
                     _ => "unpaired",
                 };
-                println!(
-                    "{}\t{presence}\t{pairing}\t{}",
+                [
                     visible(&peer.member.name),
-                    peer.member.id
-                );
-            }
+                    presence.into(),
+                    pairing.into(),
+                    endpoint_display(peer.member.id, full || !terminal),
+                ]
+            }));
+            print_table(&rows, terminal);
         }
         Command::Invite => {
             let LocalReply::Invite(ticket) = local::command(&dir, LocalRequest::Invite).await?
             else {
                 bail!("unexpected invite reply");
             };
+            if io::stderr().is_terminal() {
+                eprintln!(
+                    "Use this invite with 'massrelay join' on another device within ten minutes."
+                );
+            }
             println!("{ticket}");
         }
         Command::Approve { peer } => {
@@ -354,10 +420,7 @@ async fn execute(cli: Cli) -> Result<i32> {
                 } else {
                     "persistent".into()
                 };
-                let mut endpoint = grant.id.to_string();
-                if !full {
-                    endpoint.truncate(8);
-                }
+                let endpoint = endpoint_display(grant.id, full);
                 let target = grant.target.unwrap_or_else(|| match grant.service {
                     Service::Shell => "-".into(),
                     Service::Tcp(port) => format!("loopback:{port}"),
@@ -371,7 +434,7 @@ async fn execute(cli: Cli) -> Result<i32> {
                     visible(&target),
                 ]
             }));
-            print_grants(&rows);
+            print_table(&rows, io::stdout().is_terminal());
         }
         Command::Expose { port, to, target } => {
             let service = match (port.tcp, port.udp) {
@@ -448,23 +511,35 @@ fn visible(value: &str) -> String {
     value.chars().filter(|c| !c.is_control()).collect()
 }
 
-fn print_grants(rows: &[[String; 5]]) {
-    if !io::stdout().is_terminal() {
+fn endpoint_display(id: EndpointId, full: bool) -> String {
+    let mut endpoint = id.to_string();
+    if !full {
+        endpoint.truncate(8);
+    }
+    endpoint
+}
+
+fn print_table<const N: usize>(rows: &[[String; N]], terminal: bool) {
+    if !terminal {
         for row in rows {
             println!("{}", row.join("\t"));
         }
         return;
     }
 
-    let widths: [usize; 4] = std::array::from_fn(|index| {
+    let widths: [usize; N] = std::array::from_fn(|index| {
         rows.iter()
             .map(|row| row[index].chars().count())
             .max()
             .unwrap_or(0)
     });
-    let [service, peer, endpoint, mode] = widths;
-    for [kind, name, id, lifetime, target] in rows {
-        println!("{kind:<service$}  {name:<peer$}  {id:<endpoint$}  {lifetime:<mode$}  {target}");
+    for row in rows {
+        let (last, columns) = row.split_last().expect("table columns");
+        let mut line = String::new();
+        for (cell, width) in columns.iter().zip(widths) {
+            write!(line, "{cell:<width$}  ").expect("write to string");
+        }
+        println!("{line}{last}");
     }
 }
 
@@ -484,7 +559,7 @@ async fn confirm_peer(dir: &Path, name: &str) -> Result<EndpointId> {
         bail!("approve using the verified endpoint ID {}", peer.id);
     }
     eprintln!(
-        "Compare this endpoint ID with the one shown by massrelay run on {}:",
+        "Run 'massrelay status' on {} and compare its endpoint ID:",
         visible(&peer.name)
     );
     eprintln!("{}", peer.id);
@@ -521,7 +596,7 @@ fn env_relay() -> Option<String> {
 /// Resolve `join`'s arguments into an invite and an optional device name.
 fn join_input(argument: Option<String>, name: Option<String>) -> Result<(Ticket, Option<String>)> {
     let Some(argument) = argument else {
-        return Ok((read_ticket()?, name));
+        return Ok((read_ticket("Paste the join invite: ")?, name));
     };
     match Ticket::decode(&argument) {
         Ok(ticket) => Ok((ticket, name)),
@@ -539,12 +614,16 @@ fn join_input(argument: Option<String>, name: Option<String>) -> Result<(Ticket,
                      device name; reading the invite from stdin"
                 );
             }
-            Ok((read_ticket()?, Some(argument)))
+            Ok((read_ticket("Paste the join invite: ")?, Some(argument)))
         }
     }
 }
 
-fn read_ticket() -> Result<Ticket> {
+fn read_ticket(prompt: &str) -> Result<Ticket> {
+    if io::stdin().is_terminal() {
+        eprint!("{prompt}");
+        io::stderr().flush()?;
+    }
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
     Ticket::decode(&line)

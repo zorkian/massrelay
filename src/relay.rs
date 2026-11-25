@@ -409,7 +409,7 @@ fn configure(dir: &Path, advertised: Option<(SocketAddr, RelayUrl)>) -> Result<(
 
 /// Print a shared relay's public locator.
 pub fn info(dir: &Path) -> Result<()> {
-    let state: RelayState = storage::load(dir, STATE_FILE)?;
+    let state = load_relay_profile(dir)?;
     ensure!(
         state.shared,
         "this relay requires operator creation tickets; use relay-ticket"
@@ -420,10 +420,19 @@ pub fn info(dir: &Path) -> Result<()> {
 
 pub fn create_ticket(dir: &Path) -> Result<()> {
     // Atomic state replacement allows this local read while the relay runs.
-    let state = storage::load(dir, STATE_FILE)?;
+    let state = load_relay_profile(dir)?;
     let log = ConnectionLog::open(Some(&dir.join(EVENT_FILE)))?;
     audit_operator_ticket(&log);
     print_ticket(state)
+}
+
+fn load_relay_profile(dir: &Path) -> Result<RelayState> {
+    ensure!(
+        dir.join(STATE_FILE).try_exists()?,
+        "no relay profile in {}; run this on the relay host with '--state-dir' set to its relay state directory",
+        dir.display()
+    );
+    storage::load(dir, STATE_FILE)
 }
 
 fn audit_operator_ticket(log: &ConnectionLog) {

@@ -759,9 +759,16 @@ def exercise(binary, root):
         assert "operator creation ticket" in refused.stderr, refused.stderr
 
         # A configured shared locator does not change the ticket form.
+        empty = cli("a", "status").stdout
+        assert "unenrolled" in empty and not (root / "a").exists(), empty
         cli("a", "create", "a", ticket=create, env={"MASSRELAY_RELAY": locator})
+        offline = cli("a", "status").stdout
+        assert "enrolled" in offline and "unavailable" in offline, offline
+        assert cli("a", "relay-info", check=False).returncode != 0
         a = run_peer("a")
         eventually(lambda: cli("a", "peers", check=False).returncode == 0, "device a up")
+        online = cli("a", "status").stdout
+        assert "running" in online and endpoint_id("a") in online, online
 
         # An invalid local proof is audited without authenticating a caller or logging the proof.
         runtime = json.loads((root / "a" / "runtime.json").read_text())

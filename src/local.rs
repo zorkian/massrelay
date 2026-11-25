@@ -20,6 +20,8 @@ use crate::{
 };
 
 const RUNTIME: &str = "runtime.json";
+const SERVICE_UNAVAILABLE: &str =
+    "device service unavailable; run 'massrelay status' for next steps";
 type Tag = Hmac<Sha256>;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -68,12 +70,11 @@ async fn open(dir: &Path, request: LocalRequest) -> Result<(TcpStream, LocalRepl
 }
 
 async fn request_daemon(dir: &Path, request: LocalRequest) -> Result<(TcpStream, LocalReply)> {
-    let runtime: Runtime =
-        storage::load(dir, RUNTIME).context("start massrelay run for this device")?;
+    let runtime: Runtime = storage::load(dir, RUNTIME).context(SERVICE_UNAVAILABLE)?;
     ensure!(runtime.addr.ip().is_loopback(), "invalid daemon address");
     let mut socket = TcpStream::connect(runtime.addr)
         .await
-        .context("start massrelay run for this device")?;
+        .context(SERVICE_UNAVAILABLE)?;
     socket.set_nodelay(true)?;
     let challenge = wire::random()?;
     socket.write_all(&challenge).await?;

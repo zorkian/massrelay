@@ -524,6 +524,51 @@ fn load_device(dir: &Path) -> Result<Device> {
     Ok(device)
 }
 
+pub async fn status(dir: &Path) -> Result<()> {
+    println!("State directory  {}", dir.display());
+    if !dir.join(FILE).try_exists()? {
+        if dir.join(PENDING).try_exists()? {
+            println!("Enrollment       pending");
+            println!(
+                "Next             Retry the original 'massrelay create' or 'massrelay join' command"
+            );
+        } else {
+            println!("Enrollment       unenrolled");
+            println!("Next             Run 'massrelay create' or 'massrelay join'");
+        }
+        return Ok(());
+    }
+
+    let device: Device = storage::load(dir, FILE)?;
+    println!("Endpoint ID      {}", device.identity.public());
+    if device.revoked {
+        println!("Enrollment       revoked");
+        println!("Next             Use another state directory to enroll again");
+        return Ok(());
+    }
+    println!("Enrollment       enrolled");
+    if let Ok(LocalReply::Peers(peers)) = local::command(dir, LocalRequest::Peers).await {
+        let paired = peers
+            .iter()
+            .filter(|peer| {
+                peer.pair.ours == Some(Decision::Approve)
+                    && peer.pair.theirs == Some(Decision::Approve)
+            })
+            .count();
+        println!("Device service   running");
+        println!("Peers            {} ({paired} paired)", peers.len());
+        println!("Next             Run 'massrelay peers' to see pairing status");
+    } else {
+        println!("Device service   unavailable");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        println!(
+            "Next             Run 'massrelay start', or 'massrelay install' for first-time background setup"
+        );
+        println!("Foreground       Run 'massrelay run' to keep the service in this terminal");
+    }
+    Ok(())
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn check_enrolled(dir: &Path) -> Result<()> {
     load_device(dir).map(drop)
