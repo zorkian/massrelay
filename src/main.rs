@@ -106,6 +106,12 @@ enum Command {
     /// Set up and start this device's background service.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Install,
+    /// Restart this device's installed background service.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Restart,
+    /// Stop this device's installed background service for this login.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Stop,
     /// List devices, recent presence, and pairing status.
     Peers,
     /// Issue a one-use invite valid for ten minutes.
@@ -245,6 +251,10 @@ async fn execute(cli: Cli) -> Result<i32> {
         } => device::run(dir, shell, bind, log_file).await?,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         Command::Install => background_service::install(&dir)?,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        Command::Restart => background_service::control(&dir, ServiceAction::Restart)?,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        Command::Stop => background_service::control(&dir, ServiceAction::Stop)?,
         Command::Peers => {
             let LocalReply::Peers(peers) = local::command(&dir, LocalRequest::Peers).await? else {
                 bail!("unexpected roster reply");
@@ -370,6 +380,43 @@ fn default_state_dir() -> Result<PathBuf> {
         .context("cannot find the user state directory; specify --state-dir")?
         .data_local_dir()
         .to_path_buf())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy)]
+enum ServiceAction {
+    Restart,
+    Stop,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl ServiceAction {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Restart => "restart",
+            Self::Stop => "stop",
+        }
+    }
+
+    fn record(self, path: &Path, result: &Result<()>) {
+        use connection_log::{Audit, ConnectionLog};
+        let log = ConnectionLog::open(Some(path)).or_else(|error| {
+            eprintln!("massrelay: could not open service audit log: {error:#}");
+            ConnectionLog::open(None)
+        });
+        if let Ok(log) = log {
+            log.audit(
+                "service_control",
+                Audit {
+                    operation: self.name(),
+                    outcome: if result.is_ok() { "allowed" } else { "failed" },
+                    reason: result.is_err().then_some("service_manager_failed"),
+                    ..Audit::default()
+                },
+                None,
+            );
+        }
+    }
 }
 
 fn visible(value: &str) -> String {

@@ -10,7 +10,7 @@ use directories::BaseDirs;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
-use crate::{default_state_dir, device, storage};
+use crate::{ServiceAction, default_state_dir, device, storage};
 
 const LABEL: &str = "com.massrelay.client";
 
@@ -19,21 +19,9 @@ pub fn install(dir: &Path) -> Result<()> {
     let dir = dir
         .canonicalize()
         .context("resolve the device state directory")?;
-    let default = default_state_dir()?.canonicalize().ok();
-    let home = BaseDirs::new().context("cannot find the user home directory")?;
-    let job = Job::new(home.home_dir(), &dir, default.as_deref())?;
-    let uid = checked(Command::new("/usr/bin/id").arg("-u"), "read the user ID")?;
-    let uid = std::str::from_utf8(&uid.stdout)?.trim().parse::<u32>()?;
-    ensure!(
-        uid != 0,
-        "run massrelay install from your Mac account without sudo"
-    );
-    let domain = format!("gui/{uid}");
+    let job = Job::for_profile(&dir)?;
+    let domain = login_domain()?;
     let service = format!("{domain}/{}", job.label);
-    checked(
-        &mut launchctl("print", &domain),
-        "find the macOS login session",
-    )?;
     let loaded = launchctl("print", &service).output()?.status.success();
 
     if !loaded {
@@ -63,10 +51,7 @@ pub fn install(dir: &Path) -> Result<()> {
         "validate the LaunchAgent plist",
     )?;
     if loaded {
-        checked(
-            &mut launchctl("bootout", &service),
-            "unload the existing LaunchAgent",
-        )?;
+        unload(&service)?;
     }
     let registered = (|| {
         staged
@@ -105,6 +90,65 @@ pub fn install(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn control(dir: &Path, action: ServiceAction) -> Result<()> {
+    let dir = dir
+        .canonicalize()
+        .context("resolve the device state directory")?;
+    let job = Job::for_profile(&dir)?;
+    let result = (|| {
+        let metadata = fs::symlink_metadata(&job.plist).with_context(|| {
+            format!("find {}. Run massrelay install first", job.plist.display())
+        })?;
+        ensure!(
+            metadata.is_file(),
+            "expected a regular file at {}",
+            job.plist.display()
+        );
+        let domain = login_domain()?;
+        let service = format!("{domain}/{}", job.label);
+        let loaded = launchctl("print", &service).output()?.status.success();
+        match action {
+            ServiceAction::Stop if loaded => unload(&service),
+            ServiceAction::Stop => Ok(()),
+            ServiceAction::Restart => {
+                if loaded {
+                    unload(&service)?;
+                } else {
+                    let _lock =
+                        storage::lock(&dir).context("stop the foreground massrelay run first")?;
+                }
+                bootstrap(&domain, &job.plist)
+            }
+        }
+    })();
+    action.record(&job.events, &result);
+    result?;
+    println!(
+        "{} {}",
+        match action {
+            ServiceAction::Restart => "Restarted",
+            ServiceAction::Stop => "Stopped",
+        },
+        job.label
+    );
+    Ok(())
+}
+
+fn login_domain() -> Result<String> {
+    let uid = checked(Command::new("/usr/bin/id").arg("-u"), "read the user ID")?;
+    let uid = std::str::from_utf8(&uid.stdout)?.trim().parse::<u32>()?;
+    ensure!(
+        uid != 0,
+        "manage MassRelay from your Mac account without sudo"
+    );
+    let domain = format!("gui/{uid}");
+    checked(
+        &mut launchctl("print", &domain),
+        "find the macOS login session",
+    )?;
+    Ok(domain)
+}
+
 struct Job {
     label: String,
     plist: PathBuf,
@@ -113,6 +157,12 @@ struct Job {
 }
 
 impl Job {
+    fn for_profile(dir: &Path) -> Result<Self> {
+        let default = default_state_dir()?.canonicalize().ok();
+        let home = BaseDirs::new().context("cannot find the user home directory")?;
+        Self::new(home.home_dir(), dir, default.as_deref())
+    }
+
     fn new(home: &Path, dir: &Path, default: Option<&Path>) -> Result<Self> {
         let mut label = LABEL.to_owned();
         let mut name = "MassRelay".to_owned();
@@ -198,6 +248,11 @@ fn bootstrap(domain: &str, plist: &Path) -> Result<()> {
         launchctl("bootstrap", domain).arg(plist),
         "load the LaunchAgent",
     )?;
+    Ok(())
+}
+
+fn unload(service: &str) -> Result<()> {
+    checked(&mut launchctl("bootout", service), "unload the LaunchAgent")?;
     Ok(())
 }
 
