@@ -106,6 +106,9 @@ enum Command {
     /// Set up and start this device's background service.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Install,
+    /// Start this device's installed background service.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Start,
     /// Restart this device's installed background service.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Restart,
@@ -252,6 +255,8 @@ async fn execute(cli: Cli) -> Result<i32> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         Command::Install => background_service::install(&dir)?,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
+        Command::Start => background_service::control(&dir, ServiceAction::Start)?,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         Command::Restart => background_service::control(&dir, ServiceAction::Restart)?,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         Command::Stop => background_service::control(&dir, ServiceAction::Stop)?,
@@ -385,6 +390,7 @@ fn default_state_dir() -> Result<PathBuf> {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Clone, Copy)]
 enum ServiceAction {
+    Start,
     Restart,
     Stop,
 }
@@ -393,8 +399,17 @@ enum ServiceAction {
 impl ServiceAction {
     fn name(self) -> &'static str {
         match self {
+            Self::Start => "start",
             Self::Restart => "restart",
             Self::Stop => "stop",
+        }
+    }
+
+    fn completed(self) -> &'static str {
+        match self {
+            Self::Start => "Started",
+            Self::Restart => "Restarted",
+            Self::Stop => "Stopped",
         }
     }
 

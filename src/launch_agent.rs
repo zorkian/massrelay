@@ -110,7 +110,12 @@ pub fn control(dir: &Path, action: ServiceAction) -> Result<()> {
         match action {
             ServiceAction::Stop if loaded => unload(&service),
             ServiceAction::Stop => Ok(()),
-            ServiceAction::Restart => {
+            ServiceAction::Start if loaded => checked(
+                &mut launchctl("kickstart", &service),
+                "start the LaunchAgent",
+            )
+            .map(drop),
+            ServiceAction::Start | ServiceAction::Restart => {
                 if loaded {
                     unload(&service)?;
                 } else {
@@ -123,14 +128,7 @@ pub fn control(dir: &Path, action: ServiceAction) -> Result<()> {
     })();
     action.record(&job.events, &result);
     result?;
-    println!(
-        "{} {}",
-        match action {
-            ServiceAction::Restart => "Restarted",
-            ServiceAction::Stop => "Stopped",
-        },
-        job.label
-    );
+    println!("{} {}", action.completed(), job.label);
     Ok(())
 }
 

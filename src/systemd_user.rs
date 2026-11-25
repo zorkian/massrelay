@@ -92,7 +92,7 @@ pub fn control(dir: &Path, action: ServiceAction) -> Result<()> {
             "no installed service for this profile. Run massrelay install first"
         );
         systemctl(&["show-environment"]).context("connect to your systemd user manager")?;
-        if matches!(action, ServiceAction::Restart)
+        if !matches!(action, ServiceAction::Stop)
             && !user_command(&["is-active", "--quiet", &unit])?
                 .status
                 .success()
@@ -103,13 +103,7 @@ pub fn control(dir: &Path, action: ServiceAction) -> Result<()> {
     })();
     action.record(&dir.join("connections.jsonl"), &result);
     result?;
-    println!(
-        "{} {unit}",
-        match action {
-            ServiceAction::Restart => "Restarted",
-            ServiceAction::Stop => "Stopped",
-        }
-    );
+    println!("{} {unit}", action.completed());
     Ok(())
 }
 

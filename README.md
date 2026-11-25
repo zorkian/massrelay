@@ -4,7 +4,7 @@ MassRelay connects your own machines in a pocket network. Enrolled devices can s
 
 ## Install
 
-[MassRelay v0.3.5](https://github.com/zorkian/massrelay/releases/tag/v0.3.5) adds `massrelay restart` and `massrelay stop` on Linux and macOS. If you're upgrading from v0.2.0 or earlier, see [the upgrade instructions](#upgrade-from-v020-or-earlier).
+[MassRelay v0.3.6](https://github.com/zorkian/massrelay/releases/tag/v0.3.6) supports `massrelay start`, `massrelay restart`, and `massrelay stop` on Linux and macOS. If you're upgrading from v0.2.0 or earlier, see [the upgrade instructions](#upgrade-from-v020-or-earlier).
 
 On Linux or macOS, sign in with `gh auth login` using an account that has access to this repository. Then install the latest release to `~/.local/bin/massrelay`.
 
@@ -251,11 +251,12 @@ On macOS, the command writes and loads a LaunchAgent under your account. It star
 With `--state-dir`, the command prints the service name and log locations for that profile. Use the same profile for these commands.
 
 ```sh
+massrelay start
 massrelay restart
 massrelay stop
 ```
 
-Use `restart` after updating the installed binary or to bring a stopped service back up. Use `stop` to stop the background service and close its current sessions. The installed service remains enabled for future logins. Both commands record their outcome in the device event log.
+Use `start` to bring the background service up. If it's already running, its sessions continue. Use `restart` after updating the installed binary. Use `stop` to stop the service and close its current sessions. The installed service remains enabled for future logins. Each command records its outcome in the device event log.
 
 Events appear in both the service log and the JSONL event file. They include device startup and shutdown, peers joining and leaving, approvals and pairing changes, services enabled or disabled, temporary exposures, and session connects, disconnects, and failures. Session events include the direction and session ID. Failures and disconnects include a reason and the shell exit code when available. Events include the peer's name and endpoint ID and the service when relevant. Shell commands, terminal output, forwarded data, forwarding addresses, and invitations stay out of the event log. In the foreground, events go to stderr and to `connections.jsonl` in the state directory. Use `massrelay run --log-file PATH` to set a different path.
 
