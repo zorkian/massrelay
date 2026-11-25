@@ -34,7 +34,7 @@ use iroh::{
 };
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 
-use wire::{Decision, LocalReply, LocalRequest, ServerAddr, Service, Ticket};
+use wire::{Decision, GrantRule, LocalReply, LocalRequest, ServerAddr, Service, Ticket};
 
 #[derive(Parser)]
 #[command(
@@ -145,18 +145,18 @@ enum Command {
     Revoke { peer: String },
     /// Open an interactive shell on a paired device that has enabled it.
     Shell { peer: String },
-    /// Grant service access to one peer or to current peers.
+    /// Allow a peer to use a service or enable it by default.
     Enable {
         /// shell, tcp:PORT, or udp:PORT. Ports forward to loopback on this device.
         service: Service,
-        /// Peer name or endpoint ID. Omit to grant access to current peers.
+        /// Peer name or endpoint ID. Omit to include current and future paired peers.
         peer: Option<String>,
     },
-    /// Remove service access from one peer or all peers.
+    /// Remove an individual grant or turn off the service default.
     Disable {
         /// shell, tcp:PORT, or udp:PORT.
         service: Service,
-        /// Peer name or endpoint ID. Omit to remove access for all peers.
+        /// Peer name or endpoint ID. Omit to turn the default off.
         peer: Option<String>,
     },
     /// List the services this device grants, and who may use them.
@@ -412,22 +412,27 @@ async fn execute(cli: Cli) -> Result<i32> {
                 vec![["SERVICE", "PEER", "ENDPOINT", "MODE", "TARGET"].map(String::from)];
             rows.extend(grants.into_iter().map(|grant| {
                 let peer = grant.peer.as_deref().unwrap_or("(unknown)");
-                let mode = if grant.temporary {
-                    "temporary".into()
-                } else {
-                    "persistent".into()
+                let mode = match grant.rule {
+                    Some(GrantRule::Default) => "default",
+                    Some(GrantRule::Excluded) => "excluded",
+                    None if grant.temporary => "temporary",
+                    None => "persistent",
                 };
-                let endpoint = endpoint_display(grant.id, full);
-                let target = grant.target.unwrap_or_else(|| match grant.service {
-                    Service::Shell => "-".into(),
-                    Service::Tcp(port) => format!("loopback:{port}"),
-                    Service::Udp(port) => format!("127.0.0.1:{port}"),
-                });
+                let endpoint = grant
+                    .id
+                    .map_or_else(|| "-".into(), |id| endpoint_display(id, full));
+                let target = grant
+                    .target
+                    .unwrap_or_else(|| match (grant.service, grant.rule) {
+                        (Service::Shell, _) | (_, Some(GrantRule::Excluded)) => "-".into(),
+                        (Service::Tcp(port), _) => format!("loopback:{port}"),
+                        (Service::Udp(port), _) => format!("127.0.0.1:{port}"),
+                    });
                 [
                     grant.service.to_string(),
                     visible(peer),
                     endpoint,
-                    mode,
+                    mode.into(),
                     visible(&target),
                 ]
             }));
@@ -486,15 +491,19 @@ async fn change_service(
         local::command(dir, request).await?;
         println!("{action} {service} for {}", visible(&peer));
     } else {
-        let request = if enable {
-            LocalRequest::EnableAll { service }
+        local::command(
+            dir,
+            LocalRequest::SetServiceDefault {
+                service,
+                enabled: enable,
+            },
+        )
+        .await?;
+        if enable {
+            println!("Enabled {service} by default for current and future paired peers");
         } else {
-            LocalRequest::DisableAll { service }
-        };
-        let LocalReply::GrantsChanged(changed) = local::command(dir, request).await? else {
-            bail!("unexpected bulk grant reply");
-        };
-        println!("{service}: {changed} current peer grants changed");
+            println!("Disabled the default for {service}. Individual grants still apply.");
+        }
     }
     Ok(())
 }

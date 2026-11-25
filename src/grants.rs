@@ -1,12 +1,12 @@
 //! Which peers may use which services on this device.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, bail};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
-use crate::wire::{GrantView, Service};
+use crate::wire::{GrantRule, GrantView, Service};
 
 /// Persistent grants are saved with the device state. Exposures last only while the command that
 /// asked for them runs, so they are never saved. A peer holds at most one of the two per service.
@@ -38,9 +38,94 @@ struct Exposure {
 
 /// What an authorized session may reach.
 pub struct Access {
-    pub instance: u64,
+    pub instance: GrantInstance,
     /// An address chosen by this device's owner. `None` means loopback on the service's port.
     pub target: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantInstance {
+    Peer(u64),
+    Default(u64),
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ServiceDefaults {
+    settings: BTreeMap<Service, DefaultSetting>,
+    #[serde(skip)]
+    issued: u64,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct DefaultSetting {
+    enabled: bool,
+    excluded: BTreeSet<EndpointId>,
+    #[serde(skip)]
+    instance: u64,
+}
+
+impl ServiceDefaults {
+    pub fn set(&mut self, service: Service, enabled: bool) -> bool {
+        if self
+            .settings
+            .get(&service)
+            .is_some_and(|setting| setting.enabled)
+            == enabled
+        {
+            return false;
+        }
+        let setting = self.settings.entry(service).or_default();
+        self.issued += 1;
+        setting.instance = self.issued;
+        setting.enabled = enabled;
+        true
+    }
+
+    pub fn exclude(&mut self, peer: EndpointId, service: Service) -> bool {
+        self.settings
+            .get_mut(&service)
+            .is_some_and(|setting| setting.enabled && setting.excluded.insert(peer))
+    }
+
+    pub fn clear_exclusion(&mut self, peer: EndpointId, service: Service) -> bool {
+        self.settings
+            .get_mut(&service)
+            .is_some_and(|setting| setting.excluded.remove(&peer))
+    }
+
+    pub fn access(&self, peer: EndpointId, service: Service) -> Option<Access> {
+        let setting = self.settings.get(&service)?;
+        (setting.enabled && !setting.excluded.contains(&peer)).then_some(Access {
+            instance: GrantInstance::Default(setting.instance),
+            target: None,
+        })
+    }
+
+    pub fn list(&self, name: impl Fn(EndpointId) -> Option<String>) -> Vec<GrantView> {
+        let mut rules = Vec::new();
+        for (&service, setting) in &self.settings {
+            if setting.enabled {
+                rules.push(GrantView {
+                    service,
+                    peer: Some("all paired peers".into()),
+                    id: None,
+                    temporary: false,
+                    target: None,
+                    rule: Some(GrantRule::Default),
+                });
+            }
+            rules.extend(setting.excluded.iter().map(|&id| GrantView {
+                service,
+                peer: name(id),
+                id: Some(id),
+                temporary: false,
+                target: None,
+                rule: Some(GrantRule::Excluded),
+            }));
+        }
+        rules
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -56,7 +141,7 @@ impl Grants {
             None => (*self.persistent.get(&peer)?.get(&service)?, None),
         };
         (grant.generation == generation).then_some(Access {
-            instance: grant.instance,
+            instance: GrantInstance::Peer(grant.instance),
             target,
         })
     }
@@ -194,9 +279,10 @@ impl Grants {
             .map(|(id, service, temporary, target)| GrantView {
                 service,
                 peer: name(id),
-                id,
+                id: Some(id),
                 temporary,
                 target,
+                rule: None,
             })
             .collect();
         list.sort_by_cached_key(|grant| {

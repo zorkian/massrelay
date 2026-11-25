@@ -854,9 +854,14 @@ def exercise(binary, root):
         for source, target in pairs:
             shell_refused(source, target, "service_not_enabled")
         cli("b", "enable", "shell")
+        assert ["shell", "all paired peers", "-", "default", "-"] in grants("b")
+        terminal("c", "b", True)
+        grant("b", "c")
+        terminal("a", "b", True, during=lambda: cli("b", "disable", "shell"))
+        shell_refused("a", "b", "service_not_enabled")
+        terminal("c", "b", True)
         for source, target in pairs:
-            if target != "b":
-                grant(target, source)
+            grant(target, source)
         short_ids = {row.split("\t")[2] for row in cli("b", "list").stdout.splitlines()[1:]}
         assert short_ids == {endpoint_id(peer)[:8] for peer in ("a", "c")}, short_ids
         master, slave = pty.openpty()
@@ -921,8 +926,7 @@ def exercise(binary, root):
         shell_refused("b", "a", "service_not_enabled")
         grant("b", "a")
         terminal("a", "b", True)
-        terminal("a", "b", True, during=lambda: cli("b", "disable", "shell"))
-        assert all(row[0] != "shell" for row in grants("b"))
+        terminal("a", "b", True, during=lambda: cli("b", "disable", "shell", "a"))
         shell_refused("a", "b", "service_not_enabled")
         grant("b", "a")
 

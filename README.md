@@ -4,7 +4,7 @@ MassRelay connects your own machines in a pocket network. Enrolled devices can s
 
 ## Install
 
-[MassRelay v0.3.10](https://github.com/zorkian/massrelay/releases/tag/v0.3.10) adds a quick start screen, a peer picker, clipboard invites, and bulk service grants.
+[MassRelay v0.3.11](https://github.com/zorkian/massrelay/releases/tag/v0.3.11) adds service defaults for current and future peers.
 
 On Linux or macOS, sign in with `gh auth login` using an account that has access to this repository. Then install the latest release to `~/.local/bin/massrelay`.
 
@@ -102,7 +102,7 @@ Run `massrelay run` under your ordinary account in a terminal or supervisor of y
 
 ## Allow services
 
-The device offering a service decides who may use it. Each grant names one peer and one service, and every device starts with none. In these examples, the device `talaria` offers services to its paired peer `dirk`.
+The device offering a service decides who may use it. You can grant access to individual peers or set a default for paired peers. Every service starts off. In these examples, the device `talaria` offers services to its paired peer `dirk`.
 
 ```sh
 # On talaria
@@ -125,7 +125,7 @@ Run `massrelay connect` in a terminal to choose a paired device and open a shell
 
 A shell gives the peer your account's access, including its ability to change MassRelay grants and to use its connections to other devices.
 
-`massrelay enable` and `massrelay disable` need `massrelay run` on the offering device, and work while the relay is unreachable. Grants are saved there and survive restarts. Peers are given by name or endpoint ID, and a grant stays with that device's ID. You can enable a service before both approvals are in place; it takes effect once they are. Declining the pairing on either side, or revoking the device, removes its grants, so enable them again after a new approval.
+`massrelay enable` and `massrelay disable` need a running device service on the offering device and work while the relay is unreachable. Grants are saved there and survive restarts. Peers are given by name or endpoint ID, and an individual grant stays with that device's ID. You can enable a service before both approvals are in place. It takes effect once they are. Declining the pairing on either side or revoking the device removes its individual grants.
 
 To stop a grant, disable it. Open sessions using it close, and other services and peers are unaffected.
 
@@ -133,14 +133,18 @@ To stop a grant, disable it. Open sessions using it close, and other services an
 massrelay disable tcp:4000 dirk
 ```
 
-Omit the peer to apply the change across the current peer list.
+Omit the peer to set the default for this service.
 
 ```sh
 massrelay enable shell
 massrelay disable shell
 ```
 
-Bulk grants apply to the peers present when you run the command, and each still needs mutual pairing before it can connect. Run `enable` again after adding a peer. If an active temporary exposure conflicts with an enable, stop that exposure before retrying. A bulk disable also ends any matching temporary exposures and active sessions.
+`enable shell` lets current and future peers use your shell once you've both approved the pairing. `disable shell` turns off the default and closes sessions that depend on it. Individual grants and temporary exposures continue to apply.
+
+Use `disable shell dirk` to exclude Dirk from an enabled default. That exception is saved across service restarts and default toggles. Use `enable shell dirk` to clear the exclusion and grant Dirk access individually. Defaults and exclusions appear in `massrelay list`. Grants saved by v0.3.10 are individual grants.
+
+To expose a port with a different target to one peer, disable the default for that peer first. The exclusion will apply again when the temporary exposure ends.
 
 `massrelay list` shows each grant's peer name, eight-character endpoint ID prefix, whether the grant is persistent or temporary, and where a port is forwarded. Use `massrelay list --full` for complete endpoint IDs. Grants are not announced to the relay or to other devices.
 

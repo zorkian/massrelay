@@ -311,11 +311,9 @@ pub enum LocalRequest {
         service: Service,
         peer: String,
     },
-    EnableAll {
+    SetServiceDefault {
         service: Service,
-    },
-    DisableAll {
-        service: Service,
+        enabled: bool,
     },
     Grants,
     /// Grant a service for as long as the requesting command stays connected.
@@ -334,7 +332,6 @@ pub enum LocalReply {
     Shell,
     Error(String),
     Connected,
-    GrantsChanged(usize),
     Grants(Vec<GrantView>),
     Exposed { peer: String, id: EndpointId },
 }
@@ -343,9 +340,17 @@ pub enum LocalReply {
 pub struct GrantView {
     pub service: Service,
     pub peer: Option<String>,
-    pub id: EndpointId,
+    pub id: Option<EndpointId>,
     pub temporary: bool,
     pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<GrantRule>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub enum GrantRule {
+    Default,
+    Excluded,
 }
 
 /// A peer's request to use a service. It cannot choose what the destination connects to.

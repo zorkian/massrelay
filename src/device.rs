@@ -27,7 +27,7 @@ use tokio::{
 use crate::{
     bind_endpoint,
     connection_log::{Audit, ConnectionLog, Direction, Session},
-    grants::{Access, Grants, RemovedGrant},
+    grants::{Access, GrantInstance, Grants, RemovedGrant, ServiceDefaults},
     local, storage, tcp, terminal, tunnel, udp,
     wire::{
         self, Decision, LocalReply, LocalRequest, Member, Peer, Refusal, Reply, Request, Roster,
@@ -118,6 +118,8 @@ struct Device {
     #[serde(default)]
     grants: Grants,
     #[serde(default)]
+    service_defaults: ServiceDefaults,
+    #[serde(default)]
     udp_port: Option<u16>,
     #[serde(skip)]
     dirty: bool,
@@ -149,6 +151,7 @@ impl Device {
         }
         self.grants
             .access(id, request.service, request.generation)
+            .or_else(|| self.service_defaults.access(id, request.service))
             .ok_or(Refusal::ServiceNotEnabled)
     }
 
@@ -156,7 +159,7 @@ impl Device {
         &self,
         id: EndpointId,
         request: &ServiceRequest,
-        instance: u64,
+        instance: GrantInstance,
     ) -> Result<(), Refusal> {
         if self.access(id, request)?.instance == instance {
             Ok(())
@@ -372,6 +375,7 @@ fn commit(dir: &Path, identity: Identity, roster: Roster) -> Result<()> {
         approvals: BTreeMap::new(),
         pending_declines: BTreeMap::new(),
         grants: Grants::default(),
+        service_defaults: ServiceDefaults::default(),
         udp_port: None,
         dirty: false,
         revoked: false,
@@ -859,23 +863,21 @@ impl Node {
         if matches!(request, LocalRequest::Grants) {
             let state = self.state.lock().await;
             ensure!(!state.revoked, "this device has been revoked");
-            return Ok(LocalReply::Grants(state.grants.list(|id| {
+            let name = |id| {
                 state
                     .roster
                     .peers
                     .iter()
                     .find(|peer| peer.member.id == id)
                     .map(|peer| peer.member.name.clone())
-            })));
+            };
+            let mut grants = state.service_defaults.list(name);
+            grants.extend(state.grants.list(name));
+            grants.sort_by_key(|grant| grant.service);
+            return Ok(LocalReply::Grants(grants));
         }
-        match request {
-            LocalRequest::EnableAll { service } => {
-                return self.change_all_grants(service, true).await;
-            }
-            LocalRequest::DisableAll { service } => {
-                return self.change_all_grants(service, false).await;
-            }
-            _ => {}
+        if let LocalRequest::SetServiceDefault { service, enabled } = request {
+            return self.set_service_default(service, enabled).await;
         }
         // Grants are local decisions, which work and take effect without the relay.
         if let LocalRequest::Enable { service, peer } = &request {
@@ -886,12 +888,14 @@ impl Node {
             let added = next
                 .grants
                 .enable(member.id, &member.name, *service, generation)?;
-            if added || next.dirty {
+            let cleared = next.service_defaults.clear_exclusion(member.id, *service);
+            if added || cleared || next.dirty {
                 // Access opens only after the grant is saved.
                 self.save_restrictions(&mut next)?;
                 *state = next;
             }
-            if added {
+            if added || cleared {
+                self.changed.send_replace(());
                 self.connection_log
                     .state("service_enabled", Some(&member), Some(*service));
             }
@@ -902,11 +906,19 @@ impl Node {
             let mut state = self.state.lock().await;
             // Access closes now, even if saving fails.
             let removed = state.grants.disable(member.id, *service);
+            let excluded = state.service_defaults.exclude(member.id, *service);
             if let Some(grant) = removed {
                 self.log_removed_grant(&member, *service, grant);
             }
+            if excluded {
+                self.connection_log.state(
+                    "service_default_excluded",
+                    Some(&member),
+                    Some(*service),
+                );
+            }
             self.changed.send_replace(());
-            if removed == Some(RemovedGrant::Persistent) || state.dirty {
+            if removed == Some(RemovedGrant::Persistent) || excluded || state.dirty {
                 self.save_restrictions(&mut state)?;
             }
             return Ok(LocalReply::Done);
@@ -985,62 +997,40 @@ impl Node {
             | LocalRequest::Grants
             | LocalRequest::Enable { .. }
             | LocalRequest::Disable { .. }
-            | LocalRequest::EnableAll { .. }
-            | LocalRequest::DisableAll { .. }
+            | LocalRequest::SetServiceDefault { .. }
             | LocalRequest::Shell { .. }
             | LocalRequest::Connect { .. }
             | LocalRequest::Expose { .. } => unreachable!(),
         }
     }
 
-    async fn change_all_grants(&self, service: Service, enable: bool) -> Result<LocalReply> {
+    async fn set_service_default(&self, service: Service, enabled: bool) -> Result<LocalReply> {
         let mut state = self.state.lock().await;
         ensure!(!state.revoked, "this device has been revoked");
-        let peers: Vec<_> = state
-            .roster
-            .peers
-            .iter()
-            .map(|peer| (peer.member.clone(), peer.pair.generation))
-            .collect();
-        if enable {
+        if enabled {
             let mut next = state.clone();
-            let mut added = Vec::new();
-            for (member, generation) in peers {
-                if !next.pending_declines.contains_key(&member.id)
-                    && next
-                        .grants
-                        .enable(member.id, &member.name, service, generation)?
-                {
-                    added.push(member);
-                }
-            }
-            if !added.is_empty() || next.dirty {
+            let changed = next.service_defaults.set(service, true);
+            if changed || next.dirty {
                 self.save_restrictions(&mut next)?;
                 *state = next;
             }
-            for member in &added {
+            if changed {
+                self.changed.send_replace(());
                 self.connection_log
-                    .state("service_enabled", Some(member), Some(service));
+                    .state("service_default_enabled", None, Some(service));
             }
-            return Ok(LocalReply::GrantsChanged(added.len()));
-        }
-
-        let mut removed = 0;
-        let mut persistent = false;
-        for (member, _) in peers {
-            if let Some(grant) = state.grants.disable(member.id, service) {
-                self.log_removed_grant(&member, service, grant);
-                removed += 1;
-                persistent |= grant == RemovedGrant::Persistent;
+        } else {
+            let changed = state.service_defaults.set(service, false);
+            if changed {
+                self.changed.send_replace(());
+                self.connection_log
+                    .state("service_default_disabled", None, Some(service));
+            }
+            if changed || state.dirty {
+                self.save_restrictions(&mut state)?;
             }
         }
-        if removed > 0 {
-            self.changed.send_replace(());
-        }
-        if persistent || state.dirty {
-            self.save_restrictions(&mut state)?;
-        }
-        Ok(LocalReply::GrantsChanged(removed))
+        Ok(LocalReply::Done)
     }
 
     async fn paired(&self, id: EndpointId, network: &str, generation: u64) -> bool {
@@ -1061,7 +1051,7 @@ impl Node {
         &self,
         id: EndpointId,
         request: &ServiceRequest,
-        instance: u64,
+        instance: GrantInstance,
         start: impl Future<Output = T>,
     ) -> Result<T, Refusal> {
         let lock = self.state.lock();
@@ -1085,7 +1075,7 @@ impl Node {
         &self,
         id: EndpointId,
         request: &ServiceRequest,
-        instance: u64,
+        instance: GrantInstance,
     ) -> Refusal {
         // Subscribing before the first check means no change can be missed.
         let mut changed = self.changed.subscribe();
@@ -1255,11 +1245,18 @@ impl Node {
         let member = self.lookup(peer).await?.member;
         let mut state = self.state.lock().await;
         let generation = state.grant_generation(&member)?;
+        ensure!(
+            state.service_defaults.access(member.id, service).is_none(),
+            "{service} is enabled by default for {}; run 'massrelay disable {service} {}' before exposing a different target",
+            member.name,
+            member.name
+        );
         let instance = state
             .grants
             .expose(member.id, &member.name, service, generation, target)?;
         self.connection_log
             .state("exposure_started", Some(&member), Some(service));
+        self.changed.send_replace(());
         Ok((member, instance))
     }
 
@@ -1698,8 +1695,15 @@ fn local_operation(request: &LocalRequest) -> (&'static str, Option<&str>, Optio
         LocalRequest::Connect { peer, service, .. } => ("connect", Some(peer), Some(*service)),
         LocalRequest::Enable { peer, service } => ("enable", Some(peer), Some(*service)),
         LocalRequest::Disable { peer, service } => ("disable", Some(peer), Some(*service)),
-        LocalRequest::EnableAll { service } => ("enable_all", None, Some(*service)),
-        LocalRequest::DisableAll { service } => ("disable_all", None, Some(*service)),
+        LocalRequest::SetServiceDefault { service, enabled } => (
+            if *enabled {
+                "enable_default"
+            } else {
+                "disable_default"
+            },
+            None,
+            Some(*service),
+        ),
         LocalRequest::Expose { peer, service, .. } => ("expose", Some(peer), Some(*service)),
     }
 }
@@ -1840,7 +1844,7 @@ mod grant_tests {
     }
 
     impl Node {
-        async fn allowed(&self, peer: &Peer, service: &str) -> Result<u64, Refusal> {
+        async fn allowed(&self, peer: &Peer, service: &str) -> Result<GrantInstance, Refusal> {
             let request = ServiceRequest {
                 network: "test".into(),
                 generation: peer.pair.generation,
@@ -1871,6 +1875,78 @@ mod grant_tests {
             };
             self.apply_reply(Reply::Roster(roster), None).await
         }
+    }
+
+    #[tokio::test]
+    async fn service_defaults_cover_new_pairs_and_preserve_peer_rules() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let first = paired_peer(1, "first", 0);
+        let next = paired_peer(2, "next", 0);
+        let node = destination(dir.path(), std::slice::from_ref(&first)).await?;
+        let service = Service::Shell;
+        node.set_service_default(service, true).await?;
+        let first_instance = node.allowed(&first, "shell").await.expect("first default");
+
+        let roster = Roster {
+            network: "test".into(),
+            peers: vec![first.clone(), next.clone()],
+        };
+        node.apply_reply(Reply::Roster(roster.clone()), None)
+            .await?;
+        assert_eq!(
+            node.allowed(&next, "shell").await,
+            Err(Refusal::PairingRequired)
+        );
+        node.apply_reply(
+            Reply::Roster(roster),
+            Some((next.member.id, next.pair.generation)),
+        )
+        .await?;
+        assert!(matches!(
+            node.allowed(&next, "shell").await,
+            Ok(GrantInstance::Default(_))
+        ));
+
+        node.set_service_default(service, false).await?;
+        assert_eq!(
+            node.allowed(&first, "shell").await,
+            Err(Refusal::ServiceNotEnabled)
+        );
+        node.set_service_default(service, true).await?;
+        assert_ne!(node.allowed(&first, "shell").await, Ok(first_instance));
+        node.change(false, "shell", "first").await?;
+        let saved = load_device(dir.path())?;
+        assert!(
+            saved
+                .service_defaults
+                .access(first.member.id, service)
+                .is_none()
+        );
+        assert!(
+            saved
+                .service_defaults
+                .access(next.member.id, service)
+                .is_some()
+        );
+
+        node.change(true, "shell", "next").await?;
+        node.set_service_default(service, false).await?;
+        assert!(matches!(
+            node.allowed(&next, "shell").await,
+            Ok(GrantInstance::Peer(_))
+        ));
+        node.set_service_default(service, true).await?;
+        assert_eq!(
+            node.allowed(&first, "shell").await,
+            Err(Refusal::ServiceNotEnabled)
+        );
+        node.change(true, "shell", "first").await?;
+        assert!(matches!(
+            node.allowed(&first, "shell").await,
+            Ok(GrantInstance::Peer(_))
+        ));
+        node.endpoint.close().await;
+        Ok(())
     }
 
     #[tokio::test]
@@ -2063,6 +2139,7 @@ mod tests {
             approvals: BTreeMap::from([(source.id(), 0)]),
             pending_declines: BTreeMap::new(),
             grants: Grants::default(),
+            service_defaults: ServiceDefaults::default(),
             udp_port: None,
             dirty: false,
             revoked: false,
