@@ -4,6 +4,26 @@ set -eu
 repo=zorkian/massrelay
 install_dir=${MASSRELAY_INSTALL_DIR:-"$HOME/.local/bin"}
 version=${MASSRELAY_VERSION:-}
+relay=false
+public_ip=
+
+fail() {
+    printf '%s\n' "$*" >&2
+    exit 1
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --relay) relay=true ;;
+        --public-ip)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail '--public-ip needs an address.'
+            public_ip=$2
+            shift ;;
+        *) fail "Unknown installer option: $1" ;;
+    esac
+    shift
+done
+[ -z "$public_ip" ] || "$relay" || fail '--public-ip requires --relay.'
 
 case "$(uname -s)" in
     Linux) os=linux ;;
@@ -16,6 +36,51 @@ case "$(uname -m)" in
     aarch64|arm64) arch=aarch64 ;;
     *) printf '%s\n' 'No MassRelay binary is available for this CPU.' >&2; exit 1 ;;
 esac
+
+if "$relay"; then
+    [ "$os" = linux ] || fail '--relay requires Linux with a systemd user manager.'
+    systemctl --user show-environment >/dev/null || fail 'Could not reach the systemd user manager.'
+    case "$install_dir" in
+        /*) ;;
+        *) install_dir="$PWD/$install_dir" ;;
+    esac
+    relay_state=${XDG_DATA_HOME:-"$HOME/.local/share"}/massrelay-relay
+    unit_dir=${XDG_CONFIG_HOME:-"$HOME/.config"}/systemd/user
+    unit="$unit_dir/massrelay-relay.service"
+    if [ -e "$unit" ] || [ -L "$unit" ]; then
+        saved_ip=$(sed -n 's/^# MassRelay installer public IP: //p' "$unit")
+        [ -n "$saved_ip" ] || fail "An existing service uses $unit."
+        [ -z "$public_ip" ] || [ "$public_ip" = "$saved_ip" ] ||
+            fail "The relay already advertises $saved_ip."
+        public_ip=$saved_ip
+    fi
+    if [ -z "$public_ip" ]; then
+        public_ip=$(curl -4fsS --noproxy '*' --proto '=https' https://api.ipify.org ||
+            curl -6fsS --noproxy '*' --proto '=https' https://api64.ipify.org) ||
+            fail 'Could not discover a public IP. Pass --public-ip ADDRESS.'
+    fi
+    case "$public_ip" in
+        *:*)
+            case "$public_ip" in *[!0-9a-fA-F:.]*) fail 'Expected an IPv6 address.' ;; esac
+            getent ahostsv6 "$public_ip" >/dev/null || fail 'Expected a usable IPv6 address.'
+            advertised="[$public_ip]"
+            bind='[::]'
+            local_address='[::1]'
+            ;;
+        *.*)
+            case "$public_ip" in *[!0-9.]*) fail 'Expected an IPv4 address.' ;; esac
+            printf '%s\n' "$public_ip" | awk -F . '
+                NF != 4 { exit 1 }
+                { for (i = 1; i <= NF; i++)
+                    if ($i !~ /^(0|[1-9][0-9]*)$/ || $i > 255) exit 1 }
+            ' || fail 'Expected an IPv4 address.'
+            advertised=$public_ip
+            bind=0.0.0.0
+            local_address=127.0.0.1
+            ;;
+        *) fail 'Expected a public IPv4 or IPv6 address.' ;;
+    esac
+fi
 
 asset="massrelay-$os-$arch"
 case "$version" in
@@ -31,15 +96,41 @@ esac
 
 stage=$(mktemp -d "${TMPDIR:-/tmp}/massrelay.XXXXXX")
 destination_tmp=
+unit_tmp=
 cleanup() {
-    rm -f "$stage/$asset" "$stage/SHA256SUMS"
+    rm -f "$stage/$asset" "$stage/SHA256SUMS" "$stage/massrelay-relay.service"
     rmdir "$stage"
     if [ -n "$destination_tmp" ]; then
         rm -f "$destination_tmp"
     fi
+    if [ -n "$unit_tmp" ]; then
+        rm -f "$unit_tmp"
+    fi
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
+
+if "$relay"; then
+    # Escape systemd quoting, specifiers, and ExecStart variable expansion.
+    unit_arg() {
+        printf '"%s"' "$(printf '%s' "$1" | sed 's/["\\]/\\&/g; s/%/%%/g; s/\$/$$/g')"
+    }
+    {
+        printf '# MassRelay installer public IP: %s\n' "$public_ip"
+        printf '[Unit]\nDescription=MassRelay shared relay\n\n'
+        printf '[Service]\nType=exec\nRestart=on-failure\nExecStart='
+        unit_arg "$install_dir/massrelay"
+        printf ' --state-dir '
+        unit_arg "$relay_state"
+        printf ' relay --public-udp "%s:4433" --url "http://%s:3340" --udp-bind "%s:4433" --relay-bind "%s:3340"\n' \
+            "$advertised" "$advertised" "$bind" "$bind"
+        printf '\n[Install]\nWantedBy=default.target\n'
+    } > "$stage/massrelay-relay.service"
+    if [ -e "$unit" ] || [ -L "$unit" ]; then
+        cmp -s "$unit" "$stage/massrelay-relay.service" ||
+            fail "The existing service at $unit differs from this installation."
+    fi
+fi
 
 if curl -fsSL "$base/$asset" -o "$stage/$asset" 2>/dev/null; then
     curl -fsSL "$base/SHA256SUMS" -o "$stage/SHA256SUMS"
@@ -79,9 +170,38 @@ if [ -d "$install_dir/massrelay" ]; then
 fi
 destination_tmp=$(mktemp "$install_dir/.massrelay.XXXXXX")
 install -m 0755 "$stage/$asset" "$destination_tmp"
+if "$relay"; then
+    "$destination_tmp" relay --help | grep -Fq -- '--public-udp' ||
+        fail 'This release does not support shared relays. Install MassRelay v0.2.0 or newer.'
+fi
 mv -f "$destination_tmp" "$install_dir/massrelay"
 destination_tmp=
 printf 'Installed %s\n' "$install_dir/massrelay"
+
+if "$relay"; then
+    mkdir -p "$unit_dir"
+    if [ ! -e "$unit" ] && [ ! -L "$unit" ]; then
+        unit_tmp=$(mktemp "$unit_dir/.massrelay-relay.XXXXXX")
+        install -m 0644 "$stage/massrelay-relay.service" "$unit_tmp"
+        mv -f "$unit_tmp" "$unit"
+        unit_tmp=
+    fi
+    systemctl --user daemon-reload
+    systemctl --user enable massrelay-relay.service
+    systemctl --user restart massrelay-relay.service
+    while ! locator=$("$install_dir/massrelay" --state-dir "$relay_state" relay-info 2>/dev/null) ||
+          ! curl -fsS --noproxy '*' -o /dev/null "http://$local_address:3340/healthz" 2>/dev/null; do
+        systemctl --user is-active --quiet massrelay-relay.service ||
+            fail 'Relay startup failed. Check journalctl --user -u massrelay-relay.service.'
+        sleep 1
+    done
+    systemctl --user is-active --quiet massrelay-relay.service ||
+        fail 'Relay stopped. Check journalctl --user -u massrelay-relay.service.'
+    printf 'Relay locator: %s\n' "$locator"
+    if [ "$(loginctl show-user "$(id -u)" -p Linger --value 2>/dev/null || true)" != yes ]; then
+        printf '%s\n' 'For boot startup and operation after logout, enable lingering for this user.'
+    fi
+fi
 
 case ":${PATH:-}:" in
     *":$install_dir:"*) ;;

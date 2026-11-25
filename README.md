@@ -47,6 +47,19 @@ Pushing a tag that matches the Cargo version, such as `v0.2.0`, builds and publi
 
 ## Start a shared relay
 
+On a Linux host with systemd, pass `--relay` to the installer to install the binary and start a user service.
+
+```sh
+gh api repos/zorkian/massrelay/contents/install.sh -H 'Accept: application/vnd.github.raw+json' |
+  sh -s -- --relay
+```
+
+The installer detects the public IP for a new relay and prints its public locator. To supply the address yourself, append `--public-ip ADDRESS` to the installer arguments. The service keeps its identity and membership under `${XDG_DATA_HOME:-$HOME/.local/share}/massrelay-relay`. Rerunning the relay installer updates the binary and restarts the service with the saved address. UDP `4433` and TCP `3340` must be reachable on that address.
+
+`systemctl --user status massrelay-relay.service` shows the service status. To start it at boot and keep it running after logout, the service account needs systemd lingering enabled.
+
+### Start the relay manually
+
 One shared relay serves any number of independent pocket networks. On a reachable host, start it with the addresses that devices will use to reach it.
 
 ```sh
