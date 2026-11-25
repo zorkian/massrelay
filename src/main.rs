@@ -1,6 +1,8 @@
 mod connection_log;
 mod device;
 mod grants;
+#[cfg(target_os = "macos")]
+mod launch_agent;
 mod local;
 mod relay;
 mod storage;
@@ -97,6 +99,9 @@ enum Command {
         #[arg(long, default_value = "0.0.0.0:0")]
         bind: SocketAddr,
     },
+    /// Set up and start this device's background service on macOS.
+    #[cfg(target_os = "macos")]
+    Install,
     /// List devices, recent presence, and pairing status.
     Peers,
     /// Issue a one-use invite valid for ten minutes.
@@ -183,10 +188,7 @@ async fn main() {
 async fn execute(cli: Cli) -> Result<i32> {
     let dir = match cli.state_dir {
         Some(dir) => dir,
-        None => ProjectDirs::from("", "", "MassRelay")
-            .context("cannot find the user state directory; specify --state-dir")?
-            .data_local_dir()
-            .to_path_buf(),
+        None => default_state_dir()?,
     };
 
     match cli.command {
@@ -237,6 +239,8 @@ async fn execute(cli: Cli) -> Result<i32> {
             log_file,
             bind,
         } => device::run(dir, shell, bind, log_file).await?,
+        #[cfg(target_os = "macos")]
+        Command::Install => launch_agent::install(&dir)?,
         Command::Peers => {
             let LocalReply::Peers(peers) = local::command(&dir, LocalRequest::Peers).await? else {
                 bail!("unexpected roster reply");
@@ -355,6 +359,13 @@ async fn execute(cli: Cli) -> Result<i32> {
         } => local::connect(&dir, peer, service, listen).await?,
     }
     Ok(0)
+}
+
+fn default_state_dir() -> Result<PathBuf> {
+    Ok(ProjectDirs::from("", "", "MassRelay")
+        .context("cannot find the user state directory; specify --state-dir")?
+        .data_local_dir()
+        .to_path_buf())
 }
 
 fn visible(value: &str) -> String {

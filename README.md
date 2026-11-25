@@ -4,7 +4,7 @@ MassRelay connects your own machines in a pocket network. Enrolled devices can s
 
 ## Install
 
-[MassRelay v0.3.0](https://github.com/zorkian/massrelay/releases/tag/v0.3.0) adds per-peer service grants, temporary TCP and UDP forwarding, and connection logs. If you already run MassRelay on your devices, see [the upgrade instructions](#upgrade-from-v020-or-earlier).
+[MassRelay v0.3.1](https://github.com/zorkian/massrelay/releases/tag/v0.3.1) adds `massrelay install` for macOS background setup. If you're upgrading from v0.2.0 or earlier, see [the upgrade instructions](#upgrade-from-v020-or-earlier).
 
 On Linux or macOS, sign in with `gh auth login` using an account that has access to this repository. Then install the latest release to `~/.local/bin/massrelay`.
 
@@ -120,7 +120,7 @@ The complete forms are:
 
 `join` treats its argument as an invite only when it is a complete invite token, and otherwise as a device name.
 
-Then run `massrelay run` on both machines and leave it running. In another terminal on each machine, approve the other.
+Start MassRelay on both machines. On macOS, run [`massrelay install`](#run-in-the-background-on-macos) to set up the background service. On other platforms, run `massrelay run` and leave it running. Then approve the other device from each machine.
 
 ```sh
 # On laptop
@@ -130,7 +130,7 @@ massrelay approve workstation
 massrelay approve laptop
 ```
 
-Compare the endpoint ID shown by `approve` with the one that `massrelay run` prints on the other device. To script an approval, pass the verified endpoint ID instead of the name.
+Compare the endpoint ID shown by `approve` with the one that `massrelay run` prints on the other device. On macOS with the LaunchAgent, look for `MassRelay running as` in the service log. To script an approval, pass the verified endpoint ID instead of the name.
 
 Pairing alone gives no access. To open a shell from the laptop, allow it on the workstation.
 
@@ -235,35 +235,16 @@ Service grants replace the flag that `massrelay run` used to allow shells. The n
 
 ## Run in the background on macOS
 
-After creating or joining a network, stop any foreground `massrelay run` and load a LaunchAgent under your account. This example writes connection events to `~/Library/Logs/MassRelay-connections.jsonl`. Use `massrelay enable` to allow peers to use services.
+After creating or joining a network, stop any foreground `massrelay run` and run this from your Mac account.
 
 ```sh
-mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
-plist="$HOME/Library/LaunchAgents/com.massrelay.client.plist"
-cat > "$plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>com.massrelay.client</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>$HOME/.local/bin/massrelay</string>
-    <string>run</string>
-    <string>--log-file</string>
-    <string>$HOME/Library/Logs/MassRelay-connections.jsonl</string>
-  </array>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardErrorPath</key>
-  <string>$HOME/Library/Logs/MassRelay.log</string>
-</dict>
-</plist>
-EOF
-plutil -lint "$plist" && launchctl bootstrap "gui/$(id -u)" "$plist"
+massrelay install
+massrelay peers
 ```
 
-If the agent is already loaded, run `launchctl bootout "gui/$(id -u)/com.massrelay.client"` before reloading the plist. Use `massrelay peers` to check the agent and `tail -f ~/Library/Logs/MassRelay-connections.jsonl` to watch connections.
+The command writes and loads a LaunchAgent under your account. It starts immediately and at future logins. For the default profile, it uses `~/Library/LaunchAgents/com.massrelay.client.plist`, replacing the previous example plist if present. The service log is `~/Library/Logs/MassRelay.log`, and connection events go to `~/Library/Logs/MassRelay-connections.jsonl`. With `--state-dir`, the command prints the job name and log paths for that profile.
+
+After updating the binary, rerun `massrelay install` to reload the agent. To watch connections for the default profile, run `tail -f ~/Library/Logs/MassRelay-connections.jsonl`.
 
 Connection events are one JSON object per line. Each records the UTC time, direction, session number, the peer's name and endpoint ID when known, and the service when known. Failed and disconnect events include the reason, and on the shell host the exit code if available. Shell commands, terminal output, forwarded data, forwarding addresses, and invitations stay out of the connection log. Use `massrelay run --log-file PATH` for the same log from a terminal. By default, connection events go to stderr.
 

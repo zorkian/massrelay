@@ -355,9 +355,7 @@ pub async fn run(
     log_file: Option<PathBuf>,
 ) -> Result<()> {
     let _lock = storage::lock(&dir)?;
-    let mut device: Device =
-        storage::load(&dir, FILE).context("use create or join to enroll this device")?;
-    ensure!(!device.revoked, "this device has been revoked");
+    let mut device = load_device(&dir)?;
     let connection_log = ConnectionLog::open(log_file.as_deref())?;
     let bind_device = |addr| {
         bind_endpoint(
@@ -442,6 +440,18 @@ pub async fn run(
     node.endpoint.close().await;
     tasks.shutdown().await;
     result
+}
+
+fn load_device(dir: &Path) -> Result<Device> {
+    let device: Device =
+        storage::load(dir, FILE).context("use create or join to enroll this device")?;
+    ensure!(!device.revoked, "this device has been revoked");
+    Ok(device)
+}
+
+#[cfg(target_os = "macos")]
+pub fn check_enrolled(dir: &Path) -> Result<()> {
+    load_device(dir).map(drop)
 }
 
 async fn rpc(
