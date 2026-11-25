@@ -4,7 +4,7 @@ MassRelay connects your own machines in a pocket network. Enrolled devices can s
 
 ## Install
 
-[MassRelay v0.3.9](https://github.com/zorkian/massrelay/releases/tag/v0.3.9) adds `massrelay status` and groups the CLI help by task. If you're upgrading from v0.2.0 or earlier, see [the upgrade instructions](#upgrade-from-v020-or-earlier).
+[MassRelay v0.3.10](https://github.com/zorkian/massrelay/releases/tag/v0.3.10) adds a quick start screen, a peer picker, clipboard invites, and bulk service grants.
 
 On Linux or macOS, sign in with `gh auth login` using an account that has access to this repository. Then install the latest release to `~/.local/bin/massrelay`.
 
@@ -41,7 +41,7 @@ Release binaries and their checksums are also available on the [Releases page](h
 
 ## Pair two machines
 
-Run `massrelay status` any time to check enrollment, see your own endpoint ID, or find the next step. To create a pocket network, ask the relay operator for its public locator, or [start your own relay](#start-a-shared-relay). On the first machine, set the locator and create the network.
+Run `massrelay` for a short overview and the next step, or `massrelay --help` for all commands. Use `massrelay status` when you need this device's full endpoint ID. To create a pocket network, ask the relay operator for its public locator, or [start your own relay](#start-a-shared-relay). On the first machine, set the locator and create the network.
 
 ```sh
 export MASSRELAY_RELAY=mrrelay1_...
@@ -57,6 +57,8 @@ massrelay join mr1_...
 ```
 
 To keep the invite out of shell history and process lists, run `massrelay join` and paste it at the prompt instead.
+
+Use `massrelay create --copy` or `massrelay invite --copy` to copy the invite to your desktop clipboard. Then send it to the other device and paste it at the join prompt. On Linux, clipboard copy uses `wl-copy` on Wayland or `xclip` on X11. The default commands print the invite, so you can also use them over SSH or in a pipeline.
 
 Each device is named after the first part of its machine's hostname, with unsupported characters replaced by hyphens. If no usable hostname is available, the name is derived from the device key. Add `--name NAME` to either command to choose a name, for example when two machines share a hostname. Names may contain ASCII letters, digits, hyphens, and underscores.
 
@@ -109,9 +111,11 @@ massrelay enable tcp:4000 dirk
 massrelay list
 
 # On dirk
-massrelay shell talaria
+massrelay connect talaria
 massrelay connect talaria tcp:4000
 ```
+
+Run `massrelay connect` in a terminal to choose a paired device and open a shell. You can also use `massrelay shell PEER`.
 
 | Service | What the peer can do |
 | --- | --- |
@@ -128,6 +132,15 @@ To stop a grant, disable it. Open sessions using it close, and other services an
 ```sh
 massrelay disable tcp:4000 dirk
 ```
+
+Omit the peer to apply the change across the current peer list.
+
+```sh
+massrelay enable shell
+massrelay disable shell
+```
+
+Bulk grants apply to the peers present when you run the command, and each still needs mutual pairing before it can connect. Run `enable` again after adding a peer. If an active temporary exposure conflicts with an enable, stop that exposure before retrying. A bulk disable also ends any matching temporary exposures and active sessions.
 
 `massrelay list` shows each grant's peer name, eight-character endpoint ID prefix, whether the grant is persistent or temporary, and where a port is forwarded. Use `massrelay list --full` for complete endpoint IDs. Grants are not announced to the relay or to other devices.
 

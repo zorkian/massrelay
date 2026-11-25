@@ -177,11 +177,11 @@ def exercise(binary, root):
             for a, b in [(left, right), (right, left)]
         )
 
-    def terminal(source, target, allowed, during=None):
+    def terminal(source, target, allowed, during=None, command="shell"):
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
         proc = subprocess.Popen(
-            args(source, "shell", target), stdin=slave, stdout=slave, stderr=slave,
+            args(source, command, target), stdin=slave, stdout=slave, stderr=slave,
         )
         os.close(slave)
         output = bytearray()
@@ -761,6 +761,8 @@ def exercise(binary, root):
         # A configured shared locator does not change the ticket form.
         empty = cli("a", "status").stdout
         assert "unenrolled" in empty and not (root / "a").exists(), empty
+        home = cli("a").stdout
+        assert "massrelay join" in home and "massrelay create" in home and not (root / "a").exists()
         cli("a", "create", "a", ticket=create, env={"MASSRELAY_RELAY": locator})
         offline = cli("a", "status").stdout
         assert "enrolled" in offline and "unavailable" in offline, offline
@@ -769,6 +771,19 @@ def exercise(binary, root):
         eventually(lambda: cli("a", "peers", check=False).returncode == 0, "device a up")
         online = cli("a", "status").stdout
         assert "running" in online and endpoint_id("a") in online, online
+
+        if sys.platform.startswith("linux"):
+            clipboard = root / "clipboard"
+            helper = root / "wl-copy"
+            helper.write_text('#!/bin/sh\ncat > "$MASSRELAY_TEST_CLIPBOARD"\n')
+            helper.chmod(0o700)
+            copied = cli("a", "invite", "--copy", env={
+                "PATH": f"{root}:{inherited['PATH']}",
+                "WAYLAND_DISPLAY": "test",
+                "MASSRELAY_TEST_CLIPBOARD": str(clipboard),
+            })
+            assert not copied.stdout and clipboard.read_text().startswith("mr1_"), copied
+            assert clipboard.read_text() not in copied.stderr
 
         # An invalid local proof is audited without authenticating a caller or logging the proof.
         runtime = json.loads((root / "a" / "runtime.json").read_text())
@@ -822,11 +837,26 @@ def exercise(binary, root):
         cli("c", "decline", "a")
         eventually(lambda: paired("a", "b") and paired("b", "c"), "two approved pairs")
 
+        # The chooser lists paired devices and an empty selection opens no session.
+        master, slave = pty.openpty()
+        try:
+            before = len(connection_events("a"))
+            os.write(master, b"\n")
+            picked = subprocess.run(args("a", "connect"), stdin=slave, stdout=slave, stderr=subprocess.PIPE,
+                                    text=True, check=True, timeout=5, env=inherited)
+            assert [line.strip() for line in picked.stderr.splitlines() if line.startswith("  ")] == ["1  b"]
+            assert all(event["event"] != "connected" for event in connection_events("a")[before:])
+        finally:
+            os.close(master)
+            os.close(slave)
+
         pairs = [("a", "b"), ("b", "a"), ("b", "c"), ("c", "b")]
         for source, target in pairs:
             shell_refused(source, target, "service_not_enabled")
+        cli("b", "enable", "shell")
         for source, target in pairs:
-            grant(target, source)
+            if target != "b":
+                grant(target, source)
         short_ids = {row.split("\t")[2] for row in cli("b", "list").stdout.splitlines()[1:]}
         assert short_ids == {endpoint_id(peer)[:8] for peer in ("a", "c")}, short_ids
         master, slave = pty.openpty()
@@ -847,7 +877,7 @@ def exercise(binary, root):
             assert any(event["event"] == "pairing_established" and event["peer_name"] == "a"
                        for event in events)
         for source, target in pairs:
-            terminal(source, target, True)
+            terminal(source, target, True, command="connect")
         eventually(lambda: recorded_session("a", "b", "outbound"), "outbound connection log")
         eventually(lambda: recorded_session("b", "a", "inbound", 7), "inbound connection log")
         eventually(lambda: recorded_session("a", "b", "outbound", supervisor=True),
@@ -891,7 +921,8 @@ def exercise(binary, root):
         shell_refused("b", "a", "service_not_enabled")
         grant("b", "a")
         terminal("a", "b", True)
-        terminal("a", "b", True, during=lambda: cli("b", "disable", "shell", "a"))
+        terminal("a", "b", True, during=lambda: cli("b", "disable", "shell"))
+        assert all(row[0] != "shell" for row in grants("b"))
         shell_refused("a", "b", "service_not_enabled")
         grant("b", "a")
 

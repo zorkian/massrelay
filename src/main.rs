@@ -22,6 +22,7 @@ use std::{
     net::SocketAddr,
     num::NonZeroU16,
     path::{Path, PathBuf},
+    process::{Command as Process, Stdio},
 };
 
 use anyhow::{Context, Result, bail};
@@ -45,7 +46,7 @@ struct Cli {
     #[arg(long, global = true, env = "MASSRELAY_STATE_DIR")]
     state_dir: Option<PathBuf>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -85,6 +86,9 @@ enum Command {
         /// Device name on a shared relay. Defaults to this machine's hostname.
         #[arg(long)]
         name: Option<String>,
+        /// Copy the first invite to the clipboard.
+        #[arg(long, conflicts_with = "ticket_name")]
+        copy: bool,
     },
     /// Enroll in a pocket network using an invite.
     Join {
@@ -128,7 +132,11 @@ enum Command {
         full: bool,
     },
     /// Issue a one-use invite valid for ten minutes.
-    Invite,
+    Invite {
+        /// Copy the invite to the clipboard instead of printing it.
+        #[arg(long)]
+        copy: bool,
+    },
     /// Approve a pairing by device name or endpoint ID.
     Approve { peer: String },
     /// Decline an approval request or end an existing pairing.
@@ -137,19 +145,19 @@ enum Command {
     Revoke { peer: String },
     /// Open an interactive shell on a paired device that has enabled it.
     Shell { peer: String },
-    /// Grant a peer persistent access to a service on this device.
+    /// Grant service access to one peer or to current peers.
     Enable {
         /// shell, tcp:PORT, or udp:PORT. Ports forward to loopback on this device.
         service: Service,
-        /// Peer name or endpoint ID.
-        peer: String,
+        /// Peer name or endpoint ID. Omit to grant access to current peers.
+        peer: Option<String>,
     },
-    /// Revoke a peer's access to a service and close its sessions.
+    /// Remove service access from one peer or all peers.
     Disable {
         /// shell, tcp:PORT, or udp:PORT.
         service: Service,
-        /// Peer name or endpoint ID.
-        peer: String,
+        /// Peer name or endpoint ID. Omit to remove access for all peers.
+        peer: Option<String>,
     },
     /// List the services this device grants, and who may use them.
     List {
@@ -168,17 +176,17 @@ enum Command {
         #[arg(value_name = "HOST:PORT", value_parser = target)]
         target: Option<String>,
     },
-    /// Use a port that a paired device has enabled or exposed.
+    /// Connect to a peer's shell or forwarded port.
     ///
     /// A TCP service is connected to standard input and output. A UDP service is
     /// offered on a loopback port until this command is interrupted.
     Connect {
-        /// Peer name or endpoint ID.
-        peer: String,
-        /// tcp:PORT or udp:PORT.
-        service: Service,
+        /// Peer name or endpoint ID. Omit to choose in a terminal.
+        peer: Option<String>,
+        /// shell, tcp:PORT, or udp:PORT. Defaults to shell.
+        service: Option<Service>,
         /// Local UDP port to listen on. Defaults to the service's port.
-        #[arg(long, value_name = "PORT")]
+        #[arg(long, value_name = "PORT", requires = "service")]
         listen: Option<u16>,
     },
 }
@@ -256,7 +264,11 @@ async fn execute(cli: Cli) -> Result<i32> {
         None => default_state_dir()?,
     };
 
-    match cli.command {
+    let Some(command) = cli.command else {
+        device::show_home(&dir).await?;
+        return Ok(0);
+    };
+    match command {
         Command::RelayInit { public_udp, url } => relay::init(&dir, public_udp, url)?,
         Command::Relay {
             udp_bind,
@@ -285,7 +297,9 @@ async fn execute(cli: Cli) -> Result<i32> {
             .await?;
             eprintln!("Created a pocket network. Run 'massrelay status' for the next step.");
         }
-        Command::Create { relay, name, .. } => {
+        Command::Create {
+            relay, name, copy, ..
+        } => {
             let locator = relay.or_else(env_relay).context(
                 "pass --relay LOCATOR or set MASSRELAY_RELAY; \
                  with an operator creation ticket, use massrelay create NAME",
@@ -293,12 +307,10 @@ async fn execute(cli: Cli) -> Result<i32> {
             let server = ServerAddr::from_locator(&locator)?;
             let (name, invite) = device::create(&dir, server, name).await?;
             eprintln!(
-                "Created a pocket network. This device is {}. \
-                 Use the invite with 'massrelay join' on another device. It works once and expires in ten minutes. \
-                 Run 'massrelay status' for this device's next step.",
+                "Created a pocket network as {}. Run 'massrelay status' for this device's next step.",
                 visible(&name)
             );
-            println!("{invite}");
+            deliver_invite(&invite, copy)?;
         }
         Command::Join {
             invite_or_name,
@@ -351,17 +363,12 @@ async fn execute(cli: Cli) -> Result<i32> {
             }));
             print_table(&rows, terminal);
         }
-        Command::Invite => {
+        Command::Invite { copy } => {
             let LocalReply::Invite(ticket) = local::command(&dir, LocalRequest::Invite).await?
             else {
                 bail!("unexpected invite reply");
             };
-            if io::stderr().is_terminal() {
-                eprintln!(
-                    "Use this invite with 'massrelay join' on another device within ten minutes."
-                );
-            }
-            println!("{ticket}");
+            deliver_invite(&ticket, copy)?;
         }
         Command::Approve { peer } => {
             let peer = confirm_peer(&dir, &peer).await?;
@@ -391,20 +398,10 @@ async fn execute(cli: Cli) -> Result<i32> {
         }
         Command::Shell { peer } => return local::shell(&dir, peer).await,
         Command::Enable { service, peer } => {
-            let request = LocalRequest::Enable {
-                service,
-                peer: peer.clone(),
-            };
-            local::command(&dir, request).await?;
-            println!("Enabled {service} for {}", visible(&peer));
+            change_service(&dir, service, peer, true).await?;
         }
         Command::Disable { service, peer } => {
-            let request = LocalRequest::Disable {
-                service,
-                peer: peer.clone(),
-            };
-            local::command(&dir, request).await?;
-            println!("Disabled {service} for {}", visible(&peer));
+            change_service(&dir, service, peer, false).await?;
         }
         Command::List { full } => {
             let LocalReply::Grants(grants) = local::command(&dir, LocalRequest::Grants).await?
@@ -448,9 +445,153 @@ async fn execute(cli: Cli) -> Result<i32> {
             peer,
             service,
             listen,
-        } => local::connect(&dir, peer, service, listen).await?,
+        } => {
+            let peer = match peer {
+                Some(peer) => peer,
+                None => match pick_peer(&dir).await? {
+                    Some(peer) => peer,
+                    None => return Ok(0),
+                },
+            };
+            let service = service.unwrap_or(Service::Shell);
+            if service == Service::Shell {
+                anyhow::ensure!(listen.is_none(), "--listen applies to udp services");
+                return local::shell(&dir, peer).await;
+            }
+            local::connect(&dir, peer, service, listen).await?;
+        }
     }
     Ok(0)
+}
+
+async fn change_service(
+    dir: &Path,
+    service: Service,
+    peer: Option<String>,
+    enable: bool,
+) -> Result<()> {
+    let action = if enable { "Enabled" } else { "Disabled" };
+    if let Some(peer) = peer {
+        let request = if enable {
+            LocalRequest::Enable {
+                service,
+                peer: peer.clone(),
+            }
+        } else {
+            LocalRequest::Disable {
+                service,
+                peer: peer.clone(),
+            }
+        };
+        local::command(dir, request).await?;
+        println!("{action} {service} for {}", visible(&peer));
+    } else {
+        let request = if enable {
+            LocalRequest::EnableAll { service }
+        } else {
+            LocalRequest::DisableAll { service }
+        };
+        let LocalReply::GrantsChanged(changed) = local::command(dir, request).await? else {
+            bail!("unexpected bulk grant reply");
+        };
+        println!("{service}: {changed} current peer grants changed");
+    }
+    Ok(())
+}
+
+async fn pick_peer(dir: &Path) -> Result<Option<String>> {
+    anyhow::ensure!(
+        io::stdin().is_terminal() && io::stdout().is_terminal(),
+        "use 'massrelay connect PEER [SERVICE]'; run 'massrelay peers' to see device names"
+    );
+    let LocalReply::Peers(roster) = local::command(dir, LocalRequest::Peers).await? else {
+        bail!("unexpected roster reply");
+    };
+    let mut peers: Vec<_> = roster
+        .into_iter()
+        .filter(|peer| {
+            peer.pair.ours == Some(Decision::Approve) && peer.pair.theirs == Some(Decision::Approve)
+        })
+        .map(|peer| peer.member)
+        .collect();
+    peers.sort_by_cached_key(|peer| peer.name.to_ascii_lowercase());
+    if peers.is_empty() {
+        eprintln!(
+            "No paired devices. Run 'massrelay peers' to check approvals or 'massrelay invite' to add a device."
+        );
+        return Ok(None);
+    }
+    eprintln!("Open a shell on a paired device that has granted you access.");
+    for (index, peer) in peers.iter().enumerate() {
+        eprintln!("  {}  {}", index + 1, visible(&peer.name));
+    }
+    eprint!("Choose a device number, or press Enter to cancel: ");
+    io::stderr().flush()?;
+    let mut choice = String::new();
+    io::stdin().read_line(&mut choice)?;
+    let choice = choice.trim();
+    if choice.is_empty() {
+        return Ok(None);
+    }
+    let index = choice
+        .parse::<usize>()
+        .ok()
+        .and_then(|number| number.checked_sub(1));
+    let peer = index
+        .and_then(|index| peers.get(index))
+        .context("choose a device number from the list")?;
+    Ok(Some(peer.id.to_string()))
+}
+
+fn deliver_invite(invite: &str, copy: bool) -> Result<()> {
+    if copy {
+        let mut command = clipboard_command()?;
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context(
+                "open the clipboard helper; use the command without --copy to print the invite",
+            )?;
+        let written = child
+            .stdin
+            .take()
+            .expect("piped clipboard input")
+            .write_all(invite.as_bytes());
+        let result = child.wait()?;
+        written.context("write the invite to the clipboard")?;
+        anyhow::ensure!(result.success(), "clipboard helper failed ({result})");
+        eprintln!("Invite copied. Run 'massrelay join' on the other device and paste it there.");
+    } else if io::stdout().is_terminal() {
+        eprintln!("On the other device, run 'massrelay join' and paste the invite below.");
+        println!("{invite}");
+    } else {
+        println!("{invite}");
+        return Ok(());
+    }
+    eprintln!("The invite works once and expires in ten minutes.");
+    Ok(())
+}
+
+fn clipboard_command() -> Result<Process> {
+    #[cfg(target_os = "macos")]
+    return Ok(Process::new("/usr/bin/pbcopy"));
+    #[cfg(windows)]
+    return Ok(Process::new("clip.exe"));
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            return Ok(Process::new("wl-copy"));
+        }
+        if std::env::var_os("DISPLAY").is_some() {
+            let mut command = Process::new("xclip");
+            command.args(["-selection", "clipboard"]);
+            return Ok(command);
+        }
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    bail!("clipboard copy needs a desktop session; run 'massrelay invite' to print the invite");
 }
 
 fn default_state_dir() -> Result<PathBuf> {

@@ -311,6 +311,12 @@ pub enum LocalRequest {
         service: Service,
         peer: String,
     },
+    EnableAll {
+        service: Service,
+    },
+    DisableAll {
+        service: Service,
+    },
     Grants,
     /// Grant a service for as long as the requesting command stays connected.
     Expose {
@@ -328,6 +334,7 @@ pub enum LocalReply {
     Shell,
     Error(String),
     Connected,
+    GrantsChanged(usize),
     Grants(Vec<GrantView>),
     Exposed { peer: String, id: EndpointId },
 }

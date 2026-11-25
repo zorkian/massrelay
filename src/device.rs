@@ -525,7 +525,20 @@ fn load_device(dir: &Path) -> Result<Device> {
 }
 
 pub async fn status(dir: &Path) -> Result<()> {
-    println!("State directory  {}", dir.display());
+    show_device_status(dir, false).await
+}
+
+pub async fn show_home(dir: &Path) -> Result<()> {
+    println!("MassRelay\n");
+    show_device_status(dir, true).await?;
+    println!("\nRun 'massrelay --help' for all commands.");
+    Ok(())
+}
+
+async fn show_device_status(dir: &Path, home: bool) -> Result<()> {
+    if !home {
+        println!("State directory  {}", dir.display());
+    }
     if !dir.join(FILE).try_exists()? {
         if dir.join(PENDING).try_exists()? {
             println!("Enrollment       pending");
@@ -534,13 +547,17 @@ pub async fn status(dir: &Path) -> Result<()> {
             );
         } else {
             println!("Enrollment       unenrolled");
-            println!("Next             Run 'massrelay create' or 'massrelay join'");
+            println!("Have an invite?  Run 'massrelay join' and paste it.");
+            println!("New network?     Run 'massrelay create --relay LOCATOR'.");
+            println!("                 Get the public locator from whoever runs your relay.");
         }
         return Ok(());
     }
 
     let device: Device = storage::load(dir, FILE)?;
-    println!("Endpoint ID      {}", device.identity.public());
+    if !home {
+        println!("Endpoint ID      {}", device.identity.public());
+    }
     if device.revoked {
         println!("Enrollment       revoked");
         println!("Next             Use another state directory to enroll again");
@@ -557,7 +574,14 @@ pub async fn status(dir: &Path) -> Result<()> {
             .count();
         println!("Device service   running");
         println!("Peers            {} ({paired} paired)", peers.len());
-        println!("Next             Run 'massrelay peers' to see pairing status");
+        if home && paired > 0 {
+            println!("Connect          Run 'massrelay connect' to choose a paired device.");
+        }
+        if home && peers.is_empty() {
+            println!("Add a device     Run 'massrelay invite --copy' or 'massrelay invite'.");
+        } else {
+            println!("Pairing          Run 'massrelay peers' to check approvals.");
+        }
     } else {
         println!("Device service   unavailable");
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -844,6 +868,15 @@ impl Node {
                     .map(|peer| peer.member.name.clone())
             })));
         }
+        match request {
+            LocalRequest::EnableAll { service } => {
+                return self.change_all_grants(service, true).await;
+            }
+            LocalRequest::DisableAll { service } => {
+                return self.change_all_grants(service, false).await;
+            }
+            _ => {}
+        }
         // Grants are local decisions, which work and take effect without the relay.
         if let LocalRequest::Enable { service, peer } = &request {
             let member = self.lookup(peer).await?.member;
@@ -952,10 +985,62 @@ impl Node {
             | LocalRequest::Grants
             | LocalRequest::Enable { .. }
             | LocalRequest::Disable { .. }
+            | LocalRequest::EnableAll { .. }
+            | LocalRequest::DisableAll { .. }
             | LocalRequest::Shell { .. }
             | LocalRequest::Connect { .. }
             | LocalRequest::Expose { .. } => unreachable!(),
         }
+    }
+
+    async fn change_all_grants(&self, service: Service, enable: bool) -> Result<LocalReply> {
+        let mut state = self.state.lock().await;
+        ensure!(!state.revoked, "this device has been revoked");
+        let peers: Vec<_> = state
+            .roster
+            .peers
+            .iter()
+            .map(|peer| (peer.member.clone(), peer.pair.generation))
+            .collect();
+        if enable {
+            let mut next = state.clone();
+            let mut added = Vec::new();
+            for (member, generation) in peers {
+                if !next.pending_declines.contains_key(&member.id)
+                    && next
+                        .grants
+                        .enable(member.id, &member.name, service, generation)?
+                {
+                    added.push(member);
+                }
+            }
+            if !added.is_empty() || next.dirty {
+                self.save_restrictions(&mut next)?;
+                *state = next;
+            }
+            for member in &added {
+                self.connection_log
+                    .state("service_enabled", Some(member), Some(service));
+            }
+            return Ok(LocalReply::GrantsChanged(added.len()));
+        }
+
+        let mut removed = 0;
+        let mut persistent = false;
+        for (member, _) in peers {
+            if let Some(grant) = state.grants.disable(member.id, service) {
+                self.log_removed_grant(&member, service, grant);
+                removed += 1;
+                persistent |= grant == RemovedGrant::Persistent;
+            }
+        }
+        if removed > 0 {
+            self.changed.send_replace(());
+        }
+        if persistent || state.dirty {
+            self.save_restrictions(&mut state)?;
+        }
+        Ok(LocalReply::GrantsChanged(removed))
     }
 
     async fn paired(&self, id: EndpointId, network: &str, generation: u64) -> bool {
@@ -1613,6 +1698,8 @@ fn local_operation(request: &LocalRequest) -> (&'static str, Option<&str>, Optio
         LocalRequest::Connect { peer, service, .. } => ("connect", Some(peer), Some(*service)),
         LocalRequest::Enable { peer, service } => ("enable", Some(peer), Some(*service)),
         LocalRequest::Disable { peer, service } => ("disable", Some(peer), Some(*service)),
+        LocalRequest::EnableAll { service } => ("enable_all", None, Some(*service)),
+        LocalRequest::DisableAll { service } => ("disable_all", None, Some(*service)),
         LocalRequest::Expose { peer, service, .. } => ("expose", Some(peer), Some(*service)),
     }
 }
