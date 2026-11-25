@@ -5,19 +5,27 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use iroh::{EndpointId, RelayUrl, SecretKey};
-use iroh_relay::server::{Access, AccessControl, ClientRequest, RelayConfig, Server, ServerConfig};
+use iroh_relay::server::{
+    Access, AccessControl, ClientRequest, ConnectionId, RelayConfig, Server, ServerConfig,
+};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
-use tokio::sync::Mutex;
+use tokio::{
+    sync::{Mutex, mpsc},
+    task::JoinSet,
+};
 
 use crate::{
-    bind_endpoint, storage,
+    bind_endpoint,
+    connection_log::{Audit, ConnectionLog},
+    storage,
     wire::{self, Decision, Member, PairView, Peer, Reply, Request, Roster, ServerAddr, Ticket},
 };
 
 const STATE_FILE: &str = "relay.json";
+const EVENT_FILE: &str = "relay-events.jsonl";
 const INVITE_SECONDS: u64 = 600;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -362,8 +370,11 @@ impl RelayState {
 pub fn init(dir: &Path, udp: SocketAddr, relay: RelayUrl) -> Result<()> {
     let _lock = storage::lock(dir)?;
     ensure!(!dir.join(STATE_FILE).exists(), "relay already initialized");
+    let log = ConnectionLog::open(Some(&dir.join(EVENT_FILE)))?;
     let state = RelayState::new(udp, relay, false)?;
     storage::save(dir, STATE_FILE, &state)?;
+    log.state("relay_initialized", None, None);
+    audit_operator_ticket(&log);
     print_ticket(state)
 }
 
@@ -409,7 +420,22 @@ pub fn info(dir: &Path) -> Result<()> {
 
 pub fn create_ticket(dir: &Path) -> Result<()> {
     // Atomic state replacement allows this local read while the relay runs.
-    print_ticket(storage::load(dir, STATE_FILE)?)
+    let state = storage::load(dir, STATE_FILE)?;
+    let log = ConnectionLog::open(Some(&dir.join(EVENT_FILE)))?;
+    audit_operator_ticket(&log);
+    print_ticket(state)
+}
+
+fn audit_operator_ticket(log: &ConnectionLog) {
+    log.audit(
+        "relay_control",
+        Audit {
+            operation: "operator_ticket_read",
+            outcome: "allowed",
+            ..Audit::default()
+        },
+        None,
+    );
 }
 
 fn print_ticket(state: RelayState) -> Result<()> {
@@ -424,7 +450,10 @@ fn print_ticket(state: RelayState) -> Result<()> {
     Ok(())
 }
 
-struct RelayAccess(Arc<Mutex<RelayState>>);
+struct RelayAccess {
+    state: Arc<Mutex<RelayState>>,
+    transport_events: mpsc::UnboundedSender<Audit>,
+}
 
 impl std::fmt::Debug for RelayAccess {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -434,18 +463,36 @@ impl std::fmt::Debug for RelayAccess {
 
 impl AccessControl for RelayAccess {
     async fn on_connect(&self, client: &ClientRequest) -> Access {
-        let state = self.0.lock().await;
+        let state = self.state.lock().await;
         let peer = client.endpoint_id();
-        if peer == state.server.id
+        let allowed = peer == state.server.id
             || state
                 .networks
                 .values()
-                .any(|network| network.members.contains_key(&peer))
-        {
+                .any(|network| network.members.contains_key(&peer));
+        let _ = self.transport_events.send(Audit {
+            operation: "connect",
+            outcome: if allowed { "allowed" } else { "denied" },
+            actor_id: Some(peer),
+            transport_id: Some(client.connection_id().to_string()),
+            reason: (!allowed).then_some("not_enrolled"),
+            ..Audit::default()
+        });
+        if allowed {
             Access::Allow
         } else {
             Access::Deny { reason: None }
         }
+    }
+
+    fn on_disconnect(&self, peer: EndpointId, connection: ConnectionId) {
+        let _ = self.transport_events.send(Audit {
+            operation: "disconnect",
+            outcome: "closed",
+            actor_id: Some(peer),
+            transport_id: Some(connection.to_string()),
+            ..Audit::default()
+        });
     }
 }
 
@@ -457,13 +504,25 @@ pub async fn run(
 ) -> Result<()> {
     let _lock = storage::lock(&dir)?;
     let (config, new) = configure(&dir, advertised)?;
+    let audit = Arc::new(ConnectionLog::open(Some(&dir.join(EVENT_FILE)))?);
     let endpoint_key = SecretKey::from_bytes(&config.key);
     let relay_url = config.server.relay.clone();
     let locator = config.shared.then(|| config.server.locator()).transpose()?;
     let state = Arc::new(Mutex::new(config));
 
     let mut relay = RelayConfig::new(relay_bind);
-    relay.access = Arc::new(RelayAccess(state.clone()));
+    let (transport_events, mut events) = mpsc::unbounded_channel();
+    let transport_log = audit.clone();
+    // Iroh's synchronous disconnect callback must never block on log I/O.
+    let transport_writer = tokio::task::spawn_blocking(move || {
+        while let Some(event) = events.blocking_recv() {
+            transport_log.audit("relay_transport", event, None);
+        }
+    });
+    relay.access = Arc::new(RelayAccess {
+        state: state.clone(),
+        transport_events,
+    });
     let mut config = ServerConfig::default();
     config.relay = Some(relay);
     let mut server = Server::spawn(config).await?;
@@ -482,51 +541,127 @@ pub async fn run(
     // Save a new relay only once both listeners work, before it can accept a control request.
     if new {
         storage::save(&dir, STATE_FILE, &*state.lock().await)?;
+        audit.state("relay_initialized", None, None);
     }
     if let Some(locator) = locator {
         eprintln!("Shared relay locator (public): {locator}");
     }
     eprintln!("MassRelay listening on {udp_bind} UDP and {relay_bind} TCP");
+    audit.state("relay_started", None, None);
     let shutdown = crate::shutdown();
     tokio::pin!(shutdown);
-    loop {
+    let mut tasks = JoinSet::new();
+    let (server_exited, result) = loop {
         tokio::select! {
             ended = server.join() => {
-                ended??;
-                bail!("relay service stopped");
+                let result = ended.context("wait for relay transport")
+                    .and_then(|result| result.context("relay transport failed"))
+                    .and_then(|()| Err(anyhow::anyhow!("relay service stopped")));
+                break (true, result);
             }
-            signal = &mut shutdown => break signal?,
+            signal = &mut shutdown => break (false, signal.context("wait for relay shutdown")),
+            Some(_) = tasks.join_next() => {},
             incoming = endpoint.accept() => {
-                let Some(incoming) = incoming else { bail!("control endpoint closed") };
+                let Some(incoming) = incoming else { break (false, Err(anyhow::anyhow!("control endpoint closed"))) };
                 let (dir, state) = (dir.clone(), state.clone());
                 let relay_service = relay_service.clone();
-                tokio::spawn(async move {
-                    let _ = tokio::time::timeout(wire::RPC_TIMEOUT, async {
+                let audit = audit.clone();
+                tasks.spawn(async move {
+                    let mut actor = None;
+                    let mut stage = "handshake";
+                    let result = tokio::time::timeout(wire::RPC_TIMEOUT, async {
                         let connection = incoming.await?;
                         let who = connection.remote_id();
+                        actor = Some(who);
+                        stage = "read_request";
                         let (mut tx, mut rx) = connection.accept_bi().await?;
                         let request: Request = wire::recv(&mut rx).await?;
                         let revoked_peer = match &request {
                             Request::Revoke { peer } => Some(*peer),
                             _ => None,
                         };
-                        let reply = dispatch(&state, &dir, who, request).await;
+                        let reply = dispatch(&state, &dir, who, request, &audit).await;
                         if let (Some(peer), Reply::Roster(_)) = (revoked_peer, &reply) {
                             relay_service.clients().disconnect(peer, None);
                         }
+                        stage = "send_reply";
                         wire::send(&mut tx, reply).await?;
                         tx.finish()?;
                         // Keep the connection alive until the client has read the reply.
                         let _ = tx.stopped().await;
                         Ok::<_, anyhow::Error>(())
                     }).await;
+                    let reason = match result {
+                        Ok(Ok(())) => return,
+                        Ok(Err(_)) => "transport_or_protocol_error",
+                        Err(_) => "deadline_elapsed",
+                    };
+                    audit.audit("relay_control", Audit {
+                        operation: stage,
+                        outcome: "failed",
+                        actor_id: actor,
+                        reason: Some(reason),
+                        ..Audit::default()
+                    }, None);
                 });
             }
         }
-    }
+    };
     endpoint.close().await;
-    server.shutdown().await?;
+    tasks.shutdown().await;
+    let shutdown = if server_exited {
+        drop(server);
+        Ok(())
+    } else {
+        server.shutdown().await
+    };
+    drop(relay_service);
+    transport_writer.await?;
+    audit.state(
+        if result.is_ok() && shutdown.is_ok() {
+            "relay_stopped"
+        } else {
+            "relay_failed"
+        },
+        None,
+        None,
+    );
+    result?;
+    shutdown?;
     Ok(())
+}
+
+fn control_operation(request: &Request) -> (&'static str, Option<EndpointId>) {
+    match request {
+        Request::Create { .. } | Request::Enroll { create: true, .. } => ("create_network", None),
+        Request::Enroll { .. } => ("join_network", None),
+        Request::Sync { .. } => ("sync", None),
+        Request::Invite => ("issue_invite", None),
+        Request::Pair {
+            peer,
+            decision: Decision::Approve,
+            ..
+        } => ("approve", Some(*peer)),
+        Request::Pair {
+            peer,
+            decision: Decision::Decline,
+            ..
+        } => ("decline", Some(*peer)),
+        Request::Revoke { peer } => ("revoke", Some(*peer)),
+    }
+}
+
+fn rejection(error: &str) -> &'static str {
+    match error {
+        wire::INVALID_CREATE_TICKET => "invalid_create_ticket",
+        wire::INVALID_JOIN_INVITE => "invalid_or_spent_invite",
+        wire::EXPIRED_INVITE => "expired_invite",
+        wire::NAME_IN_USE => "name_in_use",
+        "device is not enrolled" => "not_enrolled",
+        "unknown peer" => "unknown_peer",
+        "advertised address does not match device identity" => "identity_mismatch",
+        _ => "request_rejected",
+    }
 }
 
 async fn dispatch(
@@ -534,25 +669,51 @@ async fn dispatch(
     dir: &Path,
     who: EndpointId,
     request: Request,
+    log: &ConnectionLog,
 ) -> Reply {
+    let (operation, target_id) = control_operation(&request);
     let mut state = state.lock().await;
-    if matches!(request, Request::Sync { .. }) {
-        return state
-            .apply(who, request)
-            .unwrap_or_else(|err| Reply::Error(err.to_string()));
-    }
-
-    let mut next = state.clone();
-    match next.apply(who, request) {
-        Ok(reply) => match storage::save(dir, STATE_FILE, &next) {
-            Ok(()) => {
-                *state = next;
-                reply
-            }
-            Err(err) => Reply::Error(format!("relay state could not be saved: {err}")),
+    let (reply, failure) = if matches!(request, Request::Sync { .. }) {
+        match state.apply(who, request) {
+            Ok(Reply::Roster(roster)) => return Reply::Roster(roster),
+            Ok(reply) => (reply, None),
+            Err(err) => (Reply::Error(err.to_string()), None),
+        }
+    } else {
+        let mut next = state.clone();
+        match next.apply(who, request) {
+            Ok(reply) => match storage::save(dir, STATE_FILE, &next) {
+                Ok(()) => {
+                    *state = next;
+                    (reply, None)
+                }
+                Err(err) => (
+                    Reply::Error(format!("relay state could not be saved: {err}")),
+                    Some("state_save_failed"),
+                ),
+            },
+            Err(err) => (Reply::Error(err.to_string()), None),
+        }
+    };
+    let (outcome, reason) = match (&reply, failure) {
+        (_, Some(reason)) => ("failed", Some(reason)),
+        (Reply::Error(error), None) => ("denied", Some(rejection(error))),
+        (Reply::Revoked, None) => ("denied", Some("device_revoked")),
+        _ => ("allowed", None),
+    };
+    log.audit(
+        "relay_control",
+        Audit {
+            operation,
+            outcome,
+            actor_id: Some(who),
+            target_id,
+            reason,
+            ..Audit::default()
         },
-        Err(err) => Reply::Error(err.to_string()),
-    }
+        None,
+    );
+    reply
 }
 
 #[cfg(test)]
@@ -680,14 +841,15 @@ mod tests {
     async fn retried_creation_keeps_one_network_across_restart() {
         let dir = tempfile::tempdir().unwrap();
         let (founder, second, third) = (id(1), id(2), id(3));
+        let log = ConnectionLog::open(None).unwrap();
         let state = Mutex::new(relay(true));
         let (_, roster, invite) =
-            created(dispatch(&state, dir.path(), founder, create("first")).await);
+            created(dispatch(&state, dir.path(), founder, create("first"), &log).await);
 
         // The reply is lost and the relay restarts before the founder retries.
         let state = Mutex::new(storage::load(dir.path(), STATE_FILE).unwrap());
         let (name, retried, again) =
-            created(dispatch(&state, dir.path(), founder, create("renamed")).await);
+            created(dispatch(&state, dir.path(), founder, create("renamed"), &log).await);
         assert_eq!(
             (name.as_str(), &retried.network, &again),
             ("first", &roster.network, &invite)

@@ -50,6 +50,29 @@ struct SessionEvent<'a> {
     exit_code: Option<i32>,
 }
 
+/// Audit fields are selected at the call site. Never serialize a request, reply or raw error.
+#[derive(Default, Serialize)]
+pub struct Audit {
+    pub operation: &'static str,
+    pub outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<EndpointId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<EndpointId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct AuditEvent<'a> {
+    #[serde(flatten)]
+    details: Event<'a>,
+    #[serde(flatten)]
+    audit: Audit,
+}
+
 pub struct Session<'a> {
     log: &'a ConnectionLog,
     id: u64,
@@ -108,6 +131,13 @@ impl ConnectionLog {
             member.map(|member| member.name.as_str()),
             service,
         ));
+    }
+
+    pub fn audit(&self, event: &'static str, audit: Audit, service: Option<Service>) {
+        self.write(AuditEvent {
+            details: Event::new(event, None, None, service),
+            audit,
+        });
     }
 
     fn write(&self, event: impl Serialize) {

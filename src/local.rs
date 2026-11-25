@@ -45,7 +45,7 @@ fn proof(key: &[u8; 32], role: &[u8], challenge: &[u8; 32]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
-pub async fn authenticate(socket: &mut TcpStream, runtime: &Runtime) -> Result<LocalRequest> {
+pub async fn authenticate(socket: &mut TcpStream, runtime: &Runtime) -> Result<()> {
     let mut response = [0; 32];
     socket.read_exact(&mut response).await?;
     socket
@@ -58,7 +58,7 @@ pub async fn authenticate(socket: &mut TcpStream, runtime: &Runtime) -> Result<L
         bool::from(response.ct_eq(&proof(&runtime.key, b"massrelay client v1", &challenge))),
         "local client authentication failed"
     );
-    wire::recv(socket).await
+    Ok(())
 }
 
 async fn open(dir: &Path, request: LocalRequest) -> Result<(TcpStream, LocalReply)> {

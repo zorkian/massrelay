@@ -4,7 +4,7 @@ MassRelay connects your own machines in a pocket network. Enrolled devices can s
 
 ## Install
 
-[MassRelay v0.3.3](https://github.com/zorkian/massrelay/releases/tag/v0.3.3) logs service grants, pairing changes, and incoming and outgoing sessions. If you're upgrading from v0.2.0 or earlier, see [the upgrade instructions](#upgrade-from-v020-or-earlier).
+[MassRelay v0.3.4](https://github.com/zorkian/massrelay/releases/tag/v0.3.4) adds device and relay audit logs. If you're upgrading from v0.2.0 or earlier, see [the upgrade instructions](#upgrade-from-v020-or-earlier).
 
 On Linux or macOS, sign in with `gh auth login` using an account that has access to this repository. Then install the latest release to `~/.local/bin/massrelay`.
 
@@ -251,6 +251,10 @@ On macOS, the command writes and loads a LaunchAgent under your account. It star
 With `--state-dir`, the command prints the service name and log locations for that profile. After updating the binary, rerun `massrelay install` to reload the background service.
 
 Events appear in both the service log and the JSONL event file. They include device startup and shutdown, peers joining and leaving, approvals and pairing changes, services enabled or disabled, temporary exposures, and session connects, disconnects, and failures. Session events include the direction and session ID. Failures and disconnects include a reason and the shell exit code when available. Events include the peer's name and endpoint ID and the service when relevant. Shell commands, terminal output, forwarded data, forwarding addresses, and invitations stay out of the event log. In the foreground, events go to stderr and to `connections.jsonl` in the state directory. Use `massrelay run --log-file PATH` to set a different path.
+
+Devices also audit enrollment, local commands and authentication failures, membership sync availability, state save errors, and failed peer handshakes. Enrollment events go to `connections.jsonl` in the state directory, including when the background service uses a different log file.
+
+The relay writes `relay-events.jsonl` in its state directory and mirrors events to stderr. It audits network creation, enrollment, invite issuance, operator ticket reads, approvals, declines, revocations, control errors, and authenticated relay connection decisions and disconnects. The default systemd relay service mirrors stderr to `journalctl --user -u massrelay-relay.service`. Relay transport events include an ID for matching a connection with its disconnect. The device logs provide the peer and service information for end-to-end sessions. Routine successful roster heartbeats are omitted. Audit records use authenticated endpoint IDs when known and fixed reason codes so credentials, raw requests, and data payloads stay out of the logs.
 
 ## Run a ticket-only relay
 

@@ -26,7 +26,7 @@ use tokio::{
 
 use crate::{
     bind_endpoint,
-    connection_log::{ConnectionLog, Direction, Session},
+    connection_log::{Audit, ConnectionLog, Direction, Session},
     grants::{Access, Grants, RemovedGrant},
     local, storage, tcp, terminal, tunnel, udp,
     wire::{
@@ -36,6 +36,7 @@ use crate::{
 };
 
 const FILE: &str = "device.json";
+const EVENT_FILE: &str = "connections.jsonl";
 const PENDING: &str = "pending-device.json";
 const SYNC_INTERVAL: Duration = Duration::from_secs(3);
 
@@ -223,7 +224,7 @@ pub async fn enroll(dir: &Path, ticket: Ticket, name: Option<String>, create: bo
         name: name.clone(),
         create,
     };
-    match register(&identity, request).await? {
+    match register(dir, &identity, request).await? {
         Reply::Roster(roster) => commit(dir, identity, roster),
         Reply::Revoked => bail!("this device was revoked; use a new state directory"),
         Reply::Error(error) => {
@@ -255,7 +256,7 @@ pub async fn create(
 ) -> Result<(String, String)> {
     let (_lock, identity) = prepare(dir, server, Enrollment::SharedCreate)?;
     let name = name.unwrap_or_else(|| default_name(identity.public()));
-    match register(&identity, Request::Create { name }).await? {
+    match register(dir, &identity, Request::Create { name }).await? {
         Reply::Created {
             name,
             roster,
@@ -317,22 +318,50 @@ fn prepare(dir: &Path, server: ServerAddr, operation: Enrollment) -> Result<(Fil
     Ok((lock, pending.identity))
 }
 
-async fn register(identity: &Identity, request: Request) -> Result<Reply> {
+async fn register(dir: &Path, identity: &Identity, request: Request) -> Result<Reply> {
+    let operation = match request {
+        Request::Create { .. } | Request::Enroll { create: true, .. } => "create_network",
+        _ => "join_network",
+    };
+    let log = ConnectionLog::open(Some(&dir.join(EVENT_FILE)))?;
     let bind = if identity.server.udp.is_ipv4() {
         "0.0.0.0:0"
     } else {
         "[::]:0"
     };
-    let endpoint = bind_endpoint(
-        SecretKey::from_bytes(&identity.key),
-        bind.parse()?,
+    let reply = async {
+        let endpoint = bind_endpoint(
+            SecretKey::from_bytes(&identity.key),
+            bind.parse()?,
+            None,
+            wire::SERVICE,
+            false,
+        )
+        .await?;
+        let reply = exchange(&endpoint, &identity.server, false, request).await;
+        endpoint.close().await;
+        reply
+    }
+    .await;
+    let (outcome, reason) = match &reply {
+        Ok(Reply::Created { .. } | Reply::Roster(_)) => ("allowed", None),
+        Ok(Reply::Revoked) => ("denied", Some("device_revoked")),
+        Ok(Reply::Error(_)) => ("denied", Some("relay_rejected_enrollment")),
+        Ok(_) => ("failed", Some("unexpected_reply")),
+        Err(_) => ("failed", Some("membership_service_unreachable")),
+    };
+    log.audit(
+        "enrollment",
+        Audit {
+            operation,
+            outcome,
+            actor_id: Some(identity.public()),
+            target_id: Some(identity.server.id),
+            reason,
+            ..Audit::default()
+        },
         None,
-        wire::SERVICE,
-        false,
-    )
-    .await?;
-    let reply = exchange(&endpoint, &identity.server, false, request).await;
-    endpoint.close().await;
+    );
     reply
 }
 
@@ -347,9 +376,23 @@ fn commit(dir: &Path, identity: Identity, roster: Roster) -> Result<()> {
         dirty: false,
         revoked: false,
     };
-    storage::save(dir, FILE, &device)?;
-    std::fs::remove_file(dir.join(PENDING))?;
-    Ok(())
+    let log = ConnectionLog::open(Some(&dir.join(EVENT_FILE)))?;
+    let saved = storage::save(dir, FILE, &device).and_then(|()| {
+        std::fs::remove_file(dir.join(PENDING)).context("clear completed enrollment")
+    });
+    log.audit(
+        "enrollment",
+        Audit {
+            operation: "commit",
+            outcome: if saved.is_ok() { "allowed" } else { "failed" },
+            actor_id: Some(device.identity.public()),
+            target_id: Some(device.identity.server.id),
+            reason: saved.is_err().then_some("state_save_failed"),
+            ..Audit::default()
+        },
+        None,
+    );
+    saved
 }
 
 pub async fn run(
@@ -360,7 +403,7 @@ pub async fn run(
 ) -> Result<()> {
     let _lock = storage::lock(&dir)?;
     let mut device = load_device(&dir)?;
-    let log_file = log_file.unwrap_or_else(|| dir.join("connections.jsonl"));
+    let log_file = log_file.unwrap_or_else(|| dir.join(EVENT_FILE));
     let connection_log = ConnectionLog::open(Some(&log_file))?;
     let bind_device = |addr| {
         bind_endpoint(
@@ -404,10 +447,25 @@ pub async fn run(
     let sync_node = node.clone();
     tasks.spawn(async move {
         let mut timer = tokio::time::interval(SYNC_INTERVAL);
+        let mut reachable = None;
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             timer.tick().await;
-            let _ = sync_node.refresh().await;
+            let synced = sync_node.refresh().await.is_ok();
+            if reachable != Some(synced) {
+                sync_node.connection_log.audit(
+                    "membership_sync",
+                    Audit {
+                        operation: "refresh_roster",
+                        actor_id: Some(sync_node.endpoint.id()),
+                        outcome: if synced { "allowed" } else { "failed" },
+                        reason: (!synced).then_some("could_not_sync_membership"),
+                        ..Audit::default()
+                    },
+                    None,
+                );
+                reachable = Some(synced);
+            }
             if sync_node.state.lock().await.revoked {
                 sync_node.endpoint.close().await;
                 return;
@@ -424,8 +482,17 @@ pub async fn run(
                 let Some(incoming) = incoming else { break Ok(()); };
                 let node = node.clone();
                 tasks.spawn(async move {
-                    let Ok(Ok(connection)) = timeout(wire::RPC_TIMEOUT, incoming).await else { return };
-                    node.serve_peer(connection).await;
+                    match timeout(wire::RPC_TIMEOUT, incoming).await {
+                        Ok(Ok(connection)) => node.serve_peer(connection).await,
+                        failed => {
+                            node.connection_log.audit("peer_transport", Audit {
+                                operation: "handshake",
+                                outcome: "failed",
+                                reason: Some(if failed.is_err() { "deadline_elapsed" } else { "handshake_failed" }),
+                                ..Audit::default()
+                            }, None);
+                        }
+                    }
                 });
             }
             connection = listener.accept() => {
@@ -548,6 +615,13 @@ impl Node {
         state.dirty = saved.is_err();
         if let Err(error) = &saved {
             eprintln!("massrelay: could not save updated device restrictions: {error:#}");
+            self.audit_local(
+                "save_restrictions",
+                "failed",
+                None,
+                None,
+                Some("state_save_failed"),
+            );
         }
         saved
     }
@@ -910,9 +984,73 @@ impl Node {
         }
     }
 
+    fn audit_local(
+        &self,
+        operation: &'static str,
+        outcome: &'static str,
+        target_id: Option<EndpointId>,
+        service: Option<Service>,
+        reason: Option<&'static str>,
+    ) {
+        self.connection_log.audit(
+            "local_control",
+            Audit {
+                operation,
+                outcome,
+                actor_id: Some(self.endpoint.id()),
+                target_id,
+                reason,
+                ..Audit::default()
+            },
+            service,
+        );
+    }
+
     async fn serve_local(&self, mut socket: TcpStream, runtime: &local::Runtime) -> Result<()> {
-        let request =
-            timeout(wire::RPC_TIMEOUT, local::authenticate(&mut socket, runtime)).await??;
+        let mut authenticated = false;
+        let request = timeout(wire::RPC_TIMEOUT, async {
+            local::authenticate(&mut socket, runtime).await?;
+            authenticated = true;
+            wire::recv(&mut socket).await
+        })
+        .await
+        .context("local request timed out")
+        .and_then(|result| result);
+        let request: LocalRequest = match request {
+            Ok(request) => request,
+            Err(error) => {
+                self.connection_log.audit(
+                    "local_control",
+                    Audit {
+                        operation: if authenticated {
+                            "read_request"
+                        } else {
+                            "authenticate"
+                        },
+                        outcome: "denied",
+                        actor_id: authenticated.then(|| self.endpoint.id()),
+                        reason: Some(if authenticated {
+                            "invalid_or_incomplete_request"
+                        } else {
+                            "authentication_failed"
+                        }),
+                        ..Audit::default()
+                    },
+                    None,
+                );
+                return Err(error);
+            }
+        };
+        let (operation, peer, service) = local_operation(&request);
+        let target_id = match peer {
+            Some(peer) => {
+                peer.parse()
+                    .ok()
+                    .or(self.lookup(peer).await.ok().map(|peer| peer.member.id))
+            }
+            None => None,
+        };
+        self.audit_local(operation, "requested", target_id, service, None);
         socket.set_nodelay(true)?;
         let response = match request {
             LocalRequest::Shell { peer, cols, rows } => {
@@ -927,8 +1065,26 @@ impl Node {
                 lifetime_port,
                 lifetime_key,
             } if service != Service::Shell => {
-                let mut lifetime = TcpStream::connect((Ipv4Addr::LOCALHOST, lifetime_port)).await?;
-                lifetime.write_all(&lifetime_key).await?;
+                let lifetime = async {
+                    let mut lifetime =
+                        TcpStream::connect((Ipv4Addr::LOCALHOST, lifetime_port)).await?;
+                    lifetime.write_all(&lifetime_key).await?;
+                    Ok::<_, io::Error>(lifetime)
+                }
+                .await;
+                let lifetime = match lifetime {
+                    Ok(lifetime) => lifetime,
+                    Err(error) => {
+                        self.audit_local(
+                            operation,
+                            "failed",
+                            target_id,
+                            Some(service),
+                            Some("lifetime_channel_failed"),
+                        );
+                        return Err(error.into());
+                    }
+                };
                 return self
                     .open_service(socket, peer, service, None, Some(lifetime))
                     .await;
@@ -938,9 +1094,20 @@ impl Node {
                 service,
                 peer,
                 target,
-            } => return self.expose(socket, service, peer, target).await,
+            } => return self.expose(socket, service, peer, target, target_id).await,
             request => self.manage(request).await,
         };
+        self.audit_local(
+            operation,
+            if response.is_ok() {
+                "allowed"
+            } else {
+                "denied"
+            },
+            target_id,
+            service,
+            response.is_err().then_some("command_rejected"),
+        );
         let response = response.unwrap_or_else(|error| LocalReply::Error(format!("{error:#}")));
         wire::send(&mut socket, response).await
     }
@@ -973,10 +1140,18 @@ impl Node {
         service: Service,
         peer: String,
         target: Option<String>,
+        target_id: Option<EndpointId>,
     ) -> Result<()> {
         let (member, instance) = match self.add_exposure(service, &peer, target).await {
             Ok(added) => added,
             Err(error) => {
+                self.audit_local(
+                    "expose",
+                    "denied",
+                    target_id,
+                    Some(service),
+                    Some("command_rejected"),
+                );
                 return wire::send(&mut socket, LocalReply::Error(format!("{error:#}"))).await;
             }
         };
@@ -1376,6 +1551,27 @@ impl Node {
 }
 
 /// Tell a paired peer how this device's owner can grant the service it asked for.
+fn local_operation(request: &LocalRequest) -> (&'static str, Option<&str>, Option<Service>) {
+    match request {
+        LocalRequest::Peers => ("list_peers", None, None),
+        LocalRequest::Grants => ("list_grants", None, None),
+        LocalRequest::Invite => ("issue_invite", None, None),
+        LocalRequest::Pair { peer, decision } => {
+            let operation = match decision {
+                Decision::Approve => "approve",
+                Decision::Decline => "decline",
+            };
+            (operation, Some(peer), None)
+        }
+        LocalRequest::Revoke { peer } => ("revoke", Some(peer), None),
+        LocalRequest::Shell { peer, .. } => ("shell", Some(peer), Some(Service::Shell)),
+        LocalRequest::Connect { peer, service, .. } => ("connect", Some(peer), Some(*service)),
+        LocalRequest::Enable { peer, service } => ("enable", Some(peer), Some(*service)),
+        LocalRequest::Disable { peer, service } => ("disable", Some(peer), Some(*service)),
+        LocalRequest::Expose { peer, service, .. } => ("expose", Some(peer), Some(*service)),
+    }
+}
+
 fn not_enabled(service: Service, peer: &str) -> String {
     let remedy = match service {
         Service::Udp(port) => format!("massrelay expose --udp {port} --to {peer}"),

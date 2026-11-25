@@ -763,9 +763,37 @@ def exercise(binary, root):
         a = run_peer("a")
         eventually(lambda: cli("a", "peers", check=False).returncode == 0, "device a up")
 
+        # An invalid local proof is audited without authenticating a caller or logging the proof.
+        runtime = json.loads((root / "a" / "runtime.json").read_text())
+        host, port = runtime["addr"].rsplit(":", 1)
+        with socket.create_connection((host, int(port)), timeout=5) as local:
+            local.sendall(bytes(32))
+            with local.makefile("rb") as challenge:
+                assert len(challenge.read(64)) == 64
+                local.sendall(bytes(32))
+                assert challenge.read(1) == b""
+        assert any(event["event"] == "local_control" and event["operation"] == "authenticate"
+                   and event["outcome"] == "denied" and "actor_id" not in event
+                   for event in connection_events("a"))
+        assert any(event["event"] == "enrollment" and event["operation"] == "commit"
+                   and event["actor_id"] == endpoint_id("a") for event in connection_events("a"))
+
         invite = cli("a", "invite").stdout
         cli("b", "join", "b", ticket=invite)
         assert cli("replay", "join", "replay", ticket=invite, check=False).returncode == 1
+        audit_data = (root / "relay" / "relay-events.jsonl").read_text()
+        audit = [json.loads(line) for line in audit_data.splitlines()]
+        for token in (create, invite):
+            payload = token.strip().removeprefix("mr1_")
+            payload += "=" * (-len(payload) % 4)
+            secret = json.loads(base64.urlsafe_b64decode(payload))["secret"]
+            assert token.strip() not in audit_data and secret not in audit_data
+        assert any(event["event"] == "relay_control" and event["operation"] == "issue_invite"
+                   and event["outcome"] == "allowed" and event["actor_id"] == endpoint_id("a")
+                   for event in audit)
+        assert any(event["event"] == "relay_control" and event["operation"] == "join_network"
+                   and event["outcome"] == "denied" and event["reason"] == "invalid_or_spent_invite"
+                   for event in audit)
         b = run_peer("b")
         eventually(lambda: "a" in rows("b"), "device b up")
         # B can enroll while the network founder is absent.
@@ -815,6 +843,12 @@ def exercise(binary, root):
         terminal("c", "a", False)
 
         stop(relay)
+        audit = [json.loads(line) for line in (root / "relay" / "relay-events.jsonl").read_text().splitlines()]
+        opened = {(event["pid"], event["actor_id"], event["transport_id"]) for event in audit
+                  if event["event"] == "relay_transport" and event["operation"] == "connect"
+                  and event["outcome"] == "allowed"}
+        assert any((event["pid"], event["actor_id"], event["transport_id"]) in opened for event in audit
+                   if event["event"] == "relay_transport" and event["operation"] == "disconnect")
         stop(b)
         peer_b = [run_peer("b")]
         eventually(lambda: bool(rows("b")), "device b restarted without relay")
