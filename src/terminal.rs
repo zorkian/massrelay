@@ -20,9 +20,11 @@ const EXIT: u8 = 3;
 const CHUNK: usize = 8192;
 
 fn dimensions(cols: u16, rows: u16) -> PtySize {
+    #[cfg(windows)]
+    let (cols, rows) = (cols.min(i16::MAX as u16), rows.min(i16::MAX as u16));
     PtySize {
-        cols: cols.clamp(1, 1000),
-        rows: rows.clamp(1, 1000),
+        cols: cols.max(1),
+        rows: rows.max(1),
         pixel_width: 0,
         pixel_height: 0,
     }

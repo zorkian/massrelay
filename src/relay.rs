@@ -177,8 +177,8 @@ impl RelayState {
         match request {
             Request::Sync { addr } => {
                 ensure!(
-                    addr.id == who && addr.addrs.len() <= 32,
-                    "invalid advertised address"
+                    addr.id == who,
+                    "advertised address does not match device identity"
                 );
                 let member = network.members.get_mut(&who).context("member vanished")?;
                 // Keep only directly observed address candidates. All peers already have the relay URL.
@@ -191,7 +191,6 @@ impl RelayState {
             Request::Invite => {
                 let now = storage::now();
                 self.invites.retain(|_, invite| invite.expires > now);
-                ensure!(self.invites.len() < 512, "too many open invites");
                 let secret = wire::token()?;
                 self.invites.insert(
                     secret.clone(),
@@ -231,11 +230,14 @@ impl RelayState {
     ) -> Result<Reply> {
         ensure!(
             !name.is_empty()
-                && name.len() <= 32
                 && name
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
-            "name must contain 1–32 ASCII letters, digits, hyphens, or underscores"
+            "name must contain ASCII letters, digits, hyphens, or underscores"
+        );
+        ensure!(
+            name.parse::<EndpointId>().is_err(),
+            "name cannot be an endpoint ID"
         );
 
         let id = if create {
@@ -243,7 +245,6 @@ impl RelayState {
                 bool::from(self.create_secret.as_bytes().ct_eq(secret.as_bytes())),
                 "invalid create ticket"
             );
-            ensure!(self.networks.len() < 64, "relay network limit reached");
             let id = wire::token()?;
             // A create ticket is also a one-use credential.
             self.create_secret = wire::token()?;
@@ -259,7 +260,6 @@ impl RelayState {
         };
 
         let network = self.networks.get_mut(&id).context("network vanished")?;
-        ensure!(network.members.len() < 128, "network is full");
         ensure!(
             !network
                 .members

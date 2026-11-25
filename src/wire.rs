@@ -88,7 +88,6 @@ impl Ticket {
 
     pub fn decode(text: &str) -> Result<Self> {
         let text = text.trim();
-        ensure!(text.len() <= 8192, "ticket is too long");
         let encoded = text
             .strip_prefix("mr1_")
             .context("expected a MassRelay ticket")?;
