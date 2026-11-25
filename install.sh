@@ -2,7 +2,7 @@
 set -eu
 
 repo=zorkian/massrelay
-install_dir=${MASSRELAY_INSTALL_DIR:-"$HOME/bin"}
+install_dir=${MASSRELAY_INSTALL_DIR:-"$HOME/.local/bin"}
 version=${MASSRELAY_VERSION:-}
 
 case "$(uname -s)" in

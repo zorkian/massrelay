@@ -4,7 +4,7 @@ MassRelay connects your own machines in a pocket network. Enrolled devices can s
 
 ## Install
 
-On Linux or macOS, sign in with `gh auth login` using an account that has access to this repository. Then install the latest release to `~/bin/massrelay`.
+On Linux or macOS, sign in with `gh auth login` using an account that has access to this repository. Then install the latest release to `~/.local/bin/massrelay`.
 
 ```sh
 gh api repos/zorkian/massrelay/contents/install.sh -H 'Accept: application/vnd.github.raw+json' | sh
@@ -25,7 +25,7 @@ If the repository becomes public, curl can fetch it directly.
 curl -fsSL https://raw.githubusercontent.com/zorkian/massrelay/main/install.sh | sh
 ```
 
-The installer selects the x86-64 or ARM64 binary and verifies its SHA-256 checksum. Set `MASSRELAY_VERSION` in the environment to install a specific tag. If `~/bin` is outside your `PATH`, run `~/bin/massrelay --version` or add `export PATH="$HOME/bin:$PATH"` to your shell startup file.
+The installer selects the x86-64 or ARM64 binary and verifies its SHA-256 checksum. Set `MASSRELAY_VERSION` in the environment to install a specific tag. If `~/.local/bin` is outside your `PATH`, run `~/.local/bin/massrelay --version` or add `export PATH="$HOME/.local/bin:$PATH"` to your shell startup file.
 
 On Windows x64, sign in with GitHub CLI and run this in PowerShell.
 
