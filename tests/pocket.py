@@ -270,7 +270,7 @@ def exercise(binary, root):
         cli(owner, "enable", service, peer)
 
     def grants(state):
-        lines = cli(state, "list").stdout.splitlines()
+        lines = cli(state, "list", "--full").stdout.splitlines()
         assert lines[0] == "SERVICE\tPEER\tENDPOINT\tMODE\tTARGET", lines
         return [line.split("\t") for line in lines[1:]]
 
@@ -820,6 +820,14 @@ def exercise(binary, root):
             shell_refused(source, target, "service_not_enabled")
         for source, target in pairs:
             grant(target, source)
+        short_ids = {row.split("\t")[2] for row in cli("b", "list").stdout.splitlines()[1:]}
+        assert short_ids == {endpoint_id(peer)[:8] for peer in ("a", "c")}, short_ids
+        master, slave = pty.openpty()
+        with os.fdopen(master) as output, os.fdopen(slave) as tty:
+            subprocess.run(args("b", "list"), stdout=tty, check=True, timeout=5, env=inherited)
+            header, first, second = (output.readline() for _ in range(3))
+        column = header.index("ENDPOINT")
+        assert {row[column:column + 8] for row in (first, second)} == short_ids
         # Re-enabling the same grant does not record a state change a second time.
         grant("b", "a")
         for supervisor in (False, True):

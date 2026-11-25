@@ -142,7 +142,11 @@ enum Command {
         peer: String,
     },
     /// List the services this device grants, and who may use them.
-    List,
+    List {
+        /// Show full endpoint IDs.
+        #[arg(long)]
+        full: bool,
+    },
     /// Expose a port to one peer for as long as this command runs.
     Expose {
         #[command(flatten)]
@@ -336,32 +340,38 @@ async fn execute(cli: Cli) -> Result<i32> {
             local::command(&dir, request).await?;
             println!("Disabled {service} for {}", visible(&peer));
         }
-        Command::List => {
+        Command::List { full } => {
             let LocalReply::Grants(grants) = local::command(&dir, LocalRequest::Grants).await?
             else {
                 bail!("unexpected grant list reply");
             };
-            println!("SERVICE\tPEER\tENDPOINT\tMODE\tTARGET");
-            for grant in grants {
+            let mut rows =
+                vec![["SERVICE", "PEER", "ENDPOINT", "MODE", "TARGET"].map(String::from)];
+            rows.extend(grants.into_iter().map(|grant| {
                 let peer = grant.peer.as_deref().unwrap_or("(unknown)");
                 let mode = if grant.temporary {
-                    "temporary"
+                    "temporary".into()
                 } else {
-                    "persistent"
+                    "persistent".into()
                 };
+                let mut endpoint = grant.id.to_string();
+                if !full {
+                    endpoint.truncate(8);
+                }
                 let target = grant.target.unwrap_or_else(|| match grant.service {
                     Service::Shell => "-".into(),
                     Service::Tcp(port) => format!("loopback:{port}"),
                     Service::Udp(port) => format!("127.0.0.1:{port}"),
                 });
-                println!(
-                    "{}\t{}\t{}\t{mode}\t{}",
-                    grant.service,
+                [
+                    grant.service.to_string(),
                     visible(peer),
-                    grant.id,
-                    visible(&target)
-                );
-            }
+                    endpoint,
+                    mode,
+                    visible(&target),
+                ]
+            }));
+            print_grants(&rows);
         }
         Command::Expose { port, to, target } => {
             let service = match (port.tcp, port.udp) {
@@ -436,6 +446,26 @@ impl ServiceAction {
 
 fn visible(value: &str) -> String {
     value.chars().filter(|c| !c.is_control()).collect()
+}
+
+fn print_grants(rows: &[[String; 5]]) {
+    if !io::stdout().is_terminal() {
+        for row in rows {
+            println!("{}", row.join("\t"));
+        }
+        return;
+    }
+
+    let widths: [usize; 4] = std::array::from_fn(|index| {
+        rows.iter()
+            .map(|row| row[index].chars().count())
+            .max()
+            .unwrap_or(0)
+    });
+    let [service, peer, endpoint, mode] = widths;
+    for [kind, name, id, lifetime, target] in rows {
+        println!("{kind:<service$}  {name:<peer$}  {id:<endpoint$}  {lifetime:<mode$}  {target}");
+    }
 }
 
 async fn confirm_peer(dir: &Path, name: &str) -> Result<EndpointId> {

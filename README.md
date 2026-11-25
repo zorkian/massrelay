@@ -4,7 +4,7 @@ MassRelay connects your own machines in a pocket network. Enrolled devices can s
 
 ## Install
 
-[MassRelay v0.3.7](https://github.com/zorkian/massrelay/releases/tag/v0.3.7) fixes restarting an already-loaded macOS LaunchAgent. If you're upgrading from v0.2.0 or earlier, see [the upgrade instructions](#upgrade-from-v020-or-earlier).
+[MassRelay v0.3.8](https://github.com/zorkian/massrelay/releases/tag/v0.3.8) makes the service list easier to read. If you're upgrading from v0.2.0 or earlier, see [the upgrade instructions](#upgrade-from-v020-or-earlier).
 
 On Linux or macOS, sign in with `gh auth login` using an account that has access to this repository. Then install the latest release to `~/.local/bin/massrelay`.
 
@@ -179,7 +179,7 @@ To stop a grant, disable it. Open sessions using it close, and other services an
 massrelay disable tcp:4000 dirk
 ```
 
-`massrelay list` shows this device's grants with each peer's name and endpoint ID, whether the grant is persistent or temporary, and where a port is forwarded. Grants are not announced to the relay or to other devices.
+`massrelay list` shows each grant's peer name, eight-character endpoint ID prefix, whether the grant is persistent or temporary, and where a port is forwarded. Use `massrelay list --full` for complete endpoint IDs. Grants are not announced to the relay or to other devices.
 
 ## Use a TCP port
 
