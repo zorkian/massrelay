@@ -45,6 +45,8 @@ Install stable Rust and a platform C toolchain, then run `cargo build --locked -
 
 Pushing a tag that matches the Cargo version, such as `v0.3.0`, builds and publishes the release binaries through GitHub Actions.
 
+Pushes to `main` that change Cargo's manifests, configuration, toolchain, or the release workflow warm the Rust dependency cache for each platform. To warm the caches on demand, run the Release workflow manually on `main`.
+
 ## Start a shared relay
 
 On a Linux host with systemd, pass `--relay` to the installer to install the binary and start a user service.

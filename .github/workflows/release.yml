@@ -2,8 +2,18 @@ name: Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
+    paths:
+      - .github/workflows/release.yml
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain
+      - rust-toolchain.toml
+      - .cargo/config
+      - .cargo/config.toml
   workflow_dispatch:
 
 permissions:
@@ -38,9 +48,16 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup update stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.asset }}
+          cache-bin: 'false'
+          # Each release tag can restore the corresponding default-branch cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo +stable build --locked --release
       - run: cargo +stable test --locked --release
       - name: Stage binary
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         shell: bash
         env:
           BINARY: ${{ matrix.binary }}
@@ -50,6 +67,7 @@ jobs:
           mkdir -p dist
           cp "target/release/$BINARY" "dist/$ASSET"
       - uses: actions/upload-artifact@v7
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         with:
           name: ${{ matrix.asset }}
           path: dist/${{ matrix.asset }}
