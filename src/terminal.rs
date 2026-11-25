@@ -262,7 +262,8 @@ pub async fn serve(
     cols: u16,
     rows: u16,
     shell: Option<&Path>,
-) -> Result<()> {
+    connected: impl FnOnce(),
+) -> Result<i32> {
     let pair = native_pty_system().openpty(dimensions(cols, rows))?;
     let master = pair.master;
     let mut reader = master.try_clone_reader()?;
@@ -333,6 +334,7 @@ pub async fn serve(
         })?;
 
     wire::send(tx, LocalReply::Shell).await?;
+    connected();
     let read_inputs = async {
         loop {
             let data = wire::read_frame(rx).await?;
@@ -376,5 +378,6 @@ pub async fn serve(
     };
     let code = i32::try_from(status.exit_code()).unwrap_or(1);
     let [a, b, c, d] = code.to_be_bytes();
-    wire::frame(tx, &[EXIT, a, b, c, d]).await
+    wire::frame(tx, &[EXIT, a, b, c, d]).await?;
+    Ok(code)
 }

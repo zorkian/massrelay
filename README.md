@@ -139,6 +139,41 @@ Use `massrelay peers` to see everyone in the pocket network, recent presence, an
 
 Run `massrelay run` under your ordinary account in a terminal or supervisor of your choice. Use `--allow-shell` on each destination that should accept shells. Approving a peer on such a destination gives that peer the access of the account running MassRelay. Use `--shell /path/to/shell` to override the account's default shell executable, for example to use PowerShell on Windows.
 
+## Run in the background on macOS
+
+After creating or joining a network, stop any foreground `massrelay run` and load a LaunchAgent under your account. This example enables incoming shells and writes connection events to `~/Library/Logs/MassRelay-connections.jsonl`.
+
+```sh
+mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+plist="$HOME/Library/LaunchAgents/com.massrelay.client.plist"
+cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.massrelay.client</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$HOME/.local/bin/massrelay</string>
+    <string>run</string>
+    <string>--allow-shell</string>
+    <string>--log-file</string>
+    <string>$HOME/Library/Logs/MassRelay-connections.jsonl</string>
+  </array>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardErrorPath</key>
+  <string>$HOME/Library/Logs/MassRelay.log</string>
+</dict>
+</plist>
+EOF
+plutil -lint "$plist" && launchctl bootstrap "gui/$(id -u)" "$plist"
+```
+
+If the agent is already loaded, run `launchctl bootout "gui/$(id -u)/com.massrelay.client"` before reloading the plist. Use `massrelay peers` to check the agent and `tail -f ~/Library/Logs/MassRelay-connections.jsonl` to watch connections.
+
+Connection events are one JSON object per line. Each records the UTC time, direction, session number, and the peer's name and endpoint ID when known. Disconnect events include the reason and, on the shell host, the exit code if available. Shell commands, terminal output, and invitations stay out of the connection log. Use `massrelay run --log-file PATH` for the same log from a terminal. By default, connection events go to stderr.
+
 ## Run a ticket-only relay
 
 A ticket-only relay creates a network only for the holder of an operator creation ticket. Initialize its state directory, save the one-use ticket printed to stdout, and start it.

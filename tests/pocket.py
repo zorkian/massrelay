@@ -125,7 +125,28 @@ def exercise(binary, root):
 
     def run_peer(name):
         # Explicit shell avoids invoking the host user's login startup files.
-        return start(name, "run", "--allow-shell", "--shell", "/bin/sh", "--bind", "127.0.0.1:0")
+        return start(name, "run", "--allow-shell", "--shell", "/bin/sh", "--bind", "127.0.0.1:0",
+                     "--log-file", str(root / f"{name}-connections.jsonl"))
+
+    def connection_events(name):
+        data = (root / f"{name}-connections.jsonl").read_text()
+        assert "MASSRELAY_SMOKE" not in data
+        return [json.loads(line) for line in data.splitlines()]
+
+    def recorded_session(local, peer, direction, exit_code=None):
+        events = [
+            event for event in connection_events(local)
+            if event["direction"] == direction
+            and event["peer_id"] == endpoint_id(peer)
+            and event["peer_name"] == peer
+        ]
+        opened = {(event["pid"], event["session"]) for event in events if event["event"] == "connected"}
+        return any(
+            event["event"] == "disconnected"
+            and (event["pid"], event["session"]) in opened
+            and event.get("exit_code") == exit_code
+            for event in events
+        )
 
     def endpoint_id(state):
         log = (root / f"{state}.log").read_text()
@@ -187,6 +208,8 @@ def exercise(binary, root):
 
         approve("a", "b")
         terminal("a", "b", False)
+        assert any(event["event"] == "connection_failed" and event["peer_id"] == endpoint_id("b")
+                   for event in connection_events("a"))
         approve("b", "a")
         approve("b", "c")
         approve("c", "b")
@@ -196,6 +219,8 @@ def exercise(binary, root):
 
         for source, target in [("a", "b"), ("b", "a"), ("b", "c"), ("c", "b")]:
             terminal(source, target, True)
+        eventually(lambda: recorded_session("a", "b", "outbound"), "outbound connection log")
+        eventually(lambda: recorded_session("b", "a", "inbound", 7), "inbound connection log")
         terminal("a", "c", False)
         terminal("c", "a", False)
 

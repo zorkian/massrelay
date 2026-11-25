@@ -1,3 +1,4 @@
+mod connection_log;
 mod device;
 mod local;
 mod relay;
@@ -88,6 +89,9 @@ enum Command {
         /// Use this shell executable instead of the account's default.
         #[arg(long, requires = "allow_shell")]
         shell: Option<PathBuf>,
+        /// Append connection events to this file. Defaults to stderr.
+        #[arg(long)]
+        log_file: Option<PathBuf>,
         #[arg(long, default_value = "0.0.0.0:0")]
         bind: SocketAddr,
     },
@@ -172,8 +176,9 @@ async fn execute(cli: Cli) -> Result<i32> {
         Command::Run {
             allow_shell,
             shell,
+            log_file,
             bind,
-        } => device::run(dir, allow_shell, shell, bind).await?,
+        } => device::run(dir, allow_shell, shell, bind, log_file).await?,
         Command::Peers => {
             let LocalReply::Peers(peers) = local::command(&dir, LocalRequest::Peers).await? else {
                 bail!("unexpected roster reply");

@@ -7,6 +7,7 @@ description = "User-mode pocket networks for your own machines"
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 crossterm = "0.29"
 directories = "6"

@@ -20,7 +20,9 @@ use tokio::{
 };
 
 use crate::{
-    bind_endpoint, local, storage, terminal,
+    bind_endpoint,
+    connection_log::{ConnectionLog, Direction},
+    local, storage, terminal,
     wire::{
         self, Decision, LocalReply, LocalRequest, Peer, Reply, Request, Roster, ServerAddr,
         ShellRequest, Ticket,
@@ -120,6 +122,7 @@ struct Node {
     dir: PathBuf,
     allow_shell: bool,
     shell: Option<PathBuf>,
+    connection_log: ConnectionLog,
     changed: watch::Sender<()>,
 }
 
@@ -276,11 +279,13 @@ pub async fn run(
     allow_shell: bool,
     shell: Option<PathBuf>,
     bind: SocketAddr,
+    log_file: Option<PathBuf>,
 ) -> Result<()> {
     let _lock = storage::lock(&dir)?;
     let mut device: Device =
         storage::load(&dir, FILE).context("use create or join to enroll this device")?;
     ensure!(!device.revoked, "this device has been revoked");
+    let connection_log = ConnectionLog::open(log_file.as_deref())?;
     let bind_device = |addr| {
         bind_endpoint(
             SecretKey::from_bytes(&device.identity.key),
@@ -314,6 +319,7 @@ pub async fn run(
         dir,
         allow_shell,
         shell,
+        connection_log,
         changed: watch::channel(()).0,
     });
     eprintln!("MassRelay running as {}", node.endpoint.id());
@@ -342,10 +348,6 @@ pub async fn run(
                 let node = node.clone();
                 tasks.spawn(async move {
                     let Ok(Ok(connection)) = timeout(wire::RPC_TIMEOUT, incoming).await else { return };
-                    if !node.state.lock().await.approvals.contains_key(&connection.remote_id()) {
-                        connection.close(0u32.into(), b"pairing required");
-                        return;
-                    }
                     let _ = node.serve_shell(connection).await;
                 });
             }
@@ -653,6 +655,9 @@ impl Node {
         cols: u16,
         rows: u16,
     ) -> Result<()> {
+        let mut session =
+            self.connection_log
+                .session(Direction::Outbound, None, Some(name.clone()));
         let setup = timeout(wire::RPC_TIMEOUT * 2, async {
             let peer = self.lookup(&name).await?;
             let (network, relay) = {
@@ -664,6 +669,7 @@ impl Node {
             };
             let generation = peer.pair.generation;
             let id = peer.member.id;
+            session.set_peer(id, peer.member.name);
             ensure!(
                 self.authorized(id, &network, generation).await,
                 "both devices must approve this pairing"
@@ -696,15 +702,21 @@ impl Node {
         let (connection, mut tx, mut rx, request) = match setup {
             Ok(result) => result,
             Err(error) => {
+                session.end("shell_setup_failed", None);
                 return wire::send(&mut socket, LocalReply::Error(format!("{error:#}"))).await;
             }
         };
         let id = connection.remote_id();
-        wire::send(&mut socket, LocalReply::Shell).await?;
+        session.connected();
+        if let Err(error) = wire::send(&mut socket, LocalReply::Shell).await {
+            session.end("local_client_closed", None);
+            return Err(error);
+        }
         let (mut local_rx, mut local_tx) = socket.into_split();
         tokio::select! {
             _ = self.until_unpaired(id, &request) => {
                 connection.close(0u32.into(), b"pairing ended");
+                session.end("pairing_ended", None);
             }
             result = async {
                 tokio::try_join!(
@@ -717,20 +729,52 @@ impl Node {
                         local_tx.shutdown().await
                     },
                 )
-            } => { result?; }
+            } => {
+                session.end(if result.is_ok() { "stream_closed" } else { "shell_io_error" }, None);
+                result?;
+            }
         }
         Ok(())
     }
 
     async fn serve_shell(&self, connection: Connection) -> Result<()> {
-        let (mut tx, mut rx) = timeout(wire::RPC_TIMEOUT, connection.accept_bi()).await??;
-        let request: ShellRequest = timeout(wire::RPC_TIMEOUT, wire::recv(&mut rx)).await??;
         let id = connection.remote_id();
+        let (profile_approved, name) = {
+            let state = self.state.lock().await;
+            let name = state
+                .roster
+                .peers
+                .iter()
+                .find(|peer| peer.member.id == id)
+                .map(|peer| peer.member.name.clone());
+            (state.approvals.contains_key(&id), name)
+        };
+        let mut session = self
+            .connection_log
+            .session(Direction::Inbound, Some(id), name);
+        if !profile_approved {
+            session.end("pairing_required", None);
+            connection.close(0u32.into(), b"pairing required");
+            return Ok(());
+        }
+        let setup = async {
+            let (tx, mut rx) = timeout(wire::RPC_TIMEOUT, connection.accept_bi()).await??;
+            let request: ShellRequest = timeout(wire::RPC_TIMEOUT, wire::recv(&mut rx)).await??;
+            Ok::<_, anyhow::Error>((tx, rx, request))
+        };
+        let (mut tx, mut rx, request) = match setup.await {
+            Ok(value) => value,
+            Err(error) => {
+                session.end("shell_request_failed", None);
+                return Err(error);
+            }
+        };
         if !self.allow_shell
             || !self
                 .authorized(id, &request.network, request.generation)
                 .await
         {
+            session.end("shell_unavailable", None);
             wire::send(
                 &mut tx,
                 LocalReply::Error("shell access is unavailable on this device".into()),
@@ -740,14 +784,23 @@ impl Node {
             let _ = timeout(wire::RPC_TIMEOUT, tx.stopped()).await;
             return Ok(());
         }
-        tokio::select! {
+        let outcome = tokio::select! {
             _ = self.until_unpaired(id, &request) => {
                 connection.close(0u32.into(), b"pairing ended");
+                Ok(None)
             }
-            result = terminal::serve(&mut rx, &mut tx, request.cols, request.rows, self.shell.as_deref()) => {
-                result?;
+            result = terminal::serve(&mut rx, &mut tx, request.cols, request.rows, self.shell.as_deref(), || session.connected()) => result.map(Some),
+        };
+        match outcome {
+            Ok(None) => session.end("pairing_ended", None),
+            Ok(Some(code)) => {
+                session.end("shell_exit", Some(code));
                 tx.finish()?;
                 let _ = timeout(wire::RPC_TIMEOUT, tx.stopped()).await;
+            }
+            Err(error) => {
+                session.end("shell_io_error", None);
+                return Err(error);
             }
         }
         Ok(())
@@ -854,6 +907,7 @@ mod tests {
             dir: scratch.path().into(),
             allow_shell: true,
             shell: Some("/bin/sh".into()),
+            connection_log: ConnectionLog::open(None)?,
             changed: watch::channel(()).0,
         };
         timeout(Duration::from_secs(20), async {
