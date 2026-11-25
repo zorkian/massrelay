@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            asset: massrelay-linux-x86_64
+            binary: massrelay
+          - runner: ubuntu-22.04-arm
+            asset: massrelay-linux-aarch64
+            binary: massrelay
+          - runner: macos-15-intel
+            asset: massrelay-macos-x86_64
+            binary: massrelay
+          - runner: macos-15
+            asset: massrelay-macos-aarch64
+            binary: massrelay
+          - runner: windows-2025
+            asset: massrelay-windows-x86_64.exe
+            binary: massrelay.exe
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - run: rustup update stable
+      - run: cargo +stable build --locked --release
+      - run: cargo +stable test --locked --release
+      - name: Stage binary
+        shell: bash
+        env:
+          BINARY: ${{ matrix.binary }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          "target/release/$BINARY" --version
+          mkdir -p dist
+          cp "target/release/$BINARY" "dist/$ASSET"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Check the release tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          if [ "$TAG" != "v$version" ]; then
+            echo "Tag $TAG does not match Cargo version $version" >&2
+            exit 1
+          fi
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish binaries and checksums
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          sha256sum massrelay-* > SHA256SUMS
+          gh release create "$TAG" massrelay-* SHA256SUMS --verify-tag --generate-notes

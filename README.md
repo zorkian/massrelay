@@ -2,9 +2,46 @@
 
 MassRelay connects your own machines in a pocket network. Enrolled devices can see each other. A pair must approve access from both devices before either can connect. Each destination chooses whether to offer a shell. One binary provides the desktop client, user-mode listener, and public relay.
 
-## Build
+## Install
+
+On Linux or macOS, sign in with `gh auth login` using an account that has access to this repository. Then install the latest release to `~/bin/massrelay`.
+
+```sh
+gh api repos/zorkian/massrelay/contents/install.sh -H 'Accept: application/vnd.github.raw+json' | sh
+```
+
+You can also fetch the installer with curl using your GitHub CLI session.
+
+```sh
+gh auth token |
+  awk '{ printf "header = \"Authorization: Bearer %s\"\n", $0 }' |
+  curl -fsSL --config - -H 'Accept: application/vnd.github.raw+json' \
+    https://api.github.com/repos/zorkian/massrelay/contents/install.sh | sh
+```
+
+If the repository becomes public, curl can fetch it directly.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zorkian/massrelay/main/install.sh | sh
+```
+
+The installer selects the x86-64 or ARM64 binary and verifies its SHA-256 checksum. Set `MASSRELAY_VERSION` in the environment to install a specific tag. If `~/bin` is outside your `PATH`, run `~/bin/massrelay --version` or add `export PATH="$HOME/bin:$PATH"` to your shell startup file.
+
+On Windows x64, sign in with GitHub CLI and run this in PowerShell.
+
+```powershell
+New-Item -ItemType Directory -Force "$HOME/bin" | Out-Null
+gh release download --repo zorkian/massrelay --pattern massrelay-windows-x86_64.exe --output "$HOME/bin/massrelay.exe" --clobber
+& "$HOME/bin/massrelay.exe" --version
+```
+
+Release binaries and their checksums are also available on the [Releases page](https://github.com/zorkian/massrelay/releases).
+
+## Build from source
 
 Install stable Rust and a platform C toolchain, then run `cargo build --locked --release`. The executable is `target/release/massrelay` or `target\release\massrelay.exe` on Windows.
+
+Pushing a tag that matches the Cargo version, such as `v0.1.0`, builds and publishes the release binaries through GitHub Actions.
 
 ## Start a relay
 
