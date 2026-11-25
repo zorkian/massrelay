@@ -110,15 +110,11 @@ pub fn control(dir: &Path, action: ServiceAction) -> Result<()> {
         match action {
             ServiceAction::Stop if loaded => unload(&service),
             ServiceAction::Stop => Ok(()),
-            ServiceAction::Start if loaded => checked(
-                &mut launchctl("kickstart", &service),
-                "start the LaunchAgent",
-            )
-            .map(drop),
+            ServiceAction::Start | ServiceAction::Restart if loaded => {
+                kickstart(&service, matches!(action, ServiceAction::Restart))
+            }
             ServiceAction::Start | ServiceAction::Restart => {
-                if loaded {
-                    unload(&service)?;
-                } else {
+                {
                     let _lock =
                         storage::lock(&dir).context("stop the foreground massrelay run first")?;
                 }
@@ -254,13 +250,31 @@ fn unload(service: &str) -> Result<()> {
     Ok(())
 }
 
+fn kickstart(service: &str, restart: bool) -> Result<()> {
+    let mut command = Command::new("/bin/launchctl");
+    command.arg("kickstart");
+    if restart {
+        command.arg("-k");
+    }
+    let action = if restart {
+        "restart the LaunchAgent"
+    } else {
+        "start the LaunchAgent"
+    };
+    checked(command.arg(service), action)?;
+    Ok(())
+}
+
 fn checked(command: &mut Command, action: &str) -> Result<Output> {
     let result = command.output().with_context(|| action.to_owned())?;
     ensure!(
         result.status.success(),
         "{action} failed ({}): {}",
         result.status,
-        String::from_utf8_lossy(&result.stderr).trim()
+        String::from_utf8_lossy(&result.stderr)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     );
     Ok(result)
 }

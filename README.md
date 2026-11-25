@@ -4,7 +4,7 @@ MassRelay connects your own machines in a pocket network. Enrolled devices can s
 
 ## Install
 
-[MassRelay v0.3.6](https://github.com/zorkian/massrelay/releases/tag/v0.3.6) supports `massrelay start`, `massrelay restart`, and `massrelay stop` on Linux and macOS. If you're upgrading from v0.2.0 or earlier, see [the upgrade instructions](#upgrade-from-v020-or-earlier).
+[MassRelay v0.3.7](https://github.com/zorkian/massrelay/releases/tag/v0.3.7) fixes restarting an already-loaded macOS LaunchAgent. If you're upgrading from v0.2.0 or earlier, see [the upgrade instructions](#upgrade-from-v020-or-earlier).
 
 On Linux or macOS, sign in with `gh auth login` using an account that has access to this repository. Then install the latest release to `~/.local/bin/massrelay`.
 
