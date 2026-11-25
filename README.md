@@ -4,7 +4,7 @@ MassRelay connects your own machines in a pocket network. Enrolled devices can s
 
 ## Install
 
-[MassRelay v0.2.0](https://github.com/zorkian/massrelay/releases/tag/v0.2.0) adds shared relays and the create-and-join flow. For per-peer service grants and TCP and UDP forwarding, [build from source](#build-from-source).
+[MassRelay v0.3.0](https://github.com/zorkian/massrelay/releases/tag/v0.3.0) adds per-peer service grants, temporary TCP and UDP forwarding, and connection logs. If you already run MassRelay on your devices, see [the upgrade instructions](#upgrade-from-v020-or-earlier).
 
 On Linux or macOS, sign in with `gh auth login` using an account that has access to this repository. Then install the latest release to `~/.local/bin/massrelay`.
 
@@ -43,7 +43,7 @@ Release binaries and their checksums are also available on the [Releases page](h
 
 Install stable Rust and a platform C toolchain, then run `cargo build --locked --release`. The executable is `target/release/massrelay` or `target\release\massrelay.exe` on Windows.
 
-Pushing a tag that matches the Cargo version, such as `v0.2.0`, builds and publishes the release binaries through GitHub Actions.
+Pushing a tag that matches the Cargo version, such as `v0.3.0`, builds and publishes the release binaries through GitHub Actions.
 
 ## Start a shared relay
 
