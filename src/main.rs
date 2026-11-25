@@ -20,7 +20,7 @@ use iroh::{
 };
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 
-use wire::{Decision, LocalReply, LocalRequest, Ticket};
+use wire::{Decision, LocalReply, LocalRequest, ServerAddr, Ticket};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -34,7 +34,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Initialize a relay and print a one-use network creation ticket.
+    /// Initialize a ticket-only relay and print a one-use network creation ticket.
     RelayInit {
         #[arg(long)]
         public_udp: SocketAddr,
@@ -47,13 +47,39 @@ enum Command {
         udp_bind: SocketAddr,
         #[arg(long, default_value = "0.0.0.0:3340")]
         relay_bind: SocketAddr,
+        /// Start a shared relay, open to new pocket networks, advertising this UDP address.
+        #[arg(long, requires = "url")]
+        public_udp: Option<SocketAddr>,
+        /// Relay URL advertised by a shared relay.
+        #[arg(long, requires = "public_udp")]
+        url: Option<RelayUrl>,
     },
+    /// Print a shared relay's public locator.
+    RelayInfo,
     /// Print the relay's current one-use network creation ticket.
     RelayTicket,
-    /// Create a pocket network. Reads the relay's creation ticket from stdin.
-    Create { name: String },
-    /// Enroll in a pocket network. Reads an invite from stdin.
-    Join { name: String },
+    /// Create a pocket network on a shared relay and print an invite for the next device.
+    Create {
+        /// Device name for an operator creation ticket, which is read from stdin.
+        #[arg(value_name = "NAME", conflicts_with_all = ["relay", "name"])]
+        ticket_name: Option<String>,
+        /// Public locator of a shared relay. Defaults to MASSRELAY_RELAY.
+        #[arg(long, value_name = "LOCATOR")]
+        relay: Option<String>,
+        /// Device name on a shared relay. Defaults to this machine's hostname.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Enroll in a pocket network using an invite.
+    Join {
+        /// Invite token. Anything else is a device name, with the invite read from stdin.
+        /// Omit to read the invite from stdin.
+        #[arg(value_name = "INVITE|NAME")]
+        invite_or_name: Option<String>,
+        /// Device name. Defaults to this machine's hostname.
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Make this device reachable while the foreground process runs.
     Run {
         /// Let paired devices open a shell under this OS account.
@@ -105,10 +131,44 @@ async fn execute(cli: Cli) -> Result<i32> {
         Command::Relay {
             udp_bind,
             relay_bind,
-        } => relay::run(dir, udp_bind, relay_bind).await?,
+            public_udp,
+            url,
+        } => relay::run(dir, udp_bind, relay_bind, public_udp.zip(url)).await?,
+        Command::RelayInfo => relay::info(&dir)?,
         Command::RelayTicket => relay::create_ticket(&dir)?,
-        Command::Create { name } => device::enroll(&dir, read_ticket()?, name, true).await?,
-        Command::Join { name } => device::enroll(&dir, read_ticket()?, name, false).await?,
+        Command::Create {
+            ticket_name: Some(name),
+            ..
+        } => {
+            if io::stdin().is_terminal() && env_relay().is_some() {
+                eprintln!(
+                    "massrelay: reading an operator creation ticket from stdin. \
+                     To use MASSRELAY_RELAY instead, run massrelay create --name NAME."
+                );
+            }
+            device::enroll(&dir, read_ticket()?, Some(name), true).await?
+        }
+        Command::Create { relay, name, .. } => {
+            let locator = relay.or_else(env_relay).context(
+                "pass --relay LOCATOR or set MASSRELAY_RELAY; \
+                 with an operator creation ticket, use massrelay create NAME",
+            )?;
+            let server = ServerAddr::from_locator(&locator)?;
+            let (name, invite) = device::create(&dir, server, name).await?;
+            eprintln!(
+                "Created a pocket network. This device is {}. \
+                 The invite works once and expires ten minutes after issue.",
+                visible(&name)
+            );
+            println!("{invite}");
+        }
+        Command::Join {
+            invite_or_name,
+            name,
+        } => {
+            let (ticket, name) = join_input(invite_or_name, name)?;
+            device::enroll(&dir, ticket, name, false).await?
+        }
         Command::Run {
             allow_shell,
             shell,
@@ -224,6 +284,38 @@ async fn shutdown() -> io::Result<()> {
     }
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await
+}
+
+fn env_relay() -> Option<String> {
+    std::env::var("MASSRELAY_RELAY")
+        .ok()
+        .filter(|locator| !locator.trim().is_empty())
+}
+
+/// Resolve `join`'s arguments into an invite and an optional device name.
+fn join_input(argument: Option<String>, name: Option<String>) -> Result<(Ticket, Option<String>)> {
+    let Some(argument) = argument else {
+        return Ok((read_ticket()?, name));
+    };
+    match Ticket::decode(&argument) {
+        Ok(ticket) => Ok((ticket, name)),
+        Err(_) if ServerAddr::from_locator(&argument).is_ok() => {
+            bail!("that is a relay locator; join needs an invite from an enrolled device")
+        }
+        Err(error) if name.is_some() => {
+            Err(error).context("with --name, the argument must be an invite token")
+        }
+        // A name may begin like a token, so only a complete token is treated as one.
+        Err(_) => {
+            if argument.starts_with("mr1_") {
+                eprintln!(
+                    "massrelay: the argument is not a complete invite, so it is used as the \
+                     device name; reading the invite from stdin"
+                );
+            }
+            Ok((read_ticket()?, Some(argument)))
+        }
+    }
 }
 
 fn read_ticket() -> Result<Ticket> {

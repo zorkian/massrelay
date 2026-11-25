@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    fs::File,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -9,6 +10,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, endpoint::Connection};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{self, AsyncWriteExt},
     net::TcpStream,
@@ -35,6 +37,68 @@ struct Identity {
     server: ServerAddr,
 }
 
+impl Identity {
+    fn public(&self) -> EndpointId {
+        SecretKey::from_bytes(&self.key).public()
+    }
+}
+
+/// A device name from the host's name, falling back to a label from the device key.
+fn default_name(id: EndpointId) -> String {
+    ["HOSTNAME", "COMPUTERNAME"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .chain(
+            std::iter::once_with(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok())
+                .flatten(),
+        )
+        .chain(std::iter::once_with(hostname_command).flatten())
+        .find_map(|host| host_label(&host))
+        .unwrap_or_else(|| format!("device-{}", id.fmt_short()))
+}
+
+fn hostname_command() -> Option<String> {
+    let output = std::process::Command::new("hostname").output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The first label of a hostname, restricted to characters allowed in device names.
+fn host_label(host: &str) -> Option<String> {
+    let label: String = host
+        .trim()
+        .split('.')
+        .next()?
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let label = label.trim_matches('-');
+    (!label.eq_ignore_ascii_case("localhost") && wire::check_name(label).is_ok())
+        .then(|| label.to_owned())
+}
+
+#[derive(Serialize, Deserialize)]
+struct PendingEnrollment {
+    #[serde(flatten)]
+    identity: Identity,
+    operation: Option<Enrollment>,
+}
+
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
+enum Enrollment {
+    SharedCreate,
+    OperatorTicket([u8; 32]),
+    JoinInvite([u8; 32]),
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Device {
     identity: Identity,
@@ -59,30 +123,121 @@ struct Node {
     changed: watch::Sender<()>,
 }
 
-pub async fn enroll(dir: &Path, ticket: Ticket, name: String, create: bool) -> Result<()> {
-    let _lock = storage::lock(dir)?;
+/// Redeem an operator creation ticket (`create`) or a join invite.
+pub async fn enroll(dir: &Path, ticket: Ticket, name: Option<String>, create: bool) -> Result<()> {
+    let fingerprint = Sha256::digest(ticket.secret.as_bytes()).into();
+    let operation = if create {
+        Enrollment::OperatorTicket(fingerprint)
+    } else {
+        Enrollment::JoinInvite(fingerprint)
+    };
+    let (_lock, identity) = prepare(dir, ticket.server, operation)?;
+    let defaulted = name.is_none();
+    let name = name.unwrap_or_else(|| {
+        let name = default_name(identity.public());
+        eprintln!("massrelay: joining as {name}, from this machine's hostname");
+        name
+    });
+    let request = Request::Enroll {
+        secret: ticket.secret,
+        name: name.clone(),
+        create,
+    };
+    match register(&identity, request).await? {
+        Reply::Roster(roster) => commit(dir, identity, roster),
+        Reply::Revoked => bail!("this device was revoked; use a new state directory"),
+        Reply::Error(error) => {
+            // The relay checks for existing enrollment before rejecting these credentials.
+            // A transport failure leaves the pending identity intact for an exact retry.
+            if (create && error == wire::INVALID_CREATE_TICKET)
+                || (!create
+                    && matches!(
+                        error.as_str(),
+                        wire::INVALID_JOIN_INVITE | wire::EXPIRED_INVITE
+                    ))
+            {
+                std::fs::remove_file(dir.join(PENDING)).context("clear the rejected enrollment")?;
+            }
+            if defaulted && error == wire::NAME_IN_USE {
+                bail!("name {name} is already in use; choose another with --name");
+            }
+            bail!("{error}");
+        }
+        _ => bail!("unexpected enrollment reply"),
+    }
+}
+
+/// Create a pocket network on a shared relay. Returns this device's name and the first invite.
+pub async fn create(
+    dir: &Path,
+    server: ServerAddr,
+    name: Option<String>,
+) -> Result<(String, String)> {
+    let (_lock, identity) = prepare(dir, server, Enrollment::SharedCreate)?;
+    let name = name.unwrap_or_else(|| default_name(identity.public()));
+    match register(&identity, Request::Create { name }).await? {
+        Reply::Created {
+            name,
+            roster,
+            invite,
+        } => {
+            let invite = Ticket {
+                server: identity.server.clone(),
+                secret: invite,
+            }
+            .encode()?;
+            commit(dir, identity, roster)?;
+            Ok((name, invite))
+        }
+        Reply::Revoked => bail!("this device was revoked; use a new state directory"),
+        Reply::Error(error) => bail!("{error}"),
+        _ => bail!("unexpected creation reply"),
+    }
+}
+
+/// Persist the key and operation together before sending a request. An authenticated retry
+/// may return a prior enrollment, so reuse the key only for the same operation.
+fn prepare(dir: &Path, server: ServerAddr, operation: Enrollment) -> Result<(File, Identity)> {
+    let lock = storage::lock(dir)?;
     ensure!(
         !dir.join(FILE).try_exists()?,
         "this device already belongs to a network; use a new state directory"
     );
-    let identity: Identity = if dir.join(PENDING).try_exists()? {
-        let identity: Identity = storage::load(dir, PENDING)?;
+    let mut pending = if dir.join(PENDING).try_exists()? {
+        let mut pending: PendingEnrollment = storage::load(dir, PENDING)?;
         ensure!(
-            identity.server.id == ticket.server.id,
+            pending.identity.server.id == server.id,
             "pending enrollment uses another relay; use a new state directory"
         );
-        Identity {
-            server: ticket.server,
-            ..identity
+        match &pending.operation {
+            Some(previous) => ensure!(
+                previous == &operation,
+                "another enrollment is pending; retry the original command or use a new state directory"
+            ),
+            None => bail!(
+                "enrollment began with an earlier version; finish it with the original client and ticket, \
+                 or use a new state directory"
+            ),
         }
+        pending.identity.server = server;
+        pending
     } else {
-        let identity = Identity {
-            key: wire::random()?,
-            server: ticket.server,
-        };
-        storage::save(dir, PENDING, &identity)?;
-        identity
+        PendingEnrollment {
+            identity: Identity {
+                key: wire::random()?,
+                server,
+            },
+            operation: None,
+        }
     };
+    if pending.operation.is_none() {
+        pending.operation = Some(operation);
+        storage::save(dir, PENDING, &pending)?;
+    }
+    Ok((lock, pending.identity))
+}
+
+async fn register(identity: &Identity, request: Request) -> Result<Reply> {
     let bind = if identity.server.udp.is_ipv4() {
         "0.0.0.0:0"
     } else {
@@ -96,23 +251,12 @@ pub async fn enroll(dir: &Path, ticket: Ticket, name: String, create: bool) -> R
         false,
     )
     .await?;
-    let reply = rpc(
-        &endpoint,
-        &identity.server,
-        false,
-        Request::Enroll {
-            secret: ticket.secret,
-            name,
-            create,
-        },
-    )
-    .await;
+    let reply = exchange(&endpoint, &identity.server, false, request).await;
     endpoint.close().await;
-    let roster = match reply? {
-        Reply::Roster(roster) => roster,
-        Reply::Revoked => bail!("this device was revoked; use a new state directory"),
-        _ => bail!("unexpected enrollment reply"),
-    };
+    reply
+}
+
+fn commit(dir: &Path, identity: Identity, roster: Roster) -> Result<()> {
     let device = Device {
         identity,
         roster,
@@ -232,6 +376,18 @@ async fn rpc(
     via_relay: bool,
     request: Request,
 ) -> Result<Reply> {
+    match exchange(endpoint, server, via_relay, request).await? {
+        Reply::Error(error) => bail!("{error}"),
+        reply => Ok(reply),
+    }
+}
+
+async fn exchange(
+    endpoint: &Endpoint,
+    server: &ServerAddr,
+    via_relay: bool,
+    request: Request,
+) -> Result<Reply> {
     timeout(wire::RPC_TIMEOUT, async {
         let connection = endpoint
             .connect(server.dial(via_relay), wire::CONTROL)
@@ -239,10 +395,7 @@ async fn rpc(
         let (mut tx, mut rx) = connection.open_bi().await?;
         wire::send(&mut tx, request).await?;
         tx.finish()?;
-        match wire::recv(&mut rx).await? {
-            Reply::Error(error) => bail!("{error}"),
-            reply => Ok(reply),
-        }
+        wire::recv(&mut rx).await
     })
     .await
     .context("membership service timed out")?
@@ -613,6 +766,26 @@ fn same_membership(a: &Device, b: &Device) -> Result<bool> {
         serde_json::to_vec(&device)
     };
     Ok(canonical(a)? == canonical(b)?)
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    #[test]
+    fn hostnames_become_acceptable_device_names_or_fall_back() {
+        for (host, name) in [
+            ("laptop\n", "laptop"),
+            ("Build Box.example.test", "Build-Box"),
+            ("zoë's_pc", "zo--s_pc"),
+        ] {
+            assert_eq!(host_label(host).as_deref(), Some(name));
+        }
+        let endpoint_id = SecretKey::from_bytes(&[1; 32]).public().to_string();
+        for unusable in ["", "...", "日本", "LocalHost.localdomain", &endpoint_id] {
+            assert_eq!(host_label(unusable), None);
+        }
+    }
 }
 
 #[cfg(all(test, unix))]

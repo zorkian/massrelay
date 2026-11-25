@@ -27,6 +27,9 @@ struct RelayState {
     create_secret: String,
     networks: BTreeMap<String, Network>,
     invites: BTreeMap<String, Invite>,
+    /// Whether any device may create a network. State saved before this field stays ticket-only.
+    #[serde(default)]
+    shared: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -41,6 +44,15 @@ struct Network {
     members: BTreeMap<EndpointId, Member>,
     revoked: Vec<EndpointId>,
     pairs: Vec<Pair>,
+    #[serde(default)]
+    first_invite: Option<FirstInvite>,
+}
+
+/// The latest invite handed to a founder by open creation, kept so a retry can receive it again.
+#[derive(Clone, Serialize, Deserialize)]
+struct FirstInvite {
+    founder: EndpointId,
+    secret: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -89,6 +101,26 @@ impl Pair {
 }
 
 impl Network {
+    fn add(&mut self, id: EndpointId, name: String) -> Result<()> {
+        ensure!(
+            !self
+                .members
+                .values()
+                .any(|m| m.name.eq_ignore_ascii_case(&name)),
+            wire::NAME_IN_USE
+        );
+        self.members.insert(
+            id,
+            Member {
+                id,
+                name,
+                addr: None,
+                last_seen: None,
+            },
+        );
+        Ok(())
+    }
+
     fn roster(&self, network: &str, who: EndpointId) -> Roster {
         let peers = self
             .members
@@ -146,6 +178,26 @@ impl Network {
 }
 
 impl RelayState {
+    fn new(udp: SocketAddr, relay: RelayUrl, shared: bool) -> Result<Self> {
+        ensure!(
+            !udp.ip().is_unspecified() && udp.port() != 0,
+            "specify the relay's reachable UDP address"
+        );
+        let key = wire::random()?;
+        Ok(Self {
+            key,
+            server: ServerAddr {
+                id: SecretKey::from_bytes(&key).public(),
+                udp,
+                relay,
+            },
+            create_secret: wire::token()?,
+            networks: BTreeMap::new(),
+            invites: BTreeMap::new(),
+            shared,
+        })
+    }
+
     fn apply(&mut self, who: EndpointId, request: Request) -> Result<Reply> {
         if self
             .networks
@@ -171,6 +223,13 @@ impl RelayState {
             }
             return self.enroll(who, &secret, name, create);
         }
+        if let Request::Create { name } = request {
+            ensure!(
+                self.shared,
+                "this relay requires an operator creation ticket"
+            );
+            return self.create(who, current, name);
+        }
 
         let id = current.context("device is not enrolled")?;
         let network = self.networks.get_mut(&id).context("network vanished")?;
@@ -188,20 +247,7 @@ impl RelayState {
                 );
                 member.last_seen = Some(storage::now());
             }
-            Request::Invite => {
-                let now = storage::now();
-                self.invites.retain(|_, invite| invite.expires > now);
-                let secret = wire::token()?;
-                self.invites.insert(
-                    secret.clone(),
-                    Invite {
-                        network: id,
-                        issuer: who,
-                        expires: now + INVITE_SECONDS,
-                    },
-                );
-                return Ok(Reply::Invite(secret));
-            }
+            Request::Invite => return Ok(Reply::Invite(self.issue_invite(id, who)?)),
             Request::Pair {
                 peer,
                 decision,
@@ -216,9 +262,65 @@ impl RelayState {
                     .retain(|pair| pair.left != peer && pair.right != peer);
                 self.invites.retain(|_, invite| invite.issuer != peer);
             }
-            Request::Enroll { .. } => unreachable!(),
+            Request::Enroll { .. } | Request::Create { .. } => unreachable!(),
         }
         Ok(Reply::Roster(network.roster(&id, who)))
+    }
+
+    fn issue_invite(&mut self, network: String, issuer: EndpointId) -> Result<String> {
+        let now = storage::now();
+        self.invites.retain(|_, invite| invite.expires > now);
+        let secret = wire::token()?;
+        self.invites.insert(
+            secret.clone(),
+            Invite {
+                network,
+                issuer,
+                expires: now + INVITE_SECONDS,
+            },
+        );
+        Ok(secret)
+    }
+
+    fn create(&mut self, who: EndpointId, current: Option<String>, name: String) -> Result<Reply> {
+        let (id, live) = match current {
+            // A founder retrying after a lost reply keeps the same network and unspent invite.
+            Some(id) => {
+                let first = self.networks[&id]
+                    .first_invite
+                    .as_ref()
+                    .filter(|first| first.founder == who)
+                    .context("this device already belongs to a pocket network on this relay")?;
+                let live = self
+                    .invites
+                    .get(&first.secret)
+                    .is_some_and(|invite| invite.expires > storage::now())
+                    .then(|| first.secret.clone());
+                (id, live)
+            }
+            None => {
+                wire::check_name(&name)?;
+                let id = wire::token()?;
+                let mut network = Network::default();
+                network.add(who, name)?;
+                self.networks.insert(id.clone(), network);
+                (id, None)
+            }
+        };
+        let invite = match live {
+            Some(secret) => secret,
+            None => self.issue_invite(id.clone(), who)?,
+        };
+        let network = self.networks.get_mut(&id).context("network vanished")?;
+        network.first_invite = Some(FirstInvite {
+            founder: who,
+            secret: invite.clone(),
+        });
+        Ok(Reply::Created {
+            name: network.members[&who].name.clone(),
+            roster: network.roster(&id, who),
+            invite,
+        })
     }
 
     fn enroll(
@@ -228,22 +330,12 @@ impl RelayState {
         name: String,
         create: bool,
     ) -> Result<Reply> {
-        ensure!(
-            !name.is_empty()
-                && name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
-            "name must contain ASCII letters, digits, hyphens, or underscores"
-        );
-        ensure!(
-            name.parse::<EndpointId>().is_err(),
-            "name cannot be an endpoint ID"
-        );
+        wire::check_name(&name)?;
 
         let id = if create {
             ensure!(
                 bool::from(self.create_secret.as_bytes().ct_eq(secret.as_bytes())),
-                "invalid create ticket"
+                wire::INVALID_CREATE_TICKET
             );
             let id = wire::token()?;
             // A create ticket is also a one-use credential.
@@ -254,54 +346,65 @@ impl RelayState {
             let invite = self
                 .invites
                 .get(secret)
-                .context("invalid or already used invite")?;
-            ensure!(invite.expires > storage::now(), "invite expired");
+                .context(wire::INVALID_JOIN_INVITE)?;
+            ensure!(invite.expires > storage::now(), wire::EXPIRED_INVITE);
             invite.network.clone()
         };
 
         let network = self.networks.get_mut(&id).context("network vanished")?;
-        ensure!(
-            !network
-                .members
-                .values()
-                .any(|m| m.name.eq_ignore_ascii_case(&name)),
-            "name already in use"
-        );
-        network.members.insert(
-            who,
-            Member {
-                id: who,
-                name,
-                addr: None,
-                last_seen: None,
-            },
-        );
+        network.add(who, name)?;
         self.invites.remove(secret);
         Ok(Reply::Roster(network.roster(&id, who)))
     }
 }
 
+/// Initialize a ticket-only relay.
 pub fn init(dir: &Path, udp: SocketAddr, relay: RelayUrl) -> Result<()> {
     let _lock = storage::lock(dir)?;
     ensure!(!dir.join(STATE_FILE).exists(), "relay already initialized");
-    ensure!(
-        !udp.ip().is_unspecified() && udp.port() != 0,
-        "specify the relay's reachable UDP address"
-    );
-    let key = wire::random()?;
-    let state = RelayState {
-        key,
-        server: ServerAddr {
-            id: SecretKey::from_bytes(&key).public(),
-            udp,
-            relay,
-        },
-        create_secret: wire::token()?,
-        networks: BTreeMap::new(),
-        invites: BTreeMap::new(),
-    };
+    let state = RelayState::new(udp, relay, false)?;
     storage::save(dir, STATE_FILE, &state)?;
     print_ticket(state)
+}
+
+/// Load the saved relay, or build a new shared one when given its advertised addresses and no
+/// state exists. Returns whether the state is new and still needs saving. Advertised addresses
+/// never alter saved state; they must match it.
+fn configure(dir: &Path, advertised: Option<(SocketAddr, RelayUrl)>) -> Result<(RelayState, bool)> {
+    if !dir.join(STATE_FILE).try_exists()? {
+        let (udp, relay) = advertised.context(
+            "relay is not initialized; pass --public-udp and --url to start a shared relay, \
+             or use relay-init for a ticket-only relay",
+        )?;
+        return Ok((RelayState::new(udp, relay, true)?, true));
+    }
+    let state: RelayState = storage::load(dir, STATE_FILE)?;
+    if let Some((udp, relay)) = advertised {
+        ensure!(
+            state.shared,
+            "this relay requires operator creation tickets and will not become shared; \
+             start it without --public-udp and --url, or use a new state directory"
+        );
+        ensure!(
+            state.server.udp == udp && state.server.relay == relay,
+            "this relay is saved with --public-udp {} --url {}; \
+             use those values or omit both, or use a new state directory",
+            state.server.udp,
+            state.server.relay
+        );
+    }
+    Ok((state, false))
+}
+
+/// Print a shared relay's public locator.
+pub fn info(dir: &Path) -> Result<()> {
+    let state: RelayState = storage::load(dir, STATE_FILE)?;
+    ensure!(
+        state.shared,
+        "this relay requires operator creation tickets; use relay-ticket"
+    );
+    println!("{}", state.server.locator()?);
+    Ok(())
 }
 
 pub fn create_ticket(dir: &Path) -> Result<()> {
@@ -346,11 +449,17 @@ impl AccessControl for RelayAccess {
     }
 }
 
-pub async fn run(dir: PathBuf, udp_bind: SocketAddr, relay_bind: SocketAddr) -> Result<()> {
+pub async fn run(
+    dir: PathBuf,
+    udp_bind: SocketAddr,
+    relay_bind: SocketAddr,
+    advertised: Option<(SocketAddr, RelayUrl)>,
+) -> Result<()> {
     let _lock = storage::lock(&dir)?;
-    let config: RelayState = storage::load(&dir, STATE_FILE)?;
+    let (config, new) = configure(&dir, advertised)?;
     let endpoint_key = SecretKey::from_bytes(&config.key);
     let relay_url = config.server.relay.clone();
+    let locator = config.shared.then(|| config.server.locator()).transpose()?;
     let state = Arc::new(Mutex::new(config));
 
     let mut relay = RelayConfig::new(relay_bind);
@@ -370,6 +479,13 @@ pub async fn run(dir: PathBuf, udp_bind: SocketAddr, relay_bind: SocketAddr) -> 
         false,
     )
     .await?;
+    // Save a new relay only once both listeners work, before it can accept a control request.
+    if new {
+        storage::save(&dir, STATE_FILE, &*state.lock().await)?;
+    }
+    if let Some(locator) = locator {
+        eprintln!("Shared relay locator (public): {locator}");
+    }
     eprintln!("MassRelay listening on {udp_bind} UDP and {relay_bind} TCP");
     let shutdown = crate::shutdown();
     tokio::pin!(shutdown);
@@ -499,6 +615,7 @@ mod tests {
             create_secret: String::new(),
             networks: BTreeMap::from([("example".into(), network(&[a, b]))]),
             invites: BTreeMap::new(),
+            shared: false,
         };
         assert!(relay.apply(outsider, Request::Revoke { peer: b }).is_err());
         let Reply::Invite(secret) = relay.apply(b, Request::Invite).unwrap() else {
@@ -521,5 +638,152 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    fn addresses() -> (SocketAddr, RelayUrl) {
+        (
+            "127.0.0.1:4433".parse().unwrap(),
+            "http://127.0.0.1:3340".parse().unwrap(),
+        )
+    }
+
+    fn relay(shared: bool) -> RelayState {
+        let (udp, url) = addresses();
+        RelayState::new(udp, url, shared).unwrap()
+    }
+
+    fn create(name: &str) -> Request {
+        Request::Create { name: name.into() }
+    }
+
+    fn join(secret: &str, name: &str) -> Request {
+        Request::Enroll {
+            secret: secret.into(),
+            name: name.into(),
+            create: false,
+        }
+    }
+
+    fn created(reply: Reply) -> (String, Roster, String) {
+        let Reply::Created {
+            name,
+            roster,
+            invite,
+        } = reply
+        else {
+            panic!("expected a created network");
+        };
+        (name, roster, invite)
+    }
+
+    #[tokio::test]
+    async fn retried_creation_keeps_one_network_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (founder, second, third) = (id(1), id(2), id(3));
+        let state = Mutex::new(relay(true));
+        let (_, roster, invite) =
+            created(dispatch(&state, dir.path(), founder, create("first")).await);
+
+        // The reply is lost and the relay restarts before the founder retries.
+        let state = Mutex::new(storage::load(dir.path(), STATE_FILE).unwrap());
+        let (name, retried, again) =
+            created(dispatch(&state, dir.path(), founder, create("renamed")).await);
+        assert_eq!(
+            (name.as_str(), &retried.network, &again),
+            ("first", &roster.network, &invite)
+        );
+
+        let mut state = state.into_inner();
+        state.apply(second, join(&invite, "second")).unwrap();
+        assert!(state.apply(third, join(&invite, "third")).is_err());
+        assert!(state.apply(second, create("second")).is_err());
+
+        // A spent invite is replaced, and so is an expired one. Neither works again.
+        let (_, _, replacement) = created(state.apply(founder, create("first")).unwrap());
+        assert_ne!(replacement, invite);
+        state.invites.get_mut(&replacement).unwrap().expires = 0;
+        assert!(state.apply(third, join(&replacement, "third")).is_err());
+        let (_, _, fresh) = created(state.apply(founder, create("first")).unwrap());
+        assert_ne!(fresh, replacement);
+        for spent in [&invite, &replacement] {
+            assert!(state.apply(third, join(spent, "third")).is_err());
+        }
+        state.apply(third, join(&fresh, "third")).unwrap();
+        assert_eq!(state.networks.len(), 1);
+    }
+
+    #[test]
+    fn shared_relay_networks_cannot_reach_each_other() {
+        let (a, b, c) = (id(1), id(2), id(3));
+        let mut relay = relay(true);
+        let (_, first, _) = created(relay.apply(a, create("host")).unwrap());
+        let (_, second, invite) = created(relay.apply(b, create("host")).unwrap());
+        assert_ne!(first.network, second.network);
+        assert!(second.peers.is_empty());
+
+        let Reply::Roster(roster) = relay.apply(c, join(&invite, "other")).unwrap() else {
+            panic!("expected a roster");
+        };
+        assert_eq!(roster.network, second.network);
+        assert!(roster.peers.iter().map(|p| p.member.id).eq([b]));
+        for outsider in [b, c] {
+            let pair = Request::Pair {
+                peer: a,
+                decision: Decision::Approve,
+                generation: 0,
+            };
+            assert!(relay.apply(outsider, pair).is_err());
+            assert!(relay.apply(outsider, Request::Revoke { peer: a }).is_err());
+        }
+        assert!(relay.networks[&first.network].members.contains_key(&a));
+    }
+
+    #[test]
+    fn startup_never_widens_or_readvertises_a_saved_relay() {
+        let dir = tempfile::tempdir().unwrap();
+        let (udp, url) = addresses();
+        assert!(configure(dir.path(), None).is_err());
+        let (shared, new) = configure(dir.path(), Some((udp, url.clone()))).unwrap();
+        assert!(new && shared.shared);
+        storage::save(dir.path(), STATE_FILE, &shared).unwrap();
+
+        for advertised in [None, Some((udp, url.clone()))] {
+            let (saved, new) = configure(dir.path(), advertised).unwrap();
+            assert!(!new && saved.shared && saved.key == shared.key);
+        }
+        let other_udp = "127.0.0.1:4434".parse().unwrap();
+        let other_url = "http://127.0.0.1:3341".parse().unwrap();
+        assert!(configure(dir.path(), Some((other_udp, url.clone()))).is_err());
+        assert!(configure(dir.path(), Some((udp, other_url))).is_err());
+
+        // State written before shared relays existed has neither new field.
+        let mut private = relay(false);
+        let member = id(1);
+        let ticket = Request::Enroll {
+            secret: private.create_secret.clone(),
+            name: "member".into(),
+            create: true,
+        };
+        private.apply(member, ticket).unwrap();
+        let mut legacy = serde_json::to_value(&private).unwrap();
+        legacy.as_object_mut().unwrap().remove("shared").unwrap();
+        for network in legacy["networks"].as_object_mut().unwrap().values_mut() {
+            network
+                .as_object_mut()
+                .unwrap()
+                .remove("first_invite")
+                .unwrap();
+        }
+        storage::save(dir.path(), STATE_FILE, &legacy).unwrap();
+
+        assert!(configure(dir.path(), Some((udp, url))).is_err());
+        let (mut saved, _) = configure(dir.path(), None).unwrap();
+        assert!(!saved.shared);
+        assert!(saved.apply(id(2), create("stranger")).is_err());
+        assert!(saved.apply(member, create("member")).is_err());
+        assert!(matches!(
+            saved.apply(member, Request::Invite).unwrap(),
+            Reply::Invite(_)
+        ));
     }
 }

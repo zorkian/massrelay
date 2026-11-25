@@ -1,6 +1,6 @@
 use std::{io, net::SocketAddr, time::Duration};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use iroh::{EndpointAddr, EndpointId, RelayUrl};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -9,6 +9,14 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const CONTROL: &[u8] = b"massrelay/control/1";
 pub const SHELL: &[u8] = b"massrelay/shell/1";
 pub const RPC_TIMEOUT: Duration = Duration::from_secs(10);
+pub const INVALID_CREATE_TICKET: &str = "invalid create ticket";
+pub const INVALID_JOIN_INVITE: &str = "invalid or already used invite";
+pub const EXPIRED_INVITE: &str = "invite expired";
+pub const NAME_IN_USE: &str = "name already in use";
+/// A public relay locator names a relay. It carries no secret and grants no membership.
+const LOCATOR_PREFIX: &str = "mrrelay1_";
+/// Operator creation tickets and join invites share this secret-bearing format.
+const TICKET_PREFIX: &str = "mr1_";
 
 pub async fn send<T: Serialize>(writer: &mut (impl AsyncWrite + Unpin), value: T) -> Result<()> {
     let data = serde_json::to_vec(&value)?;
@@ -51,6 +59,28 @@ pub fn token() -> Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(random()?))
 }
 
+pub fn check_name(name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+        "name must contain ASCII letters, digits, hyphens, or underscores"
+    );
+    ensure!(
+        name.parse::<EndpointId>().is_err(),
+        "name cannot be an endpoint ID"
+    );
+    Ok(())
+}
+
+fn encode(prefix: &str, value: &impl Serialize) -> Result<String> {
+    Ok(format!(
+        "{prefix}{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(value)?)
+    ))
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ServerAddr {
     pub id: EndpointId,
@@ -67,6 +97,21 @@ impl ServerAddr {
             addr
         }
     }
+
+    pub fn locator(&self) -> Result<String> {
+        encode(LOCATOR_PREFIX, self)
+    }
+
+    pub fn from_locator(text: &str) -> Result<Self> {
+        let encoded = text
+            .trim()
+            .strip_prefix(LOCATOR_PREFIX)
+            .context("expected a MassRelay relay locator starting with mrrelay1_")?;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .context("invalid relay locator")?;
+        serde_json::from_slice(&bytes).context("invalid relay locator")
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -77,17 +122,14 @@ pub struct Ticket {
 
 impl Ticket {
     pub fn encode(&self) -> Result<String> {
-        Ok(format!(
-            "mr1_{}",
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(self)?)
-        ))
+        encode(TICKET_PREFIX, self)
     }
 
     pub fn decode(text: &str) -> Result<Self> {
         let text = text.trim();
         let encoded = text
-            .strip_prefix("mr1_")
-            .context("expected a MassRelay ticket")?;
+            .strip_prefix(TICKET_PREFIX)
+            .context("expected a MassRelay ticket or invite starting with mr1_")?;
         serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?).context("invalid ticket")
     }
 }
@@ -144,6 +186,11 @@ pub enum Request {
     Revoke {
         peer: EndpointId,
     },
+    /// Open creation on a shared relay. Membership and the first invite are issued together.
+    /// Repeating it from the founder returns that invite while it remains unused and unexpired.
+    Create {
+        name: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -152,6 +199,12 @@ pub enum Reply {
     Invite(String),
     Revoked,
     Error(String),
+    Created {
+        /// The founder's registered name, which a retry cannot change.
+        name: String,
+        roster: Roster,
+        invite: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
