@@ -449,7 +449,7 @@ fn load_device(dir: &Path) -> Result<Device> {
     Ok(device)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn check_enrolled(dir: &Path) -> Result<()> {
     load_device(dir).map(drop)
 }

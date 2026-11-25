@@ -1,8 +1,12 @@
+#[cfg(target_os = "macos")]
+#[path = "launch_agent.rs"]
+mod background_service;
+#[cfg(target_os = "linux")]
+#[path = "systemd_user.rs"]
+mod background_service;
 mod connection_log;
 mod device;
 mod grants;
-#[cfg(target_os = "macos")]
-mod launch_agent;
 mod local;
 mod relay;
 mod storage;
@@ -99,8 +103,8 @@ enum Command {
         #[arg(long, default_value = "0.0.0.0:0")]
         bind: SocketAddr,
     },
-    /// Set up and start this device's background service on macOS.
-    #[cfg(target_os = "macos")]
+    /// Set up and start this device's background service.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     Install,
     /// List devices, recent presence, and pairing status.
     Peers,
@@ -239,8 +243,8 @@ async fn execute(cli: Cli) -> Result<i32> {
             log_file,
             bind,
         } => device::run(dir, shell, bind, log_file).await?,
-        #[cfg(target_os = "macos")]
-        Command::Install => launch_agent::install(&dir)?,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        Command::Install => background_service::install(&dir)?,
         Command::Peers => {
             let LocalReply::Peers(peers) = local::command(&dir, LocalRequest::Peers).await? else {
                 bail!("unexpected roster reply");
