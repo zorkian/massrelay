@@ -1,10 +1,10 @@
 # MassRelay
 
-MassRelay connects your own machines in a pocket network. Enrolled devices can see each other. A pair must approve access from both devices before either can connect. Each destination chooses whether to offer a shell. One binary provides the desktop client, user-mode listener, and public relay.
+MassRelay connects your own machines in a pocket network. Enrolled devices can see each other. A pair must approve access from both devices before either can connect. Each destination then chooses which services each peer may use, such as a shell or a TCP port. One binary provides the desktop client, user-mode listener, and public relay.
 
 ## Install
 
-[MassRelay v0.2.0](https://github.com/zorkian/massrelay/releases/tag/v0.2.0) adds shared relays and the create-and-join flow.
+[MassRelay v0.2.0](https://github.com/zorkian/massrelay/releases/tag/v0.2.0) adds shared relays and the create-and-join flow. For per-peer service grants and TCP and UDP forwarding, [build from source](#build-from-source).
 
 On Linux or macOS, sign in with `gh auth login` using an account that has access to this repository. Then install the latest release to `~/.local/bin/massrelay`.
 
@@ -120,7 +120,7 @@ The complete forms are:
 
 `join` treats its argument as an invite only when it is a complete invite token, and otherwise as a device name.
 
-Then run `massrelay run --allow-shell` on both machines and leave it running. In another terminal on each machine, approve the other.
+Then run `massrelay run` on both machines and leave it running. In another terminal on each machine, approve the other.
 
 ```sh
 # On laptop
@@ -128,20 +128,114 @@ massrelay approve workstation
 
 # On workstation
 massrelay approve laptop
-
-# On either side, use the other device's name
-massrelay shell laptop
 ```
 
 Compare the endpoint ID shown by `approve` with the one that `massrelay run` prints on the other device. To script an approval, pass the verified endpoint ID instead of the name.
 
+Pairing alone gives no access. To open a shell from the laptop, allow it on the workstation.
+
+```sh
+# On workstation
+massrelay enable shell laptop
+
+# On laptop
+massrelay shell workstation
+```
+
 Use `massrelay peers` to see everyone in the pocket network, recent presence, and your pairing status. Any enrolled device can invite another with `massrelay invite` while `massrelay run` is running. Invites can be used once and expire after ten minutes. Use `massrelay decline NAME` to decline or unpair, or `massrelay revoke NAME` to remove another device from the network. Name matching is case-insensitive, and commands accept endpoint IDs as well.
 
-Run `massrelay run` under your ordinary account in a terminal or supervisor of your choice. Use `--allow-shell` on each destination that should accept shells. Approving a peer on such a destination gives that peer the access of the account running MassRelay. Use `--shell /path/to/shell` to override the account's default shell executable, for example to use PowerShell on Windows.
+Run `massrelay run` under your ordinary account in a terminal or supervisor of your choice. Use `--shell /path/to/shell` to override the account's default shell executable, for example to use PowerShell on Windows.
+
+## Allow services
+
+The device offering a service decides who may use it. Each grant names one peer and one service, and every device starts with none. In these examples, the device `talaria` offers services to its paired peer `dirk`.
+
+```sh
+# On talaria
+massrelay enable shell dirk
+massrelay enable tcp:4000 dirk
+massrelay list
+
+# On dirk
+massrelay shell talaria
+massrelay connect talaria tcp:4000
+```
+
+| Service | What the peer can do |
+| --- | --- |
+| `shell` | Open an interactive shell as the account running `massrelay run`, using `massrelay shell`. |
+| `tcp:PORT` | Connect to that TCP port on the offering device's loopback address, IPv4 or IPv6. |
+| `udp:PORT` | Exchange datagrams with that UDP port on `127.0.0.1` on the offering device. |
+
+A shell gives the peer your account's access, including its ability to change MassRelay grants and to use its connections to other devices.
+
+`massrelay enable` and `massrelay disable` need `massrelay run` on the offering device, and work while the relay is unreachable. Grants are saved there and survive restarts. Peers are given by name or endpoint ID, and a grant stays with that device's ID. You can enable a service before both approvals are in place; it takes effect once they are. Declining the pairing on either side, or revoking the device, removes its grants, so enable them again after a new approval.
+
+To stop a grant, disable it. Open sessions using it close, and other services and peers are unaffected.
+
+```sh
+massrelay disable tcp:4000 dirk
+```
+
+`massrelay list` shows this device's grants with each peer's name and endpoint ID, whether the grant is persistent or temporary, and where a port is forwarded. Grants are not announced to the relay or to other devices.
+
+## Use a TCP port
+
+`massrelay connect PEER tcp:PORT` carries one TCP connection over standard input and output. Output is the unmodified data from the port, and errors go to standard error.
+
+```sh
+printf 'GET / HTTP/1.0\r\n\r\n' | massrelay connect talaria tcp:4000
+```
+
+Each direction closes separately. End of input is passed to the port, whose replies still arrive, and when the port finishes sending, standard output closes while input is still accepted. The command exits once both directions have closed, so in a terminal you may need Ctrl-D after the other end has finished.
+
+## Expose a port temporarily
+
+`massrelay expose` grants one peer a port only while the command runs. Run it on the device that offers the port.
+
+```sh
+# On talaria, leave this running
+massrelay expose --tcp 4000 --to dirk
+
+# On dirk
+massrelay connect talaria tcp:4000
+```
+
+By default it forwards to loopback on the same port. Add `HOST:PORT` to forward elsewhere. The offering device resolves and connects to that address, so it can be any host that device can reach. The peer cannot choose or change it.
+
+```sh
+massrelay expose --tcp 4000 --to dirk 127.0.0.1:8080
+massrelay expose --tcp 5432 --to dirk database.internal:5432
+massrelay expose --tcp 8000 --to dirk '[::1]:8000'
+```
+
+The port after `--tcp` or `--udp` names the service that the peer asks for. Exposing a port requires a running `massrelay run`, and the exposure still needs both pairing approvals. Press Ctrl-C to end it. It also ends if the command is closed or killed, if `massrelay run` stops, if the pairing ends, or if you run `massrelay disable tcp:4000 dirk`. Its sessions close with it. Temporary grants are never saved. A peer can hold either a persistent or a temporary grant for a service; disable the existing one before replacing it.
+
+## Use a UDP port
+
+Expose a UDP port with `--udp`, or grant it persistently with `massrelay enable udp:PORT PEER`.
+
+```sh
+# On talaria, leave this running
+massrelay expose --udp 5000 --to dirk
+
+# On dirk, leave this running too
+massrelay connect talaria udp:5000
+```
+
+`connect` listens on `127.0.0.1` on the same port and prints the address. Send datagrams there. Add `--listen PORT` to use another local port, for example when both devices are on one machine, or `--listen 0` to choose a free one. Stop it with Ctrl-C.
+
+Each local sender address gets its own socket on the offering device, which keeps replies separate. These associations last until the session ends. A target given as a hostname is resolved when the session starts, preferring IPv4.
+
+Datagram boundaries are preserved, including empty datagrams. The consumer's loopback socket is IPv4, so a payload is limited to 65,507 bytes. Between the devices, datagrams travel over one encrypted, reliable, ordered stream. A lost packet there delays the datagrams behind it instead of dropping them, which differs from native UDP and can add latency. Datagrams can still be lost at either local socket, for example when a sender outpaces the connection.
+
+## Upgrade from v0.2.0 or earlier
+
+Service grants replace the flag that `massrelay run` used to allow shells. The new version rejects that flag, so remove it from any LaunchAgent, service, or script before restarting. A LaunchAgent that still passes it exits at each start. Upgrade and restart `massrelay run` on both ends of every connection, because older and newer devices cannot open sessions with each other. Existing enrollment and pairings are kept. No shell or port is enabled after the upgrade until you grant it. Relays need no change.
 
 ## Run in the background on macOS
 
-After creating or joining a network, stop any foreground `massrelay run` and load a LaunchAgent under your account. This example enables incoming shells and writes connection events to `~/Library/Logs/MassRelay-connections.jsonl`.
+After creating or joining a network, stop any foreground `massrelay run` and load a LaunchAgent under your account. This example writes connection events to `~/Library/Logs/MassRelay-connections.jsonl`. Use `massrelay enable` to allow peers to use services.
 
 ```sh
 mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
@@ -156,7 +250,6 @@ cat > "$plist" <<EOF
   <array>
     <string>$HOME/.local/bin/massrelay</string>
     <string>run</string>
-    <string>--allow-shell</string>
     <string>--log-file</string>
     <string>$HOME/Library/Logs/MassRelay-connections.jsonl</string>
   </array>
@@ -172,7 +265,7 @@ plutil -lint "$plist" && launchctl bootstrap "gui/$(id -u)" "$plist"
 
 If the agent is already loaded, run `launchctl bootout "gui/$(id -u)/com.massrelay.client"` before reloading the plist. Use `massrelay peers` to check the agent and `tail -f ~/Library/Logs/MassRelay-connections.jsonl` to watch connections.
 
-Connection events are one JSON object per line. Each records the UTC time, direction, session number, and the peer's name and endpoint ID when known. Disconnect events include the reason and, on the shell host, the exit code if available. Shell commands, terminal output, and invitations stay out of the connection log. Use `massrelay run --log-file PATH` for the same log from a terminal. By default, connection events go to stderr.
+Connection events are one JSON object per line. Each records the UTC time, direction, session number, the peer's name and endpoint ID when known, and the service when known. Failed and disconnect events include the reason, and on the shell host the exit code if available. Shell commands, terminal output, forwarded data, forwarding addresses, and invitations stay out of the connection log. Use `massrelay run --log-file PATH` for the same log from a terminal. By default, connection events go to stderr.
 
 ## Run a ticket-only relay
 
@@ -190,12 +283,12 @@ For another pocket network, print the next one-use creation ticket with `massrel
 
 ## Connections and state
 
-Iroh authenticates peer keys and encrypts both directions of the shell. It can use direct connections or the configured relay. The relay manages the membership roster, coordinates pair approvals, and can see addressing and presence metadata. Each direct connection requires a locally saved approval for the authenticated peer key on **both** devices. A shell gives the peer access to your local account, including the ability to use that account's MassRelay connections to other devices.
+Iroh authenticates peer keys and encrypts both directions of every session. It can use direct connections or the configured relay. The relay manages the membership roster, coordinates pair approvals, and can see addressing and presence metadata. Each connection requires a locally saved approval for the authenticated peer key on **both** devices, and a grant for that peer and service on the offering device.
 
-If the relay goes offline, cached approvals still work over a reachable direct path. MassRelay saves peer address candidates, reuses its UDP port when possible, and uses local multicast discovery. Use a fixed `--bind` address and port if a device has a stable direct address you want it to keep. Behind NAT, establishing a new direct path can require the relay. Presence becomes unknown as the last heartbeat ages. Revocations take effect on each device when it next learns about them. A decline closes access locally as soon as you make it and syncs to the relay when it returns.
+If the relay goes offline, cached approvals and grants still work over a reachable direct path. MassRelay saves peer address candidates, reuses its UDP port when possible, and uses local multicast discovery. Use a fixed `--bind` address and port if a device has a stable direct address you want it to keep. Behind NAT, establishing a new direct path can require the relay. Presence becomes unknown as the last heartbeat ages. Revocations take effect on each device when it next learns about them. A decline closes access locally as soon as you make it and syncs to the relay when it returns.
 
-Keep the device state directory to preserve keys and approvals across restarts. If you lose every enrolled device, create a new pocket network. A plain shell ends on disconnection. Use the destination's terminal multiplexer if you need work to outlive a connection.
+Keep the device state directory to preserve keys, approvals, and grants across restarts. If you lose every enrolled device, create a new pocket network. A plain shell ends on disconnection. Use the destination's terminal multiplexer if you need work to outlive a connection.
 
 ## Verification
 
-Run `cargo test --locked` and `cargo clippy --locked --all-targets -- -D warnings`. On Linux or macOS, run `cargo test --locked shell_works_with_only_a_tcp_relay_path -- --ignored` to test a shell with direct paths disabled. Build the debug binary and run `python3 tests/pocket.py target/debug/massrelay` for a three-device network on a ticket-only relay, followed by isolated networks and restarts on a shared relay. Both network tests use loopback ports.
+Run `cargo test --locked` and `cargo clippy --locked --all-targets -- -D warnings`. On Linux or macOS, run `cargo test --locked shell_works_with_only_a_tcp_relay_path -- --ignored` to test a shell with direct paths disabled. Build the debug binary and run `python3 tests/pocket.py target/debug/massrelay` for a three-device network on a ticket-only relay, including service grants and TCP and UDP forwarding, followed by isolated networks and restarts on a shared relay. Both network tests use loopback ports.

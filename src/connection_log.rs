@@ -13,6 +13,8 @@ use chrono::{SecondsFormat, Utc};
 use iroh::EndpointId;
 use serde::Serialize;
 
+use crate::wire::Service;
+
 pub struct ConnectionLog {
     file: Option<Mutex<File>>,
     counter: AtomicU64,
@@ -35,6 +37,8 @@ struct Event<'a> {
     peer_id: Option<String>,
     peer_name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    service: Option<Service>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     exit_code: Option<i32>,
@@ -46,6 +50,7 @@ pub struct Session<'a> {
     direction: Direction,
     peer_id: Option<EndpointId>,
     peer_name: Option<String>,
+    service: Option<Service>,
     connected: bool,
     ended: bool,
 }
@@ -84,6 +89,7 @@ impl ConnectionLog {
             direction,
             peer_id,
             peer_name,
+            service: None,
             connected: false,
             ended: false,
         }
@@ -114,6 +120,10 @@ impl Session<'_> {
         self.peer_name = Some(name);
     }
 
+    pub fn set_service(&mut self, service: Service) {
+        self.service = Some(service);
+    }
+
     pub fn connected(&mut self) {
         self.connected = true;
         self.record("connected", None, None);
@@ -138,6 +148,7 @@ impl Session<'_> {
             event,
             peer_id: self.peer_id.map(|id| id.to_string()),
             peer_name: self.peer_name.as_deref(),
+            service: self.service,
             reason,
             exit_code,
         });

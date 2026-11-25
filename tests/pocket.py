@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import termios
+import threading
 import time
 
 
@@ -42,6 +43,104 @@ def stop(process):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+
+
+class TcpTarget:
+    """A loopback TCP service that runs one handler thread for each connection."""
+
+    def __init__(self, handler, host="127.0.0.1"):
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        self.listener = socket.socket(family, socket.SOCK_STREAM)
+        self.listener.bind((host, 0))
+        self.listener.listen()
+        self.port = self.listener.getsockname()[1]
+        self.accepted = 0
+        self.handler = handler
+        threading.Thread(target=self.accept, daemon=True).start()
+
+    def accept(self):
+        while True:
+            try:
+                connection, _ = self.listener.accept()
+            except OSError:
+                return
+            self.accepted += 1
+            threading.Thread(target=self.serve, args=(connection,), daemon=True).start()
+
+    def serve(self, connection):
+        with connection:
+            try:
+                self.handler(connection)
+            except OSError:
+                pass
+
+    def close(self):
+        self.listener.close()
+
+
+def echo(connection):
+    while data := connection.recv(65536):
+        connection.sendall(data)
+
+
+def read_all(connection):
+    data = bytearray()
+    while chunk := connection.recv(65536):
+        data.extend(chunk)
+    return bytes(data)
+
+
+def reply_after_eof(connection):
+    request = read_all(connection)
+    connection.sendall(b"reply:" + request)
+
+
+class UdpTarget:
+    """A loopback UDP service that echoes each datagram and records who sent it."""
+
+    def __init__(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65535)
+        self.socket.bind(("127.0.0.1", 0))
+        self.port = self.socket.getsockname()[1]
+        self.received = []
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self):
+        while True:
+            try:
+                data, sender = self.socket.recvfrom(65536)
+                self.received.append((data, sender))
+                self.socket.sendto(data, sender)
+            except OSError:
+                return
+
+
+def read_exactly(stream, size, seconds=15):
+    deadline = time.monotonic() + seconds
+    data = bytearray()
+    while len(data) < size and time.monotonic() < deadline:
+        if select.select([stream], [], [], 0.1)[0]:
+            chunk = os.read(stream.fileno(), size - len(data))
+            if not chunk:
+                break
+            data.extend(chunk)
+    assert len(data) == size, f"expected {size} bytes, received {bytes(data[:200])!r}"
+    return bytes(data)
+
+
+def read_line(stream, containing, seconds=15):
+    deadline = time.monotonic() + seconds
+    data = bytearray()
+    while time.monotonic() < deadline:
+        if select.select([stream], [], [], 0.1)[0]:
+            chunk = os.read(stream.fileno(), 1)
+            if not chunk:
+                break
+            data.extend(chunk)
+            if chunk == b"\n" and containing.encode() in data:
+                return data.decode()
+    raise AssertionError(f"no line containing {containing!r} in {bytes(data)!r}")
 
 
 def exercise(binary, root):
@@ -125,7 +224,7 @@ def exercise(binary, root):
 
     def run_peer(name):
         # Explicit shell avoids invoking the host user's login startup files.
-        return start(name, "run", "--allow-shell", "--shell", "/bin/sh", "--bind", "127.0.0.1:0",
+        return start(name, "run", "--shell", "/bin/sh", "--bind", "127.0.0.1:0",
                      "--log-file", str(root / f"{name}-connections.jsonl"))
 
     def connection_events(name):
@@ -148,6 +247,69 @@ def exercise(binary, root):
             for event in events
         )
 
+    def shell_refused(source, target, reason):
+        # The log shows why a shell was refused, not just that it was.
+        before = len(connection_events(source))
+        terminal(source, target, False)
+        eventually(
+            lambda: any(
+                event["event"] == "connection_failed" and event["direction"] == "outbound"
+                and event.get("reason") == reason and event.get("service") == "shell"
+                for event in connection_events(source)[before:]
+            ),
+            f"{source} to {target} refused for {reason}",
+        )
+
+    def grant(owner, peer, service="shell"):
+        cli(owner, "enable", service, peer)
+
+    def grants(state):
+        lines = cli(state, "list").stdout.splitlines()
+        assert lines[0] == "SERVICE\tPEER\tENDPOINT\tMODE\tTARGET", lines
+        return [line.split("\t") for line in lines[1:]]
+
+    def popen(state, *command):
+        process = subprocess.Popen(
+            args(state, *command), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=inherited, bufsize=0,
+        )
+        processes.append(process)
+        return process
+
+    def finished(process, code, message=None):
+        assert process.wait(timeout=15) == code, (process.returncode, process.stderr.read())
+        error = process.stderr.read().decode()
+        if message is None:
+            assert not error, error
+        else:
+            assert message in error, error
+
+    def forward(source, target, service, data=b""):
+        return subprocess.run(
+            args(source, "connect", target, service), input=data, capture_output=True,
+            timeout=40, env=inherited,
+        )
+
+    def forward_refused(source, target, service, message):
+        result = forward(source, target, service, b"unsent")
+        assert result.returncode == 1 and not result.stdout, result
+        assert message in result.stderr.decode(), result.stderr
+
+    def stream(source, target, service):
+        # An open session that has proven it can carry data both ways.
+        process = popen(source, "connect", target, service)
+        alive(process)
+        return process
+
+    def alive(process):
+        process.stdin.write(b"ping\0\xff")
+        assert read_exactly(process.stdout, 6) == b"ping\0\xff"
+
+    def expose(owner, *command):
+        process = popen(owner, "expose", *command)
+        read_line(process.stderr, "Press Ctrl-C to stop.")
+        return process
+
     def endpoint_id(state):
         log = (root / f"{state}.log").read_text()
         return log.rsplit("MassRelay running as ", 1)[1].splitlines()[0]
@@ -161,6 +323,408 @@ def exercise(binary, root):
             f"127.0.0.1:{free_port(socket.SOCK_DGRAM)}",
             f"127.0.0.1:{free_port(socket.SOCK_STREAM)}",
         )
+
+    def port_services(owner_process):
+        """b owns the services. a and c are paired with b."""
+        echo_one, echo_two = TcpTarget(echo), TcpTarget(echo)
+        replying = TcpTarget(reply_after_eof)
+        one, two = f"tcp:{echo_one.port}", f"tcp:{echo_two.port}"
+        reply = f"tcp:{replying.port}"
+
+        # Nothing is granted by pairing, and a refused request never reaches the target.
+        forward_refused("a", "b", reply, f"{reply} is not enabled for this device")
+        assert replying.accepted == 0
+
+        grant("b", "A", reply)
+        grant("b", endpoint_id("a"), reply)
+        assert [row for row in grants("b") if row[0] == reply] == [
+            [reply, "a", endpoint_id("a"), "persistent", f"loopback:{replying.port}"]
+        ]
+        # Binary data larger than any buffer survives, and EOF still allows a reply.
+        payload = bytes(range(256)) * 512 + os.urandom(3 * 1024 * 1024)
+        result = forward("a", "b", reply, payload)
+        assert result.returncode == 0 and not result.stderr, result.stderr
+        assert result.stdout == b"reply:" + payload
+        result = forward("a", "b", reply)
+        assert result.returncode == 0 and result.stdout == b"reply:", result
+
+        # The grant covers one peer and one service.
+        forward_refused("c", "b", reply, "is not enabled for this device")
+        forward_refused("a", "b", one, f"{one} is not enabled for this device")
+        assert replying.accepted == 2 and echo_one.accepted == 0
+        # A port grant does not confer a shell, and removing a shell grant leaves ports alone.
+        cli("b", "disable", "shell", "a")
+        shell_refused("a", "b", "service_not_enabled")
+        assert forward("a", "b", reply).returncode == 0
+
+        closed = free_port(socket.SOCK_STREAM)
+        grant("b", "a", f"tcp:{closed}")
+        forward_refused("a", "b", f"tcp:{closed}", f"could not connect to loopback port {closed}")
+        cli("b", "disable", f"tcp:{closed}", "a")
+
+        # The target may finish sending first, while still receiving.
+        received = []
+        done = threading.Event()
+
+        def greet(connection):
+            connection.sendall(b"greeting")
+            connection.shutdown(socket.SHUT_WR)
+            received.append(read_all(connection))
+            done.set()
+
+        greeting = TcpTarget(greet)
+        grant("b", "a", f"tcp:{greeting.port}")
+        process = popen("a", "connect", "b", f"tcp:{greeting.port}")
+        assert read_exactly(process.stdout, 8) == b"greeting"
+        # Standard output reaches end of file while the command still accepts input.
+        assert select.select([process.stdout], [], [], 15)[0]
+        assert os.read(process.stdout.fileno(), 1) == b"" and process.poll() is None
+        process.stdin.write(b"sent after the remote EOF")
+        process.stdin.close()
+        finished(process, 0)
+        assert done.wait(10) and received == [b"sent after the remote EOF"]
+
+        # Both directions move bulk data at the same time.
+        grant("b", "a", one)
+        bulk = os.urandom(8 * 1024 * 1024)
+        result = forward("a", "b", one, bulk)
+        assert result.returncode == 0 and result.stdout == bulk, (result.returncode, result.stderr)
+
+        # A reset from the target is a failure, reported after what it already sent.
+        def reset(connection):
+            connection.recv(1)
+            connection.sendall(b"partial")
+            time.sleep(0.5)
+            connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+
+        resetting = TcpTarget(reset)
+        grant("b", "a", f"tcp:{resetting.port}")
+        process = popen("a", "connect", "b", f"tcp:{resetting.port}")
+        process.stdin.write(b"x")
+        assert read_exactly(process.stdout, 7) == b"partial"
+        finished(process, 1, f"forwarding tcp:{resetting.port} failed on the destination")
+        resetting.close()
+
+        # Loopback may be IPv6 only.
+        try:
+            ipv6 = TcpTarget(reply_after_eof, "::1")
+        except OSError:
+            print("IPv6 loopback unavailable; skipped")
+        else:
+            grant("b", "a", f"tcp:{ipv6.port}")
+            result = forward("a", "b", f"tcp:{ipv6.port}", b"six")
+            assert result.stdout == b"reply:six", result
+
+        # Disabling closes matching sessions only, even with local input still open.
+        grant("b", "a", two)
+        grant("b", "c", one)
+        a_one, a_two, c_one = stream("a", "b", one), stream("a", "b", two), stream("c", "b", one)
+        cli("b", "disable", one, "a")
+        finished(a_one, 1, f"access to {one} was removed on the destination")
+        alive(a_two)
+        alive(c_one)
+        cli("b", "disable", one, "a")
+        forward_refused("a", "b", one, "is not enabled")
+        # A replacement grant does not carry over a session from the removed one.
+        grant("b", "a", one)
+        a_one = stream("a", "b", one)
+        cli("b", "disable", one, "a")
+        grant("b", "a", one)
+        finished(a_one, 1, "was removed on the destination")
+        alive(c_one)
+
+        # Declining on either side ends the pair's forwarded sessions and grants.
+        for decliner, other_side in [("b", "c"), ("c", "b")]:
+            process = stream("c", "b", one)
+            alive(a_two)
+            cli(decliner, "decline", other_side)
+            finished(process, 1, "pairing")
+            alive(a_two)
+            # The decline must reach the relay before either side can approve again.
+            eventually(
+                lambda: rows(other_side).get(decliner, ["", ""])[1] == "declined by peer",
+                "decline reached peer",
+            )
+            approve("b", "c")
+            approve("c", "b")
+            eventually(lambda: paired("b", "c"), "paired again")
+            assert all(row[1] != "c" for row in grants("b")), grants("b")
+            forward_refused("c", "b", one, "is not enabled")
+            grant("b", "c", one)
+        c_one = stream("c", "b", one)
+        for direction, node in [("inbound", "b"), ("outbound", "a")]:
+            reasons = {
+                (event["event"], event.get("reason"))
+                for event in connection_events(node)
+                if event["direction"] == direction and event.get("service") == one
+            }
+            assert {("connected", None), ("disconnected", "grant_removed")} <= reasons, reasons
+
+        # A lost local command ends its session without disturbing others.
+        a_one = stream("a", "b", one)
+        a_one.kill()
+        a_one.wait(timeout=5)
+        eventually(
+            lambda: any(
+                event["event"] == "disconnected" and event.get("service") == one
+                and event.get("reason") == "peer_disconnected"
+                for event in connection_events("b")
+            ),
+            "destination noticed the lost command",
+        )
+
+        # Exiting the CLI also closes a tunnel whose target has stopped reading.
+        release_target = threading.Event()
+
+        def stop_reading(connection):
+            connection.sendall(b"ready")
+            release_target.wait()
+
+        stalled = TcpTarget(stop_reading)
+        service = f"tcp:{stalled.port}"
+        grant("b", "a", service)
+        process = popen("a", "connect", "b", service)
+        try:
+            assert read_exactly(process.stdout, 5) == b"ready"
+            fd = process.stdin.fileno()
+            os.set_blocking(fd, False)
+            deadline = time.monotonic() + 10
+            while select.select([], [fd], [], 0.25)[1]:
+                assert time.monotonic() < deadline, "target did not stall the connection"
+                try:
+                    os.write(fd, bytes(65536))
+                except BlockingIOError:
+                    pass
+            process.kill()
+            process.wait(timeout=5)
+            eventually(
+                lambda: any(
+                    event["event"] == "disconnected" and event.get("service") == service
+                    and event.get("reason") == "peer_disconnected"
+                    for event in connection_events("b")
+                ),
+                "destination closed the stalled connection",
+            )
+        finally:
+            release_target.set()
+            stalled.close()
+
+        # Persistent grants survive a restart.
+        before = grants("b")
+        stop(owner_process)
+        finished(c_one, 1, "connection to the destination was lost")
+        finished(a_two, 1, "connection to the destination was lost")
+        owner_process = run_peer("b")
+        eventually(lambda: cli("b", "list", check=False).returncode == 0, "owner restarted")
+        assert grants("b") == before
+        eventually(
+            lambda: forward("a", "b", reply, b"again").stdout == b"reply:again",
+            "grant after restart",
+        )
+
+        # Profiles saved before grants existed keep their pairing and grant nothing.
+        stop(owner_process)
+        profile = root / "b" / "device.json"
+        saved = json.loads(profile.read_text())
+        del saved["grants"]
+        profile.write_text(json.dumps(saved))
+        owner_process = run_peer("b")
+        eventually(lambda: cli("b", "list", check=False).returncode == 0, "legacy profile up")
+        assert grants("b") == []
+        eventually(
+            lambda: "is not enabled" in forward("a", "b", reply).stderr.decode(),
+            "legacy profile denies",
+        )
+        assert paired("a", "b")
+
+        exposures(owner_process)
+        for state, event in [(s, e) for s in "abc" for e in connection_events(s)]:
+            assert "greeting" not in json.dumps(event), (state, event)
+        for target in [echo_one, echo_two, replying, greeting]:
+            target.close()
+        print("Per-peer services and one-off exposures passed")
+
+    def exposures(owner_process):
+        mapped, other = TcpTarget(echo), TcpTarget(echo)
+        service = f"tcp:{free_port(socket.SOCK_STREAM)}"
+        keep = f"tcp:{other.port}"
+        grant("b", "a", keep)
+        steady = stream("a", "b", keep)
+
+        # A temporary grant maps the service to the owner's chosen address.
+        lease = expose("b", "--tcp", service[4:], "--to", "a", f"localhost:{mapped.port}")
+        row = [service, "a", endpoint_id("a"), "temporary", f"localhost:{mapped.port}"]
+        assert row in grants("b"), grants("b")
+        assert service not in (root / "b" / "device.json").read_text()
+        live = stream("a", "b", service)
+        assert mapped.accepted == 1
+        forward_refused("c", "b", service, "is not enabled")
+        for command, message in [
+            (("enable", service, "a"), "currently exposed"),
+            (("expose", "--tcp", service[4:], "--to", "a"), "already exposed"),
+            (("expose", "--tcp", keep[4:], "--to", "a"), "already enabled"),
+        ]:
+            conflict = cli("b", *command, check=False)
+            assert conflict.returncode == 1 and message in conflict.stderr, conflict
+        assert row in grants("b")
+        alive(live)
+
+        # Ctrl-C removes the grant before the command exits, and closes only its sessions.
+        lease.send_signal(signal.SIGINT)
+        finished(lease, 0)
+        assert all(grant_row[0] != service for grant_row in grants("b"))
+        finished(live, 1, "was removed on the destination")
+        forward_refused("a", "b", service, "is not enabled")
+        alive(steady)
+
+        # So does losing the command without any chance to clean up, or SIGTERM.
+        for end in [signal.SIGKILL, signal.SIGTERM]:
+            lease = expose("b", "--tcp", service[4:], "--to", "a", f"127.0.0.1:{mapped.port}")
+            live = stream("a", "b", service)
+            lease.send_signal(end)
+            lease.wait(timeout=10)
+            finished(live, 1, "was removed on the destination")
+            assert all(grant_row[0] != service for grant_row in grants("b"))
+
+        # Explicit disable stops the lease.
+        lease = expose("b", "--tcp", service[4:], "--to", endpoint_id("a"), f"127.0.0.1:{mapped.port}")
+        live = stream("a", "b", service)
+        cli("b", "disable", service, "a")
+        finished(lease, 1, "ended because it was disabled")
+        finished(live, 1, "was removed on the destination")
+        alive(steady)
+
+        # With no address, an exposure forwards to loopback on the same port.
+        lease = expose("b", "--tcp", str(mapped.port), "--to", "a")
+        result = stream("a", "b", f"tcp:{mapped.port}")
+        result.stdin.close()
+        finished(result, 0)
+        lease.send_signal(signal.SIGINT)
+        finished(lease, 0)
+
+        # A peer learns that an exposed address failed, but not what the address is.
+        closed = free_port(socket.SOCK_STREAM)
+        lease = expose("b", "--tcp", service[4:], "--to", "a", f"127.0.0.1:{closed}")
+        result = forward("a", "b", service)
+        error = result.stderr.decode()
+        assert result.returncode == 1 and f"the {service} target" in error, error
+        assert str(closed) not in error.replace(service, ""), error
+        lease.send_signal(signal.SIGINT)
+        finished(lease, 0)
+
+        udp_services()
+
+        # Ending the pairing ends an exposure, and a new pairing does not restore it.
+        lease = expose("b", "--tcp", service[4:], "--to", "a", f"127.0.0.1:{mapped.port}")
+        live = stream("a", "b", service)
+        cli("a", "decline", "b")
+        finished(lease, 1, "the pairing changed")
+        finished(live, 1, "pairing")
+        eventually(
+            lambda: rows("b").get("a", ["", ""])[1] == "declined by peer", "decline reached owner"
+        )
+        approve("a", "b")
+        approve("b", "a")
+        eventually(lambda: paired("a", "b"), "paired after exposure")
+        forward_refused("a", "b", service, "is not enabled")
+        grant("b", "a", keep)
+        steady = stream("a", "b", keep)
+
+        # Stopping the daemon ends its exposures.
+        lease = expose("b", "--tcp", service[4:], "--to", "a", f"127.0.0.1:{mapped.port}")
+        stop(owner_process)
+        finished(lease, 1, "daemon stopped")
+        finished(steady, 1, "connection to the destination was lost")
+        run_peer("b")
+        eventually(lambda: cli("b", "list", check=False).returncode == 0, "owner back")
+        assert all(grant_row[3] == "persistent" for grant_row in grants("b"))
+        for target in [mapped, other]:
+            target.close()
+
+    def udp_services():
+        target = UdpTarget()
+        port = free_port(socket.SOCK_DGRAM)
+        service = f"udp:{port}"
+        denied = cli("a", "connect", "b", service, check=False)
+        assert denied.returncode == 1, denied
+        assert f"massrelay expose --udp {port} --to a" in denied.stderr, denied.stderr
+
+        lease = expose("b", "--udp", str(port), "--to", "a", f"127.0.0.1:{target.port}")
+
+        def consumer(*extra):
+            process = popen("a", "connect", "b", service, *extra)
+            line = read_line(process.stderr, "send datagrams to")
+            host, local = line.strip().rsplit(" ", 1)[1].rsplit(":", 1)
+            assert host == "127.0.0.1", line
+            return process, int(local)
+
+        # The default local port is the service's port.
+        process, local = consumer()
+        assert local == port
+        process.send_signal(signal.SIGINT)
+        process.wait(timeout=5)
+
+        process, local = consumer("--listen", "0")
+        senders = [socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for _ in range(2)]
+        for sender in senders:
+            sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65535)
+            sender.settimeout(10)
+        sizes = [0, 1, 1400, 9217, 65507, 0, 3]
+        for size in sizes:
+            for sender in senders:
+                datagram = os.urandom(size)
+                sender.sendto(datagram, ("127.0.0.1", local))
+                reply, origin = sender.recvfrom(65536)
+                assert reply == datagram and origin == ("127.0.0.1", local), (size, len(reply))
+        # Queued datagrams keep their boundaries and their senders.
+        markers_start = len(target.received)
+        for number in range(10):
+            for index, sender in enumerate(senders):
+                sender.sendto(f"{index}-{number}".encode(), ("127.0.0.1", local))
+        for index, sender in enumerate(senders):
+            replies = [sender.recv(100).decode() for _ in range(10)]
+            assert replies == [f"{index}-{number}" for number in range(10)], replies
+        origins = {}
+        for data, origin in target.received[markers_start:]:
+            if data[:2] in (b"0-", b"1-"):
+                origins.setdefault(data[:1], set()).add(origin)
+        assert len(origins[b"0"]) == len(origins[b"1"]) == 1 and origins[b"0"] != origins[b"1"]
+
+        cli("b", "disable", service, "a")
+        finished(process, 1, f"access to {service} was removed on the destination")
+        finished(lease, 1, "ended because it was disabled")
+
+        # A persistent UDP grant forwards to loopback on its own port.
+        persistent = f"udp:{target.port}"
+        grant("b", "a", persistent)
+        process = popen("a", "connect", "b", persistent, "--listen", "0")
+        local = int(read_line(process.stderr, "send datagrams to").strip().rsplit(":", 1)[1])
+        senders[0].sendto(b"persistent", ("127.0.0.1", local))
+        assert senders[0].recv(100) == b"persistent"
+        cli("b", "disable", persistent, "a")
+        finished(process, 1, "was removed on the destination")
+
+        # A target that is not listening yet does not end the session.
+        late = free_port(socket.SOCK_DGRAM)
+        grant("b", "a", f"udp:{late}")
+        process = popen("a", "connect", "b", f"udp:{late}", "--listen", "0")
+        local = int(read_line(process.stderr, "send datagrams to").strip().rsplit(":", 1)[1])
+        senders[0].sendto(b"lost", ("127.0.0.1", local))
+        time.sleep(1)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as listener:
+            listener.bind(("127.0.0.1", late))
+            listener.settimeout(10)
+            senders[0].sendto(b"heard", ("127.0.0.1", local))
+            data, origin = listener.recvfrom(100)
+            assert data == b"heard", data
+            listener.sendto(b"answer", origin)
+            assert senders[0].recv(100) == b"answer"
+        assert process.poll() is None
+        process.send_signal(signal.SIGINT)
+        process.wait(timeout=5)
+        for sender in senders:
+            sender.close()
+        target.socket.close()
 
     def operator_ticket_relay():
         udp, tcp = addresses()
@@ -217,7 +781,12 @@ def exercise(binary, root):
         cli("c", "decline", "a")
         eventually(lambda: paired("a", "b") and paired("b", "c"), "two approved pairs")
 
-        for source, target in [("a", "b"), ("b", "a"), ("b", "c"), ("c", "b")]:
+        pairs = [("a", "b"), ("b", "a"), ("b", "c"), ("c", "b")]
+        for source, target in pairs:
+            shell_refused(source, target, "service_not_enabled")
+        for source, target in pairs:
+            grant(target, source)
+        for source, target in pairs:
             terminal(source, target, True)
         eventually(lambda: recorded_session("a", "b", "outbound"), "outbound connection log")
         eventually(lambda: recorded_session("b", "a", "inbound", 7), "inbound connection log")
@@ -226,10 +795,18 @@ def exercise(binary, root):
 
         stop(relay)
         stop(b)
-        run_peer("b")
+        peer_b = [run_peer("b")]
         eventually(lambda: bool(rows("b")), "device b restarted without relay")
         terminal("a", "b", True)
+        # Grants are local decisions, so they change while the relay is away.
+        cli("b", "disable", "shell", "a")
+        shell_refused("a", "b", "service_not_enabled")
+        grant("b", "a")
+        terminal("a", "b", True)
         cli("a", "decline", "b")
+        assert all(row[1] != "b" for row in grants("a")), grants("a")
+        pending = cli("a", "enable", "shell", "b", check=False)
+        assert pending.returncode == 1 and "has not reached the relay" in pending.stderr, pending
         terminal("b", "a", False)
         relay = start("relay", "relay", "--udp-bind", udp, "--relay-bind", tcp)
         eventually(lambda: relay.poll() is None and rows("a").get("b", [""])[0] == "recent", "relay restarted")
@@ -237,9 +814,27 @@ def exercise(binary, root):
         terminal("a", "b", False)
         approve("b", "a")
         eventually(lambda: paired("a", "b"), "fresh mutual approval after offline decline")
+        # The earlier grants ended with the earlier pairing, on both devices.
+        shell_refused("a", "b", "service_not_enabled")
+        shell_refused("b", "a", "service_not_enabled")
+        grant("b", "a")
         terminal("a", "b", True)
+        terminal("a", "b", True, during=lambda: cli("b", "disable", "shell", "a"))
+        shell_refused("a", "b", "service_not_enabled")
+        grant("b", "a")
+
+        port_services(peer_b[0])
+        eventually(lambda: paired("a", "b") and paired("b", "c"), "pairs after restarts")
+        grant("b", "c")
+        # Revocation ends forwarded ports as well as shells.
+        target = TcpTarget(echo)
+        grant("b", "c", f"tcp:{target.port}")
+        forwarded = stream("c", "b", f"tcp:{target.port}")
         terminal("c", "b", True, during=lambda: cli("b", "revoke", "c"))
+        finished(forwarded, 1, "pairing")
+        target.close()
         eventually(lambda: "c" not in rows("a"), "revocation reached peer")
+        assert all(row[1] != "c" for row in grants("b")), grants("b")
         terminal("b", "c", False)
         terminal("c", "b", False)
 
@@ -332,6 +927,7 @@ def exercise(binary, root):
             and rows("s2").get("First-Host", ["", ""])[1] == "paired",
             "shared pair",
         )
+        grant("s2", "First-Host")
         terminal("s1", "Second", True)
 
         # Restart keeps identity and membership, and never takes new advertised addresses.

@@ -1,18 +1,23 @@
 use std::{
     collections::BTreeMap,
     fs::File,
-    net::SocketAddr,
+    future::{Future, poll_fn},
+    net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
+    task::{Poll, ready},
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, endpoint::Connection};
+use iroh::{
+    Endpoint, EndpointAddr, EndpointId, SecretKey,
+    endpoint::{Connection, ConnectionError, RecvStream, SendStream},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::{self, AsyncWriteExt},
+    io::{self, AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::{Mutex, watch},
     task::JoinSet,
@@ -21,11 +26,12 @@ use tokio::{
 
 use crate::{
     bind_endpoint,
-    connection_log::{ConnectionLog, Direction},
-    local, storage, terminal,
+    connection_log::{ConnectionLog, Direction, Session},
+    grants::{Access, Grants},
+    local, storage, tcp, terminal, tunnel, udp,
     wire::{
-        self, Decision, LocalReply, LocalRequest, Peer, Reply, Request, Roster, ServerAddr,
-        ShellRequest, Ticket,
+        self, Decision, LocalReply, LocalRequest, Member, Peer, Refusal, Reply, Request, Roster,
+        ServerAddr, Service, ServiceReply, ServiceRequest, Ticket,
     },
 };
 
@@ -109,10 +115,78 @@ struct Device {
     #[serde(default)]
     pending_declines: BTreeMap<EndpointId, u64>,
     #[serde(default)]
+    grants: Grants,
+    #[serde(default)]
     udp_port: Option<u16>,
     #[serde(skip)]
     dirty: bool,
     revoked: bool,
+}
+
+impl Device {
+    /// Whether both devices currently approve this pairing generation.
+    fn paired(&self, id: EndpointId, network: &str, generation: u64) -> bool {
+        !self.revoked
+            && self.roster.network == network
+            && self.approvals.get(&id) == Some(&generation)
+            && self.roster.peers.iter().any(|peer| {
+                peer.member.id == id
+                    && peer.pair.generation == generation
+                    && peer.pair.ours == Some(Decision::Approve)
+                    && peer.pair.theirs == Some(Decision::Approve)
+            })
+    }
+
+    /// Both mutual pairing and a grant for this peer and service are required.
+    fn access(&self, id: EndpointId, request: &ServiceRequest) -> Result<Access, Refusal> {
+        if !self.paired(id, &request.network, request.generation) {
+            return Err(Refusal::PairingRequired);
+        }
+        self.grants
+            .access(id, request.service, request.generation)
+            .ok_or(Refusal::ServiceNotEnabled)
+    }
+
+    fn check_grant(
+        &self,
+        id: EndpointId,
+        request: &ServiceRequest,
+        instance: u64,
+    ) -> Result<(), Refusal> {
+        if self.access(id, request)?.instance == instance {
+            Ok(())
+        } else {
+            Err(Refusal::ServiceNotEnabled)
+        }
+    }
+
+    /// The pairing generation that a new grant for a known peer belongs to.
+    fn grant_generation(&self, peer: &Member) -> Result<u64> {
+        ensure!(!self.revoked, "this device has been revoked");
+        ensure!(
+            !self.pending_declines.contains_key(&peer.id),
+            "the decline of {} has not reached the relay yet; try again after it does",
+            peer.name
+        );
+        self.roster
+            .peers
+            .iter()
+            .find(|known| known.member.id == peer.id)
+            .map(|known| known.pair.generation)
+            .with_context(|| format!("unknown peer {}", peer.name))
+    }
+
+    /// Forget grants made under a pairing that has since ended.
+    fn prune_grants(&mut self) {
+        let (revoked, declines, peers) = (self.revoked, &self.pending_declines, &self.roster.peers);
+        self.grants.retain(|id, generation| {
+            !revoked
+                && !declines.contains_key(&id)
+                && peers
+                    .iter()
+                    .any(|peer| peer.member.id == id && peer.pair.generation == generation)
+        });
+    }
 }
 
 struct Node {
@@ -120,7 +194,6 @@ struct Node {
     operations: Mutex<()>,
     endpoint: Endpoint,
     dir: PathBuf,
-    allow_shell: bool,
     shell: Option<PathBuf>,
     connection_log: ConnectionLog,
     changed: watch::Sender<()>,
@@ -250,7 +323,7 @@ async fn register(identity: &Identity, request: Request) -> Result<Reply> {
         SecretKey::from_bytes(&identity.key),
         bind.parse()?,
         None,
-        wire::SHELL,
+        wire::SERVICE,
         false,
     )
     .await?;
@@ -265,6 +338,7 @@ fn commit(dir: &Path, identity: Identity, roster: Roster) -> Result<()> {
         roster,
         approvals: BTreeMap::new(),
         pending_declines: BTreeMap::new(),
+        grants: Grants::default(),
         udp_port: None,
         dirty: false,
         revoked: false,
@@ -276,7 +350,6 @@ fn commit(dir: &Path, identity: Identity, roster: Roster) -> Result<()> {
 
 pub async fn run(
     dir: PathBuf,
-    allow_shell: bool,
     shell: Option<PathBuf>,
     bind: SocketAddr,
     log_file: Option<PathBuf>,
@@ -291,7 +364,7 @@ pub async fn run(
             SecretKey::from_bytes(&device.identity.key),
             addr,
             Some(device.identity.server.relay.clone()),
-            wire::SHELL,
+            wire::SERVICE,
             true,
         )
     };
@@ -317,7 +390,6 @@ pub async fn run(
         operations: Mutex::new(()),
         endpoint,
         dir,
-        allow_shell,
         shell,
         connection_log,
         changed: watch::channel(()).0,
@@ -348,7 +420,7 @@ pub async fn run(
                 let node = node.clone();
                 tasks.spawn(async move {
                     let Ok(Ok(connection)) = timeout(wire::RPC_TIMEOUT, incoming).await else { return };
-                    let _ = node.serve_shell(connection).await;
+                    node.serve_peer(connection).await;
                 });
             }
             connection = listener.accept() => {
@@ -496,6 +568,7 @@ impl Node {
             }
             _ => bail!("unexpected membership reply"),
         }
+        next.prune_grants();
         let changed = !same_membership(&state, &next)?;
         let saved = if changed || state.dirty {
             self.save_restrictions(&mut next)
@@ -520,16 +593,18 @@ impl Node {
         let state = self.state.lock().await;
         ensure!(!state.revoked, "this device has been revoked");
         let id: Option<EndpointId> = name.parse().ok();
-        state
-            .roster
-            .peers
-            .iter()
-            .find(|peer| match id {
-                Some(id) => peer.member.id == id,
-                None => peer.member.name.eq_ignore_ascii_case(name),
-            })
-            .cloned()
-            .with_context(|| format!("unknown peer {name}"))
+        let mut matches = state.roster.peers.iter().filter(|peer| match id {
+            Some(id) => peer.member.id == id,
+            None => peer.member.name.eq_ignore_ascii_case(name),
+        });
+        let peer = matches
+            .next()
+            .with_context(|| format!("unknown peer {name}"))?;
+        ensure!(
+            matches.next().is_none(),
+            "several peers are named {name}; use an endpoint ID"
+        );
+        Ok(peer.clone())
     }
 
     async fn manage(&self, request: LocalRequest) -> Result<LocalReply> {
@@ -548,6 +623,45 @@ impl Node {
             }
             return Ok(LocalReply::Peers(peers));
         }
+        if matches!(request, LocalRequest::Grants) {
+            let state = self.state.lock().await;
+            ensure!(!state.revoked, "this device has been revoked");
+            return Ok(LocalReply::Grants(state.grants.list(|id| {
+                state
+                    .roster
+                    .peers
+                    .iter()
+                    .find(|peer| peer.member.id == id)
+                    .map(|peer| peer.member.name.clone())
+            })));
+        }
+        // Grants are local decisions, which work and take effect without the relay.
+        if let LocalRequest::Enable { service, peer } = &request {
+            let member = self.lookup(peer).await?.member;
+            let mut state = self.state.lock().await;
+            let generation = state.grant_generation(&member)?;
+            let mut next = state.clone();
+            let added = next
+                .grants
+                .enable(member.id, &member.name, *service, generation)?;
+            if added || next.dirty {
+                // Access opens only after the grant is saved.
+                self.save_restrictions(&mut next)?;
+                *state = next;
+            }
+            return Ok(LocalReply::Done);
+        }
+        if let LocalRequest::Disable { service, peer } = &request {
+            let id = self.lookup(peer).await?.member.id;
+            let mut state = self.state.lock().await;
+            // Access closes now, even if saving fails.
+            let removed = state.grants.disable(id, *service);
+            self.changed.send_replace(());
+            if removed || state.dirty {
+                self.save_restrictions(&mut state)?;
+            }
+            return Ok(LocalReply::Done);
+        }
         if let LocalRequest::Pair {
             peer,
             decision: Decision::Decline,
@@ -561,6 +675,7 @@ impl Node {
                 .pending_declines
                 .entry(id)
                 .or_insert(peer.pair.generation);
+            state.prune_grants();
             self.changed.send_replace(());
             self.save_restrictions(&mut state)?;
             return Ok(LocalReply::Done);
@@ -605,28 +720,80 @@ impl Node {
                 self.apply_reply(reply, None).await?;
                 Ok(LocalReply::Done)
             }
-            LocalRequest::Peers | LocalRequest::Shell { .. } => unreachable!(),
+            LocalRequest::Peers
+            | LocalRequest::Grants
+            | LocalRequest::Enable { .. }
+            | LocalRequest::Disable { .. }
+            | LocalRequest::Shell { .. }
+            | LocalRequest::Connect { .. }
+            | LocalRequest::Expose { .. } => unreachable!(),
         }
     }
 
-    async fn authorized(&self, id: EndpointId, network: &str, generation: u64) -> bool {
-        let state = self.state.lock().await;
-        !state.revoked
-            && state.roster.network == network
-            && state.approvals.get(&id) == Some(&generation)
-            && state.roster.peers.iter().any(|peer| {
-                peer.member.id == id
-                    && peer.pair.generation == generation
-                    && peer.pair.ours == Some(Decision::Approve)
-                    && peer.pair.theirs == Some(Decision::Approve)
-            })
+    async fn paired(&self, id: EndpointId, network: &str, generation: u64) -> bool {
+        self.state.lock().await.paired(id, network, generation)
     }
 
-    async fn until_unpaired(&self, id: EndpointId, request: &ShellRequest) {
+    async fn until_unpaired(&self, id: EndpointId, request: &ServiceRequest) {
+        let mut changed = self.changed.subscribe();
+        while self.paired(id, &request.network, request.generation).await {
+            if changed.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+
+    /// Serialize authorized side effects with grant changes without holding the lock across a wait.
+    async fn start_if_allowed<T>(
+        &self,
+        id: EndpointId,
+        request: &ServiceRequest,
+        instance: u64,
+        start: impl Future<Output = T>,
+    ) -> Result<T, Refusal> {
+        let lock = self.state.lock();
+        tokio::pin!(lock, start);
+        poll_fn(|cx| {
+            let state = ready!(lock.as_mut().poll(cx));
+            let result = match state.check_grant(id, request, instance) {
+                Ok(()) => start.as_mut().poll(cx).map(Ok),
+                Err(refusal) => Poll::Ready(Err(refusal)),
+            };
+            drop(state);
+            if result.is_pending() {
+                lock.set(self.state.lock());
+            }
+            result
+        })
+        .await
+    }
+
+    async fn until_denied(
+        &self,
+        id: EndpointId,
+        request: &ServiceRequest,
+        instance: u64,
+    ) -> Refusal {
+        // Subscribing before the first check means no change can be missed.
+        let mut changed = self.changed.subscribe();
+        loop {
+            if let Err(refusal) = self.state.lock().await.check_grant(id, request, instance) {
+                return refusal;
+            }
+            if changed.changed().await.is_err() {
+                return Refusal::PairingRequired;
+            }
+        }
+    }
+
+    async fn until_withdrawn(&self, id: EndpointId, service: Service, instance: u64) {
         let mut changed = self.changed.subscribe();
         while self
-            .authorized(id, &request.network, request.generation)
+            .state
+            .lock()
             .await
+            .grants
+            .is_exposed(id, service, instance)
         {
             if changed.changed().await.is_err() {
                 break;
@@ -638,26 +805,127 @@ impl Node {
         let request =
             timeout(wire::RPC_TIMEOUT, local::authenticate(&mut socket, runtime)).await??;
         socket.set_nodelay(true)?;
-        if let LocalRequest::Shell { peer, cols, rows } = request {
-            return self.open_shell(socket, peer, cols, rows).await;
-        }
-        let response = self
-            .manage(request)
-            .await
-            .unwrap_or_else(|error| LocalReply::Error(format!("{error:#}")));
+        let response = match request {
+            LocalRequest::Shell { peer, cols, rows } => {
+                let size = Some((cols, rows));
+                return self
+                    .open_service(socket, peer, Service::Shell, size, None)
+                    .await;
+            }
+            LocalRequest::Connect {
+                peer,
+                service,
+                lifetime_port,
+                lifetime_key,
+            } if service != Service::Shell => {
+                let mut lifetime = TcpStream::connect((Ipv4Addr::LOCALHOST, lifetime_port)).await?;
+                lifetime.write_all(&lifetime_key).await?;
+                return self
+                    .open_service(socket, peer, service, None, Some(lifetime))
+                    .await;
+            }
+            LocalRequest::Connect { .. } => Err(anyhow::anyhow!("connect forwards a port")),
+            LocalRequest::Expose {
+                service,
+                peer,
+                target,
+            } => return self.expose(socket, service, peer, target).await,
+            request => self.manage(request).await,
+        };
+        let response = response.unwrap_or_else(|error| LocalReply::Error(format!("{error:#}")));
         wire::send(&mut socket, response).await
     }
 
-    async fn open_shell(
+    async fn add_exposure(
+        &self,
+        service: Service,
+        peer: &str,
+        target: Option<String>,
+    ) -> Result<(Member, u64)> {
+        ensure!(service != Service::Shell, "only a port can be exposed");
+        if let Some(target) = &target {
+            wire::check_target(target)?;
+        }
+        let member = self.lookup(peer).await?.member;
+        let mut state = self.state.lock().await;
+        let generation = state.grant_generation(&member)?;
+        let instance = state
+            .grants
+            .expose(member.id, &member.name, service, generation, target)?;
+        Ok((member, instance))
+    }
+
+    /// Hold a temporary grant for as long as the local command stays connected.
+    async fn expose(
+        &self,
+        mut socket: TcpStream,
+        service: Service,
+        peer: String,
+        target: Option<String>,
+    ) -> Result<()> {
+        let (member, instance) = match self.add_exposure(service, &peer, target).await {
+            Ok(added) => added,
+            Err(error) => {
+                return wire::send(&mut socket, LocalReply::Error(format!("{error:#}"))).await;
+            }
+        };
+        let (mut rx, mut tx) = socket.split();
+        let stopped = async {
+            let reply = LocalReply::Exposed {
+                peer: member.name.clone(),
+                id: member.id,
+            };
+            wire::send(&mut tx, reply).await?;
+            let mut stop = [0];
+            Ok::<_, anyhow::Error>(tokio::select! {
+                biased;
+                _ = self.until_withdrawn(member.id, service, instance) => false,
+                // The command closes its side to stop. A lost command ends the read too.
+                _ = rx.read(&mut stop) => true,
+            })
+        }
+        .await;
+        // Every way out of the wait removes this grant and closes its sessions.
+        self.state
+            .lock()
+            .await
+            .grants
+            .withdraw(member.id, service, instance);
+        self.changed.send_replace(());
+        let reply = if stopped? {
+            LocalReply::Done
+        } else {
+            LocalReply::Error(format!(
+                "the {service} exposure to {} ended because it was disabled or the pairing changed",
+                member.name
+            ))
+        };
+        wire::send(&mut tx, reply).await
+    }
+
+    /// Open a service on a peer and connect it to the local command.
+    async fn open_service(
         &self,
         mut socket: TcpStream,
         name: String,
-        cols: u16,
-        rows: u16,
+        service: Service,
+        terminal: Option<(u16, u16)>,
+        mut lifetime: Option<TcpStream>,
     ) -> Result<()> {
         let mut session =
             self.connection_log
                 .session(Direction::Outbound, None, Some(name.clone()));
+        session.set_service(service);
+        let mut failure = "setup_failed";
+        let local_closed = async {
+            match lifetime.as_mut() {
+                Some(socket) => {
+                    let _ = socket.read_u8().await;
+                }
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(local_closed);
         let setup = timeout(wire::RPC_TIMEOUT * 2, async {
             let peer = self.lookup(&name).await?;
             let (network, relay) = {
@@ -670,74 +938,149 @@ impl Node {
             let generation = peer.pair.generation;
             let id = peer.member.id;
             session.set_peer(id, peer.member.name);
-            ensure!(
-                self.authorized(id, &network, generation).await,
-                "both devices must approve this pairing"
-            );
+            if !self.paired(id, &network, generation).await {
+                failure = Refusal::PairingRequired.reason();
+                bail!(wire::PAIRING_REQUIRED);
+            }
             let addr = peer.member.addr.unwrap_or_else(|| EndpointAddr::new(id));
             ensure!(addr.id == id, "membership address identity mismatch");
             let connection = self
                 .endpoint
-                .connect(addr.with_relay_url(relay), wire::SHELL)
-                .await?;
-            let (mut tx, mut rx) = connection.open_bi().await?;
-            let request = ShellRequest {
+                .connect(addr.with_relay_url(relay), wire::SERVICE)
+                .await
+                .map_err(|error| {
+                    // The error already describes its causes.
+                    anyhow::anyhow!(
+                        "could not reach the peer; \
+                         check that it is running an up-to-date MassRelay: {error}"
+                    )
+                })?;
+            let request = ServiceRequest {
                 network,
                 generation,
-                cols,
-                rows,
+                service,
+                terminal,
             };
-            wire::send(&mut tx, &request).await?;
-            let response: LocalReply = wire::recv(&mut rx).await?;
-            match response {
-                LocalReply::Shell => Ok((connection, tx, rx, request)),
-                LocalReply::Error(error) => bail!("{error}"),
-                _ => bail!("unexpected shell reply"),
+            let opened = async {
+                let (mut tx, mut rx) = connection.open_bi().await?;
+                wire::send(&mut tx, &request).await?;
+                let reply: ServiceReply = wire::recv(&mut rx).await?;
+                Ok::<_, anyhow::Error>((tx, rx, reply))
             }
-        })
-        .await
-        .context("shell connection timed out")
-        .and_then(|result| result);
+            .await;
+            match opened {
+                Ok((tx, rx, ServiceReply::Ready)) => Ok((connection, tx, rx, request)),
+                Ok((_, _, ServiceReply::Refused { refusal, message })) => {
+                    failure = refusal.reason();
+                    bail!("{message}")
+                }
+                Err(error) => match closed_by_peer(&connection, service) {
+                    Some((reason, message)) => {
+                        failure = reason;
+                        bail!("{message}")
+                    }
+                    None => Err(error),
+                },
+            }
+        });
+        let setup = tokio::select! {
+            biased;
+            _ = &mut local_closed => {
+                session.end("local_client_closed", None);
+                return Ok(());
+            }
+            result = setup => result.context("service connection timed out").and_then(|result| result),
+        };
 
         let (connection, mut tx, mut rx, request) = match setup {
             Ok(result) => result,
             Err(error) => {
-                session.end("shell_setup_failed", None);
+                session.end(failure, None);
                 return wire::send(&mut socket, LocalReply::Error(format!("{error:#}"))).await;
             }
         };
         let id = connection.remote_id();
         session.connected();
-        if let Err(error) = wire::send(&mut socket, LocalReply::Shell).await {
+        let ready = match service {
+            Service::Shell => LocalReply::Shell,
+            _ => LocalReply::Connected,
+        };
+        if let Err(error) = wire::send(&mut socket, ready).await {
             session.end("local_client_closed", None);
             return Err(error);
         }
         let (mut local_rx, mut local_tx) = socket.into_split();
-        tokio::select! {
-            _ = self.until_unpaired(id, &request) => {
-                connection.close(0u32.into(), b"pairing ended");
-                session.end("pairing_ended", None);
+        if service == Service::Shell {
+            tokio::select! {
+                _ = self.until_unpaired(id, &request) => {
+                    connection.close(0u32.into(), wire::CLOSE_PAIRING_ENDED);
+                    session.end("pairing_ended", None);
+                }
+                result = async {
+                    tokio::try_join!(
+                        async {
+                            io::copy(&mut local_rx, &mut tx).await?;
+                            tx.shutdown().await
+                        },
+                        async {
+                            io::copy(&mut rx, &mut local_tx).await?;
+                            local_tx.shutdown().await
+                        },
+                    )
+                } => {
+                    let reason = match (&result, closed_by_peer(&connection, service)) {
+                        (Ok(_), _) => "stream_closed",
+                        (Err(_), Some((reason, _))) => reason,
+                        (Err(_), None) => "shell_io_error",
+                    };
+                    session.end(reason, None);
+                    result?;
+                }
             }
-            result = async {
-                tokio::try_join!(
-                    async {
-                        io::copy(&mut local_rx, &mut tx).await?;
-                        tx.shutdown().await
-                    },
-                    async {
-                        io::copy(&mut rx, &mut local_tx).await?;
-                        local_tx.shutdown().await
-                    },
-                )
-            } => {
-                session.end(if result.is_ok() { "stream_closed" } else { "shell_io_error" }, None);
-                result?;
-            }
+            return Ok(());
         }
+
+        let mut writing = false;
+        // A message is what to tell the local command when the destination cannot.
+        // Polling order varies, so that a busy download cannot hold back the upload.
+        let (reason, message) = tokio::select! {
+            _ = self.until_unpaired(id, &request) => {
+                connection.close(0u32.into(), wire::CLOSE_PAIRING_ENDED);
+                ("pairing_ended", Some("this pairing ended".to_owned()))
+            }
+            delivered = tunnel::deliver(&mut rx, &mut local_tx, &mut writing) => match delivered {
+                Ok(true) => ("stream_closed", None),
+                Ok(false) => ("service_failed", None),
+                Err(tunnel::Cut::Local) => ("local_client_closed", None),
+                Err(tunnel::Cut::Peer) => match closed_by_peer(&connection, service) {
+                    Some((reason, message)) => (reason, Some(message)),
+                    None => (
+                        "peer_disconnected",
+                        Some("the connection to the destination was lost".to_owned()),
+                    ),
+                },
+            },
+            _ = &mut local_closed => ("local_client_closed", None),
+            _ = tunnel::pump(&mut local_rx, &mut tx) => ("local_client_closed", None),
+        };
+        connection.close(0u32.into(), b"done");
+        session.end(reason, None);
+        if reason == "local_client_closed" {
+            return Ok(());
+        }
+        if let Some(message) = message {
+            // After part of a frame, only closing the socket can report the failure.
+            if writing {
+                return Ok(());
+            }
+            tunnel::fail(&mut local_tx, &message).await?;
+        }
+        // Closing with unread input could discard the final frame before the command reads it.
+        io::copy(&mut local_rx, &mut io::sink()).await?;
         Ok(())
     }
 
-    async fn serve_shell(&self, connection: Connection) -> Result<()> {
+    async fn serve_peer(&self, connection: Connection) {
         let id = connection.remote_id();
         let (profile_approved, name) = {
             let state = self.state.lock().await;
@@ -751,59 +1094,220 @@ impl Node {
         };
         let mut session = self
             .connection_log
-            .session(Direction::Inbound, Some(id), name);
+            .session(Direction::Inbound, Some(id), name.clone());
         if !profile_approved {
             session.end("pairing_required", None);
-            connection.close(0u32.into(), b"pairing required");
-            return Ok(());
+            connection.close(0u32.into(), wire::CLOSE_PAIRING_REQUIRED);
+            return;
         }
         let setup = async {
             let (tx, mut rx) = timeout(wire::RPC_TIMEOUT, connection.accept_bi()).await??;
-            let request: ShellRequest = timeout(wire::RPC_TIMEOUT, wire::recv(&mut rx)).await??;
+            let request: ServiceRequest = timeout(wire::RPC_TIMEOUT, wire::recv(&mut rx)).await??;
             Ok::<_, anyhow::Error>((tx, rx, request))
         };
-        let (mut tx, mut rx, request) = match setup.await {
-            Ok(value) => value,
-            Err(error) => {
-                session.end("shell_request_failed", None);
-                return Err(error);
+        let Ok((mut tx, mut rx, request)) = setup.await else {
+            session.end("service_request_failed", None);
+            return;
+        };
+        session.set_service(request.service);
+        let access = self.state.lock().await.access(id, &request);
+        let access = match access {
+            Ok(access) => access,
+            Err(refusal) => {
+                session.end(refusal.reason(), None);
+                let message = match refusal {
+                    Refusal::ServiceNotEnabled => {
+                        not_enabled(request.service, &name.unwrap_or_default())
+                    }
+                    _ => wire::PAIRING_REQUIRED.into(),
+                };
+                refuse(&connection, &mut tx, refusal, message).await;
+                return;
             }
         };
-        if !self.allow_shell
-            || !self
-                .authorized(id, &request.network, request.generation)
-                .await
+        let (reason, exit_code) = tokio::select! {
+            // Check authorization first, so nothing more is forwarded once it has been removed.
+            biased;
+            refusal = self.until_denied(id, &request, access.instance) => {
+                (close_denied(&connection, refusal), None)
+            }
+            outcome = async {
+                if request.service == Service::Shell {
+                    let (cols, rows) = request.terminal.unwrap_or((80, 24));
+                    let opened = self.start_if_allowed(id, &request, access.instance, async {
+                        terminal::start(cols, rows, self.shell.as_deref())
+                    }).await;
+                    return match opened {
+                        Ok(Ok(terminal)) => self.serve_shell(terminal, &mut rx, &mut tx, &mut session).await,
+                        Ok(Err(_)) => ("shell_io_error", None),
+                        Err(refusal) => (close_denied(&connection, refusal), None),
+                    };
+                }
+                tokio::select! {
+                    biased;
+                    reason = self.serve_port(
+                        &request, &access, &connection, &mut rx, &mut tx, &mut session,
+                    ) => (reason, None),
+                    _ = connection.closed() => ("peer_disconnected", None),
+                }
+            } => outcome,
+        };
+        session.end(reason, exit_code);
+    }
+
+    /// Returns the reason the session ended, and the shell's exit code if it exited.
+    async fn serve_shell(
+        &self,
+        terminal: terminal::Terminal,
+        rx: &mut RecvStream,
+        tx: &mut SendStream,
+        session: &mut Session<'_>,
+    ) -> (&'static str, Option<i32>) {
+        match terminal.serve(rx, tx, || session.connected()).await {
+            Ok(code) => {
+                if tx.finish().is_ok() {
+                    let _ = timeout(wire::RPC_TIMEOUT, tx.stopped()).await;
+                }
+                ("shell_exit", Some(code))
+            }
+            Err(_) => ("shell_io_error", None),
+        }
+    }
+
+    /// Forward a TCP or UDP service, and return the reason the session ended.
+    async fn serve_port(
+        &self,
+        request: &ServiceRequest,
+        access: &Access,
+        connection: &Connection,
+        rx: &mut RecvStream,
+        tx: &mut SendStream,
+        session: &mut Session<'_>,
+    ) -> &'static str {
+        enum Target {
+            Tcp(TcpStream),
+            Udp(SocketAddr),
+        }
+        let (service, target) = (request.service, access.target.as_deref());
+        let id = connection.remote_id();
+        let opened = self
+            .start_if_allowed(id, request, access.instance, async {
+                match service {
+                    Service::Tcp(port) => tcp::dial(port, target).await.map(Target::Tcp),
+                    Service::Udp(port) => udp::resolve(port, target).await.map(Target::Udp),
+                    Service::Shell => unreachable!("shells do not forward ports"),
+                }
+            })
+            .await;
+        let opened = match opened {
+            Ok(Ok(opened)) => opened,
+            Err(refusal) => return close_denied(connection, refusal),
+            Ok(Err(error)) => {
+                // The owner's chosen address is not disclosed to the peer.
+                let place = match target {
+                    Some(_) => format!("the {service} target"),
+                    None => match service {
+                        Service::Tcp(port) | Service::Udp(port) => format!("loopback port {port}"),
+                        Service::Shell => unreachable!("shells do not forward ports"),
+                    },
+                };
+                let message = format!("could not connect to {place} on the destination: {error}");
+                refuse(connection, tx, Refusal::TargetUnavailable, message).await;
+                return Refusal::TargetUnavailable.reason();
+            }
+        };
+        // Authorization may have been removed while the target was opening.
+        if let Err(refusal) = self
+            .state
+            .lock()
+            .await
+            .check_grant(id, request, access.instance)
         {
-            session.end("shell_unavailable", None);
-            wire::send(
-                &mut tx,
-                LocalReply::Error("shell access is unavailable on this device".into()),
-            )
-            .await?;
-            tx.finish()?;
-            let _ = timeout(wire::RPC_TIMEOUT, tx.stopped()).await;
-            return Ok(());
+            return close_denied(connection, refusal);
         }
-        let outcome = tokio::select! {
-            _ = self.until_unpaired(id, &request) => {
-                connection.close(0u32.into(), b"pairing ended");
-                Ok(None)
+        if wire::send(tx, ServiceReply::Ready).await.is_err() {
+            return "peer_disconnected";
+        }
+        session.connected();
+        let result = match opened {
+            Target::Tcp(mut stream) => tcp::bridge(rx, tx, &mut stream).await,
+            Target::Udp(addr) => {
+                udp::bridge(rx, tx, |first| async move {
+                    self.start_if_allowed(
+                        id,
+                        request,
+                        access.instance,
+                        udp::associate(addr, &first),
+                    )
+                    .await
+                    .map_err(tunnel::Broken::Denied)?
+                    .map_err(tunnel::Broken::Target)
+                })
+                .await
             }
-            result = terminal::serve(&mut rx, &mut tx, request.cols, request.rows, self.shell.as_deref(), || session.connected()) => result.map(Some),
         };
-        match outcome {
-            Ok(None) => session.end("pairing_ended", None),
-            Ok(Some(code)) => {
-                session.end("shell_exit", Some(code));
-                tx.finish()?;
-                let _ = timeout(wire::RPC_TIMEOUT, tx.stopped()).await;
+        let (reason, sent) = match result {
+            Ok(()) => ("stream_closed", tunnel::done(tx).await),
+            Err(tunnel::Broken::Target(error)) => {
+                let message = format!("forwarding {service} failed on the destination: {error}");
+                ("target_io_error", tunnel::fail(tx, &message).await)
             }
-            Err(error) => {
-                session.end("shell_io_error", None);
-                return Err(error);
-            }
+            Err(tunnel::Broken::Peer) => return "peer_disconnected",
+            Err(tunnel::Broken::Denied(refusal)) => return close_denied(connection, refusal),
+        };
+        if sent.is_ok() && tx.finish().is_ok() {
+            // The peer closes the connection once it has received everything.
+            connection.closed().await;
         }
-        Ok(())
+        reason
+    }
+}
+
+/// Tell a paired peer how this device's owner can grant the service it asked for.
+fn not_enabled(service: Service, peer: &str) -> String {
+    let remedy = match service {
+        Service::Udp(port) => format!("massrelay expose --udp {port} --to {peer}"),
+        _ => format!("massrelay enable {service} {peer}"),
+    };
+    format!("{service} is not enabled for this device; on the destination, run {remedy}")
+}
+
+async fn refuse(connection: &Connection, tx: &mut SendStream, refusal: Refusal, message: String) {
+    let reply = ServiceReply::Refused { refusal, message };
+    if wire::send(tx, reply).await.is_ok() && tx.finish().is_ok() {
+        // Closing first could discard the reply, so wait for the peer to close.
+        let _ = timeout(wire::RPC_TIMEOUT, connection.closed()).await;
+    }
+}
+
+/// Close an active session whose authorization was removed, and return the reason to log.
+fn close_denied(connection: &Connection, refusal: Refusal) -> &'static str {
+    let (close, reason) = match refusal {
+        Refusal::PairingRequired => (wire::CLOSE_PAIRING_ENDED, "pairing_ended"),
+        _ => (wire::CLOSE_GRANT_REMOVED, "grant_removed"),
+    };
+    connection.close(0u32.into(), close);
+    reason
+}
+
+/// The destination's reason for closing a connection, as a log reason and an explanation.
+fn closed_by_peer(connection: &Connection, service: Service) -> Option<(&'static str, String)> {
+    let Some(ConnectionError::ApplicationClosed(close)) = connection.close_reason() else {
+        return None;
+    };
+    match close.reason.as_ref() {
+        wire::CLOSE_PAIRING_REQUIRED => Some((
+            Refusal::PairingRequired.reason(),
+            wire::PAIRING_REQUIRED.into(),
+        )),
+        wire::CLOSE_PAIRING_ENDED => {
+            Some(("pairing_ended", "the destination ended this pairing".into()))
+        }
+        wire::CLOSE_GRANT_REMOVED => Some((
+            "grant_removed",
+            format!("access to {service} was removed on the destination"),
+        )),
+        _ => None,
     }
 }
 
@@ -841,6 +1345,226 @@ mod name_tests {
     }
 }
 
+#[cfg(test)]
+mod grant_tests {
+    use super::*;
+    use crate::wire::PairView;
+
+    fn paired_peer(seed: u8, name: &str, generation: u64) -> Peer {
+        Peer {
+            member: Member {
+                id: SecretKey::from_bytes(&[seed; 32]).public(),
+                name: name.into(),
+                addr: None,
+                last_seen: None,
+            },
+            pair: PairView {
+                generation,
+                ours: Some(Decision::Approve),
+                theirs: Some(Decision::Approve),
+            },
+        }
+    }
+
+    /// A destination on loopback, paired with each peer, whose profile predates service grants.
+    async fn destination(dir: &Path, peers: &[Peer]) -> Result<Node> {
+        let key = SecretKey::from_bytes(&[9; 32]);
+        let approvals: BTreeMap<_, _> = peers
+            .iter()
+            .map(|peer| (peer.member.id, peer.pair.generation))
+            .collect();
+        let profile = serde_json::json!({
+            "identity": {
+                "key": key.to_bytes(),
+                "server": {
+                    "id": key.public(),
+                    "udp": "127.0.0.1:1",
+                    "relay": "http://127.0.0.1:1",
+                },
+            },
+            "roster": Roster { network: "test".into(), peers: peers.to_vec() },
+            "approvals": approvals,
+            "revoked": false,
+        });
+        storage::save(dir, FILE, &profile)?;
+        let bind = "127.0.0.1:0".parse()?;
+        Ok(Node {
+            state: Mutex::new(storage::load(dir, FILE)?),
+            operations: Mutex::new(()),
+            endpoint: bind_endpoint(key, bind, None, wire::SERVICE, false).await?,
+            dir: dir.into(),
+            shell: None,
+            connection_log: ConnectionLog::open(None)?,
+            changed: watch::channel(()).0,
+        })
+    }
+
+    impl Node {
+        async fn allowed(&self, peer: &Peer, service: &str) -> Result<u64, Refusal> {
+            let request = ServiceRequest {
+                network: "test".into(),
+                generation: peer.pair.generation,
+                service: service.parse().expect("test service"),
+                terminal: None,
+            };
+            let state = self.state.lock().await;
+            state
+                .access(peer.member.id, &request)
+                .map(|access| access.instance)
+        }
+
+        async fn change(&self, enable: bool, service: &str, peer: &str) -> Result<()> {
+            let (service, peer) = (service.parse().expect("test service"), peer.into());
+            self.manage(if enable {
+                LocalRequest::Enable { service, peer }
+            } else {
+                LocalRequest::Disable { service, peer }
+            })
+            .await
+            .map(drop)
+        }
+
+        async fn roster(&self, peers: &[Peer]) -> Result<()> {
+            let roster = Roster {
+                network: "test".into(),
+                peers: peers.to_vec(),
+            };
+            self.apply_reply(Reply::Roster(roster), None).await
+        }
+    }
+
+    #[tokio::test]
+    async fn grants_belong_to_one_peer_service_and_pairing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (first, second) = (paired_peer(1, "first", 0), paired_peer(2, "second", 0));
+        let node = destination(dir.path(), &[first.clone(), second.clone()]).await?;
+        let denied = Err(Refusal::ServiceNotEnabled);
+
+        assert_eq!(node.allowed(&first, "shell").await, denied);
+        node.change(true, "tcp:80", "FIRST").await?;
+        let instance = node.allowed(&first, "tcp:80").await.expect("granted");
+        node.change(true, "tcp:80", &first.member.id.to_string())
+            .await?;
+        assert_eq!(node.allowed(&first, "tcp:80").await, Ok(instance));
+        for service in ["shell", "tcp:81", "udp:80"] {
+            assert_eq!(node.allowed(&first, service).await, denied);
+        }
+        assert_eq!(node.allowed(&second, "tcp:80").await, denied);
+
+        // Temporary grants are not saved, and never replace a persistent one.
+        assert!(
+            node.add_exposure("tcp:80".parse().unwrap(), "first", None)
+                .await
+                .is_err()
+        );
+        let udp = "udp:53".parse().unwrap();
+        node.add_exposure(udp, "second", Some("localhost:5353".into()))
+            .await?;
+        assert!(node.change(true, "udp:53", "second").await.is_err());
+        assert!(node.allowed(&second, "udp:53").await.is_ok());
+        let saved: Device = storage::load(dir.path(), FILE)?;
+        let saved = saved.grants.list(|_| None);
+        assert!(saved.len() == 1 && !saved[0].temporary);
+
+        // Removing and restoring a grant never revives the instance that sessions hold.
+        node.change(false, "tcp:80", "first").await?;
+        node.change(false, "tcp:80", "first").await?;
+        assert_eq!(node.allowed(&first, "tcp:80").await, denied);
+        node.change(true, "tcp:80", "first").await?;
+        assert_ne!(node.allowed(&first, "tcp:80").await, Ok(instance));
+
+        // A new pairing generation ends both kinds of grant.
+        let repaired = paired_peer(2, "second", 1);
+        let first_again = paired_peer(1, "first", 1);
+        node.roster(&[first_again.clone(), repaired.clone()])
+            .await?;
+        // A grant made before both approvals waits for them.
+        node.change(true, "tcp:90", "second").await?;
+        assert_eq!(
+            node.allowed(&repaired, "tcp:90").await,
+            Err(Refusal::PairingRequired)
+        );
+        node.state.lock().await.approvals = [(first.member.id, 1), (second.member.id, 1)].into();
+        assert!(node.allowed(&repaired, "tcp:90").await.is_ok());
+        assert_eq!(node.allowed(&first_again, "tcp:80").await, denied);
+        assert_eq!(node.allowed(&repaired, "udp:53").await, denied);
+
+        // A grant stays with the device, not its name.
+        node.change(true, "shell", "first").await?;
+        let namesake = paired_peer(3, "first", 1);
+        node.roster(std::slice::from_ref(&namesake)).await?;
+        node.state
+            .lock()
+            .await
+            .approvals
+            .insert(namesake.member.id, 1);
+        assert_eq!(node.allowed(&namesake, "shell").await, denied);
+        let saved: Device = storage::load(dir.path(), FILE)?;
+        assert!(saved.grants.list(|_| None).is_empty());
+        node.endpoint.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_waits_for_grant_changes() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let peer = paired_peer(1, "peer", 0);
+        let node = destination(dir.path(), std::slice::from_ref(&peer)).await?;
+        node.change(true, "tcp:80", "peer").await?;
+        let instance = node.allowed(&peer, "tcp:80").await.expect("granted");
+        let request = ServiceRequest {
+            network: "test".into(),
+            generation: peer.pair.generation,
+            service: "tcp:80".parse().unwrap(),
+            terminal: None,
+        };
+        let id = peer.member.id;
+
+        let mut state = node.state.lock().await;
+        let startup = node.start_if_allowed(id, &request, instance, async {
+            panic!("a removed grant must never start a service");
+        });
+        tokio::pin!(startup);
+        assert!(poll_fn(|cx| Poll::Ready(startup.as_mut().poll(cx).is_pending())).await);
+        assert!(state.grants.disable(id, request.service));
+        drop(state);
+        assert_eq!(startup.await, Err(Refusal::ServiceNotEnabled));
+        node.endpoint.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unsaved_changes_never_widen_access() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let peer = paired_peer(1, "peer", 0);
+        let node = destination(dir.path(), std::slice::from_ref(&peer)).await?;
+        node.change(true, "shell", "peer").await?;
+
+        // A directory in place of the state file makes every save fail.
+        let file = dir.path().join(FILE);
+        std::fs::remove_file(&file)?;
+        std::fs::create_dir_all(file.join("occupied"))?;
+        assert!(node.change(true, "tcp:80", "peer").await.is_err());
+        assert_eq!(
+            node.allowed(&peer, "tcp:80").await,
+            Err(Refusal::ServiceNotEnabled)
+        );
+        assert!(node.change(false, "shell", "peer").await.is_err());
+        assert_eq!(
+            node.allowed(&peer, "shell").await,
+            Err(Refusal::ServiceNotEnabled)
+        );
+
+        // Retrying saves the removal once storage recovers.
+        std::fs::remove_dir_all(&file)?;
+        node.change(false, "shell", "peer").await?;
+        let saved: Device = storage::load(dir.path(), FILE)?;
+        assert!(saved.grants.list(|_| None).is_empty());
+        node.endpoint.close().await;
+        Ok(())
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -861,7 +1585,7 @@ mod tests {
             Endpoint::builder(presets::Minimal)
                 .clear_ip_transports()
                 .relay_mode(RelayMode::custom([url.clone()]))
-                .alpns(vec![wire::SHELL.to_vec()])
+                .alpns(vec![wire::SERVICE.to_vec()])
                 .bind()
         };
         let (source, destination) = tokio::try_join!(endpoint(), endpoint())?;
@@ -895,6 +1619,7 @@ mod tests {
             },
             approvals: BTreeMap::from([(source.id(), 0)]),
             pending_declines: BTreeMap::new(),
+            grants: Grants::default(),
             udp_port: None,
             dirty: false,
             revoked: false,
@@ -905,32 +1630,37 @@ mod tests {
             operations: Mutex::new(()),
             endpoint: destination,
             dir: scratch.path().into(),
-            allow_shell: true,
             shell: Some("/bin/sh".into()),
             connection_log: ConnectionLog::open(None)?,
             changed: watch::channel(()).0,
         };
+        node.manage(LocalRequest::Enable {
+            service: Service::Shell,
+            peer: "source".into(),
+        })
+        .await?;
         timeout(Duration::from_secs(20), async {
             node.endpoint.online().await;
             let server = async {
                 let incoming = node.endpoint.accept().await.context("endpoint closed")?;
-                node.serve_shell(incoming.await?).await
+                node.serve_peer(incoming.await?).await;
+                Ok(())
             };
             let client = async {
                 let addr = EndpointAddr::new(node.endpoint.id()).with_relay_url(url);
-                let connection = source.connect(addr, wire::SHELL).await?;
+                let connection = source.connect(addr, wire::SERVICE).await?;
                 let (mut tx, mut rx) = connection.open_bi().await?;
                 wire::send(
                     &mut tx,
-                    ShellRequest {
+                    ServiceRequest {
                         network: "test".into(),
                         generation: 0,
-                        cols: 80,
-                        rows: 24,
+                        service: Service::Shell,
+                        terminal: Some((80, 24)),
                     },
                 )
                 .await?;
-                assert!(matches!(wire::recv(&mut rx).await?, LocalReply::Shell));
+                assert!(matches!(wire::recv(&mut rx).await?, ServiceReply::Ready));
                 wire::frame(&mut tx, b"\x01printf '%s%s\\n' relay_ only; exit 17\r").await?;
                 let mut output = Vec::new();
                 loop {

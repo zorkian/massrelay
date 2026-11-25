@@ -1,19 +1,24 @@
 mod connection_log;
 mod device;
+mod grants;
 mod local;
 mod relay;
 mod storage;
+mod tcp;
 mod terminal;
+mod tunnel;
+mod udp;
 mod wire;
 
 use std::{
     io::{self, IsTerminal, Write},
     net::SocketAddr,
+    num::NonZeroU16,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use directories::ProjectDirs;
 use iroh::{
     Endpoint, EndpointId, RelayUrl, SecretKey,
@@ -21,7 +26,7 @@ use iroh::{
 };
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 
-use wire::{Decision, LocalReply, LocalRequest, ServerAddr, Ticket};
+use wire::{Decision, LocalReply, LocalRequest, ServerAddr, Service, Ticket};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -83,11 +88,8 @@ enum Command {
     },
     /// Make this device reachable while the foreground process runs.
     Run {
-        /// Let paired devices open a shell under this OS account.
-        #[arg(long)]
-        allow_shell: bool,
         /// Use this shell executable instead of the account's default.
-        #[arg(long, requires = "allow_shell")]
+        #[arg(long)]
         shell: Option<PathBuf>,
         /// Append connection events to this file. Defaults to stderr.
         #[arg(long)]
@@ -105,8 +107,65 @@ enum Command {
     Decline { peer: String },
     /// Remove another device from the entire network.
     Revoke { peer: String },
-    /// Open an interactive shell on a paired device.
+    /// Open an interactive shell on a paired device that has enabled it.
     Shell { peer: String },
+    /// Let one peer use a service on this device, until disabled or the pairing ends.
+    Enable {
+        /// shell, tcp:PORT, or udp:PORT. Ports forward to loopback on this device.
+        service: Service,
+        /// Peer name or endpoint ID.
+        peer: String,
+    },
+    /// Remove one peer's grant or exposure of a service, and close its sessions.
+    Disable {
+        /// shell, tcp:PORT, or udp:PORT.
+        service: Service,
+        /// Peer name or endpoint ID.
+        peer: String,
+    },
+    /// List the services this device grants, and who may use them.
+    List,
+    /// Expose a port to one peer for as long as this command runs.
+    Expose {
+        #[command(flatten)]
+        port: ExposedPort,
+        /// The only peer allowed to connect, by device name or endpoint ID.
+        #[arg(long, value_name = "PEER")]
+        to: String,
+        /// Where this device forwards to. Defaults to loopback on the same port.
+        #[arg(value_name = "HOST:PORT", value_parser = target)]
+        target: Option<String>,
+    },
+    /// Use a port that a paired device has enabled or exposed.
+    ///
+    /// A TCP service is connected to standard input and output. A UDP service is
+    /// offered on a loopback port until this command is interrupted.
+    Connect {
+        /// Peer name or endpoint ID.
+        peer: String,
+        /// tcp:PORT or udp:PORT.
+        service: Service,
+        /// Local UDP port to listen on. Defaults to the service's port.
+        #[arg(long, value_name = "PORT")]
+        listen: Option<u16>,
+    },
+}
+
+#[derive(Args)]
+#[group(required = true, multiple = false)]
+struct ExposedPort {
+    /// Expose this TCP port.
+    #[arg(long, value_name = "PORT")]
+    tcp: Option<NonZeroU16>,
+    /// Expose this UDP port.
+    #[arg(long, value_name = "PORT")]
+    udp: Option<NonZeroU16>,
+}
+
+fn target(text: &str) -> Result<String, String> {
+    wire::check_target(text)
+        .map(|()| text.to_owned())
+        .map_err(|error| error.to_string())
 }
 
 #[tokio::main]
@@ -174,11 +233,10 @@ async fn execute(cli: Cli) -> Result<i32> {
             device::enroll(&dir, ticket, name, false).await?
         }
         Command::Run {
-            allow_shell,
             shell,
             log_file,
             bind,
-        } => device::run(dir, allow_shell, shell, bind, log_file).await?,
+        } => device::run(dir, shell, bind, log_file).await?,
         Command::Peers => {
             let LocalReply::Peers(peers) = local::command(&dir, LocalRequest::Peers).await? else {
                 bail!("unexpected roster reply");
@@ -239,6 +297,62 @@ async fn execute(cli: Cli) -> Result<i32> {
             local::command(&dir, LocalRequest::Revoke { peer }).await?;
         }
         Command::Shell { peer } => return local::shell(&dir, peer).await,
+        Command::Enable { service, peer } => {
+            let request = LocalRequest::Enable {
+                service,
+                peer: peer.clone(),
+            };
+            local::command(&dir, request).await?;
+            println!("Enabled {service} for {}", visible(&peer));
+        }
+        Command::Disable { service, peer } => {
+            let request = LocalRequest::Disable {
+                service,
+                peer: peer.clone(),
+            };
+            local::command(&dir, request).await?;
+            println!("Disabled {service} for {}", visible(&peer));
+        }
+        Command::List => {
+            let LocalReply::Grants(grants) = local::command(&dir, LocalRequest::Grants).await?
+            else {
+                bail!("unexpected grant list reply");
+            };
+            println!("SERVICE\tPEER\tENDPOINT\tMODE\tTARGET");
+            for grant in grants {
+                let peer = grant.peer.as_deref().unwrap_or("(unknown)");
+                let mode = if grant.temporary {
+                    "temporary"
+                } else {
+                    "persistent"
+                };
+                let target = grant.target.unwrap_or_else(|| match grant.service {
+                    Service::Shell => "-".into(),
+                    Service::Tcp(port) => format!("loopback:{port}"),
+                    Service::Udp(port) => format!("127.0.0.1:{port}"),
+                });
+                println!(
+                    "{}\t{}\t{}\t{mode}\t{}",
+                    grant.service,
+                    visible(peer),
+                    grant.id,
+                    visible(&target)
+                );
+            }
+        }
+        Command::Expose { port, to, target } => {
+            let service = match (port.tcp, port.udp) {
+                (Some(port), None) => Service::Tcp(port),
+                (None, Some(port)) => Service::Udp(port),
+                _ => bail!("pass one of --tcp or --udp"),
+            };
+            local::expose(&dir, service, to, target).await?
+        }
+        Command::Connect {
+            peer,
+            service,
+            listen,
+        } => local::connect(&dir, peer, service, listen).await?,
     }
     Ok(0)
 }

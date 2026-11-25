@@ -12,7 +12,7 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 
-use crate::wire::{self, LocalReply};
+use crate::wire::{self, ServiceReply};
 
 const DATA: u8 = 1;
 const RESIZE: u8 = 2;
@@ -256,14 +256,14 @@ impl Drop for Process {
     }
 }
 
-pub async fn serve(
-    rx: &mut (impl AsyncRead + Unpin),
-    tx: &mut (impl AsyncWrite + Unpin),
-    cols: u16,
-    rows: u16,
-    shell: Option<&Path>,
-    connected: impl FnOnce(),
-) -> Result<i32> {
+pub struct Terminal {
+    input: mpsc::Sender<Input>,
+    output: mpsc::Receiver<Vec<u8>>,
+    exited: oneshot::Receiver<io::Result<portable_pty::ExitStatus>>,
+    _stop: std::sync::mpsc::Sender<()>,
+}
+
+pub fn start(cols: u16, rows: u16, shell: Option<&Path>) -> Result<Terminal> {
     let pair = native_pty_system().openpty(dimensions(cols, rows))?;
     let master = pair.master;
     let mut reader = master.try_clone_reader()?;
@@ -272,9 +272,9 @@ pub async fn serve(
     command.env("TERM", "xterm-256color");
     let mut process = Process(pair.slave.spawn_command(command)?);
     drop(pair.slave);
-    let (input_tx, mut input_rx) = mpsc::channel::<Input>(8);
-    let (output_tx, mut output_rx) = mpsc::channel(16);
-    let (exit_tx, mut exit_rx) = oneshot::channel();
+    let (input, mut input_rx) = mpsc::channel::<Input>(8);
+    let (output_tx, output) = mpsc::channel(16);
+    let (exit_tx, exited) = oneshot::channel();
     let (_stop, stop) = std::sync::mpsc::channel::<()>();
 
     thread::Builder::new()
@@ -333,51 +333,67 @@ pub async fn serve(
             }
         })?;
 
-    wire::send(tx, LocalReply::Shell).await?;
-    connected();
-    let read_inputs = async {
-        loop {
-            let data = wire::read_frame(rx).await?;
-            let input = match data.as_slice() {
-                [RESIZE, c0, c1, r0, r1] => Input::Resize(dimensions(
-                    u16::from_be_bytes([*c0, *c1]),
-                    u16::from_be_bytes([*r0, *r1]),
-                )),
-                [DATA, bytes @ ..] => Input::Data(bytes.to_vec()),
-                _ => bail!("invalid shell input frame"),
-            };
-            input_tx
-                .send(input)
-                .await
-                .context("remote terminal input closed")?;
-        }
-    };
+    Ok(Terminal {
+        input,
+        output,
+        exited,
+        _stop,
+    })
+}
 
-    let write_outputs = async {
-        let status = loop {
-            tokio::select! {
-                result = &mut exit_rx => break result??,
-                data = output_rx.recv() => match data {
-                    Some(data) => wire::frame(tx, &data).await?,
-                    None => break exit_rx.await??,
-                },
+impl Terminal {
+    pub async fn serve(
+        mut self,
+        rx: &mut (impl AsyncRead + Unpin),
+        tx: &mut (impl AsyncWrite + Unpin),
+        connected: impl FnOnce(),
+    ) -> Result<i32> {
+        wire::send(tx, ServiceReply::Ready).await?;
+        connected();
+        let read_inputs = async {
+            loop {
+                let data = wire::read_frame(rx).await?;
+                let input = match data.as_slice() {
+                    [RESIZE, c0, c1, r0, r1] => Input::Resize(dimensions(
+                        u16::from_be_bytes([*c0, *c1]),
+                        u16::from_be_bytes([*r0, *r1]),
+                    )),
+                    [DATA, bytes @ ..] => Input::Data(bytes.to_vec()),
+                    _ => bail!("invalid shell input frame"),
+                };
+                self.input
+                    .send(input)
+                    .await
+                    .context("remote terminal input closed")?;
             }
         };
-        // ConPTY or a descendant may keep the output handle open after the shell exits.
-        // Time out waiting for a chunk, never in the middle of writing a frame.
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-        while let Ok(Some(data)) = tokio::time::timeout_at(deadline, output_rx.recv()).await {
-            wire::frame(tx, &data).await?;
-        }
-        Ok::<_, anyhow::Error>(status)
-    };
 
-    let status = tokio::select! {
-        result = write_outputs => result?,
-        result = read_inputs => return result,
-    };
-    let code = i32::try_from(status.exit_code()).unwrap_or(1);
-    let [a, b, c, d] = code.to_be_bytes();
-    wire::frame(tx, &[EXIT, a, b, c, d]).await?;
-    Ok(code)
+        let write_outputs = async {
+            let status = loop {
+                tokio::select! {
+                    result = &mut self.exited => break result??,
+                    data = self.output.recv() => match data {
+                        Some(data) => wire::frame(tx, &data).await?,
+                        None => break self.exited.await??,
+                    },
+                }
+            };
+            // ConPTY or a descendant may keep the output handle open after the shell exits.
+            // Time out waiting for a chunk, never in the middle of writing a frame.
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+            while let Ok(Some(data)) = tokio::time::timeout_at(deadline, self.output.recv()).await {
+                wire::frame(tx, &data).await?;
+            }
+            Ok::<_, anyhow::Error>(status)
+        };
+
+        let status = tokio::select! {
+            result = write_outputs => result?,
+            result = read_inputs => return result,
+        };
+        let code = i32::try_from(status.exit_code()).unwrap_or(1);
+        let [a, b, c, d] = code.to_be_bytes();
+        wire::frame(tx, &[EXIT, a, b, c, d]).await?;
+        Ok(code)
+    }
 }
