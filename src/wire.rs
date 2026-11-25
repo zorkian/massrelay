@@ -1,6 +1,6 @@
 use std::{io, net::SocketAddr, time::Duration};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use iroh::{EndpointAddr, EndpointId, RelayUrl};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -9,7 +9,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const CONTROL: &[u8] = b"massrelay/control/1";
 pub const SHELL: &[u8] = b"massrelay/shell/1";
 pub const RPC_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_FRAME: usize = 1024 * 1024;
 
 pub async fn send<T: Serialize>(writer: &mut (impl AsyncWrite + Unpin), value: T) -> Result<()> {
     let data = serde_json::to_vec(&value)?;
@@ -17,30 +16,28 @@ pub async fn send<T: Serialize>(writer: &mut (impl AsyncWrite + Unpin), value: T
 }
 
 pub async fn recv<T: DeserializeOwned>(reader: &mut (impl AsyncRead + Unpin)) -> Result<T> {
-    let bytes = read_frame(reader, MAX_FRAME).await?;
+    let bytes = read_frame(reader).await?;
     serde_json::from_slice(&bytes).context("invalid message")
 }
 
 pub async fn frame(writer: &mut (impl AsyncWrite + Unpin), data: &[u8]) -> Result<()> {
-    ensure!(data.len() <= MAX_FRAME, "frame exceeds size limit");
-    writer.write_u32(data.len() as u32).await?;
+    let len = u32::try_from(data.len()).context("frame length does not fit the wire format")?;
+    writer.write_u32(len).await?;
     writer.write_all(data).await?;
     Ok(())
 }
 
-pub async fn read_frame(
-    reader: &mut (impl AsyncRead + Unpin),
-    limit: usize,
-) -> io::Result<Vec<u8>> {
-    let len = reader.read_u32().await? as usize;
-    if len > limit {
+pub async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<Vec<u8>> {
+    let len = reader.read_u32().await?;
+    // Grow the buffer as bytes arrive rather than allocating the advertised length up front.
+    let mut data = Vec::new();
+    reader.take(u64::from(len)).read_to_end(&mut data).await?;
+    if data.len() != len as usize {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "frame exceeds size limit",
+            io::ErrorKind::UnexpectedEof,
+            "incomplete frame",
         ));
     }
-    let mut data = vec![0; len];
-    reader.read_exact(&mut data).await?;
     Ok(data)
 }
 

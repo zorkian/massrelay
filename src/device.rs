@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     io::{self, AsyncWriteExt},
     net::TcpStream,
-    sync::{Mutex, Semaphore, watch},
+    sync::{Mutex, watch},
     task::JoinSet,
     time::{MissedTickBehavior, timeout},
 };
@@ -173,9 +173,6 @@ pub async fn run(
         changed: watch::channel(()).0,
     });
     eprintln!("MassRelay running as {}", node.endpoint.id());
-    let limit = Arc::new(Semaphore::new(32));
-    let handshakes = Arc::new(Semaphore::new(32));
-    let local_limit = Arc::new(Semaphore::new(32));
     let mut tasks = JoinSet::new();
     let sync_node = node.clone();
     tasks.spawn(async move {
@@ -198,21 +195,13 @@ pub async fn run(
             Some(_) = tasks.join_next() => {},
             incoming = node.endpoint.accept() => {
                 let Some(incoming) = incoming else { break Ok(()); };
-                let Ok(handshake) = handshakes.clone().try_acquire_owned() else {
-                    incoming.refuse();
-                    continue;
-                };
                 let node = node.clone();
-                let limit = limit.clone();
                 tasks.spawn(async move {
-                    let connection = timeout(wire::RPC_TIMEOUT, incoming).await;
-                    drop(handshake);
-                    let Ok(Ok(connection)) = connection else { return };
+                    let Ok(Ok(connection)) = timeout(wire::RPC_TIMEOUT, incoming).await else { return };
                     if !node.state.lock().await.approvals.contains_key(&connection.remote_id()) {
                         connection.close(0u32.into(), b"pairing required");
                         return;
                     }
-                    let Ok(_session) = limit.try_acquire_owned() else { return };
                     let _ = node.serve_shell(connection).await;
                 });
             }
@@ -225,10 +214,8 @@ pub async fn run(
                         continue;
                     }
                 };
-                let Ok(permit) = local_limit.clone().try_acquire_owned() else { continue };
                 let (node, runtime) = (node.clone(), runtime.clone());
                 tasks.spawn(async move {
-                    let _permit = permit;
                     let _ = node.serve_local(socket, &runtime).await;
                 });
             }
@@ -720,7 +707,7 @@ mod tests {
                 wire::frame(&mut tx, b"\x01printf '%s%s\\n' relay_ only; exit 17\r").await?;
                 let mut output = Vec::new();
                 loop {
-                    let frame = wire::read_frame(&mut rx, 8192).await?;
+                    let frame = wire::read_frame(&mut rx).await?;
                     match frame.split_first() {
                         Some((&1, data)) => output.extend_from_slice(data),
                         Some((&3, status)) => {

@@ -10,7 +10,7 @@ use iroh::{EndpointId, RelayUrl, SecretKey};
 use iroh_relay::server::{Access, AccessControl, ClientRequest, RelayConfig, Server, ServerConfig};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Mutex;
 
 use crate::{
     bind_endpoint, storage,
@@ -371,7 +371,6 @@ pub async fn run(dir: PathBuf, udp_bind: SocketAddr, relay_bind: SocketAddr) -> 
     )
     .await?;
     eprintln!("MassRelay listening on {udp_bind} UDP and {relay_bind} TCP");
-    let limit = Arc::new(Semaphore::new(64));
     let shutdown = crate::shutdown();
     tokio::pin!(shutdown);
     loop {
@@ -383,15 +382,9 @@ pub async fn run(dir: PathBuf, udp_bind: SocketAddr, relay_bind: SocketAddr) -> 
             signal = &mut shutdown => break signal?,
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { bail!("control endpoint closed") };
-                // Own the whole request for the bounded lifetime of its permit.
-                let Ok(permit) = limit.clone().try_acquire_owned() else {
-                    incoming.refuse();
-                    continue;
-                };
                 let (dir, state) = (dir.clone(), state.clone());
                 let relay_service = relay_service.clone();
                 tokio::spawn(async move {
-                    let _permit = permit;
                     let _ = tokio::time::timeout(wire::RPC_TIMEOUT, async {
                         let connection = incoming.await?;
                         let who = connection.remote_id();

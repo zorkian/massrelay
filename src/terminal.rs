@@ -165,7 +165,7 @@ pub async fn attach(
         #[cfg(windows)]
         let mut pending = Vec::new();
         loop {
-            let data = wire::read_frame(&mut rx, CHUNK)
+            let data = wire::read_frame(&mut rx)
                 .await
                 .context("remote shell disconnected")?;
             match data.split_first() {
@@ -335,7 +335,7 @@ pub async fn serve(
     wire::send(tx, LocalReply::Shell).await?;
     let read_inputs = async {
         loop {
-            let data = wire::read_frame(rx, CHUNK).await?;
+            let data = wire::read_frame(rx).await?;
             let input = match data.as_slice() {
                 [RESIZE, c0, c1, r0, r1] => Input::Resize(dimensions(
                     u16::from_be_bytes([*c0, *c1]),
