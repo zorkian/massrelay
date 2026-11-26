@@ -60,11 +60,12 @@ jobs:
         if: matrix.runner == 'ubuntu-22.04'
         shell: bash
         run: |
+          log="$RUNNER_TEMP/signature-qualification.log"
           for run in {1..100}; do
             if ! cargo +stable test --locked --release \
-              competing_writers_loser_adopts_winner_and_restages > signature-qualification.log 2>&1
+              competing_writers_loser_adopts_winner_and_restages > "$log" 2>&1
             then
-              cat signature-qualification.log
+              cat "$log"
               echo "Membership verification failed on iteration $run"
               exit 1
             fi
