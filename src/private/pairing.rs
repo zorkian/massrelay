@@ -1027,21 +1027,29 @@ impl Authorization {
 
     /// Resolve when the authority ends or the connection closes.
     pub async fn done(&self) -> Refusal {
-        let flag = async {
-            loop {
-                let n = self.flag.notify.notified();
-                let mut n = pin!(n);
-                n.as_mut().enable();
-                if let Some(r) = self.flag.get() {
-                    return r;
+        self.watch_end().await
+    }
+
+    /// Observe cancellation without keeping the registered authorization alive.
+    pub(super) fn watch_end(&self) -> impl Future<Output = Refusal> + Send + 'static + use<> {
+        let (flag, link) = (self.flag.clone(), self.link.clone());
+        async move {
+            let ended = async {
+                loop {
+                    let n = flag.notify.notified();
+                    let mut n = pin!(n);
+                    n.as_mut().enable();
+                    if let Some(r) = flag.get() {
+                        return r;
+                    }
+                    n.await;
                 }
-                n.await;
+            };
+            tokio::select! {
+                biased;
+                why = ended => Refusal::Invalidated(why),
+                _ = link.closed() => Refusal::ConnectionClosed,
             }
-        };
-        tokio::select! {
-            biased;
-            why = flag => Refusal::Invalidated(why),
-            _ = self.link.closed() => Refusal::ConnectionClosed,
         }
     }
 

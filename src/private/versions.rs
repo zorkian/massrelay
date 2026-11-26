@@ -4,7 +4,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use iroh::{EndpointId, endpoint::Connection};
@@ -20,6 +20,7 @@ const FILE: &str = "peer-versions.json";
 const PREFIX: &[u8] = b"massrelay/version/1\0";
 const MAX_VERSION: usize = 64;
 const REPORT_WAIT: Duration = Duration::from_secs(2);
+const SAVE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Observation {
@@ -32,14 +33,22 @@ pub(super) type Observations = BTreeMap<EndpointId, Observation>;
 
 pub(super) struct PeerVersions {
     dir: PathBuf,
-    observations: Mutex<Observations>,
+    cache: Mutex<Cache>,
+}
+
+struct Cache {
+    observations: Observations,
+    last_save: Option<Instant>,
 }
 
 impl PeerVersions {
     pub fn open(dir: &Path) -> Self {
         Self {
             dir: dir.into(),
-            observations: Mutex::new(Self::read(dir)),
+            cache: Mutex::new(Cache {
+                observations: Self::read(dir),
+                last_save: None,
+            }),
         }
     }
 
@@ -50,18 +59,19 @@ impl PeerVersions {
     }
 
     pub fn observations(&self) -> Observations {
-        self.observations.lock().expect("peer versions").clone()
+        self.cache
+            .lock()
+            .expect("peer versions")
+            .observations
+            .clone()
     }
 
     /// A separate unidirectional stream leaves the existing service stream
     /// unchanged. Older peers may ignore it without delaying a connection.
-    pub fn exchange(self: &Arc<Self>, conn: &Connection, auth: &Arc<Authorization>) -> Exchange {
-        let (versions, conn, auth) = (self.clone(), conn.clone(), auth.clone());
+    pub fn exchange(self: &Arc<Self>, conn: &Connection, auth: &Authorization) -> Exchange {
+        let (versions, conn, ended) = (self.clone(), conn.clone(), auth.watch_end());
         Exchange(tokio::spawn(async move {
             let exchange = async {
-                if auth.status().is_err() {
-                    return;
-                }
                 let send = async {
                     let mut stream = conn.open_uni().await?;
                     let mut report = PREFIX.to_vec();
@@ -74,30 +84,39 @@ impl PeerVersions {
                     let mut stream = conn.accept_uni().await.ok()?;
                     let body = stream.read_to_end(PREFIX.len() + MAX_VERSION).await.ok()?;
                     let version = decode_report(&body)?;
-                    if auth.status().is_ok() {
-                        versions.remember(conn.remote_id(), version);
-                    }
+                    versions.remember(conn.remote_id(), version);
                     Some(())
                 };
                 let _ = tokio::join!(send, receive);
             };
             tokio::select! {
                 biased;
-                _ = auth.done() => {}
+                _ = ended => {}
                 _ = timeout(REPORT_WAIT, exchange) => {}
             }
         }))
     }
 
     fn remember(&self, peer: EndpointId, version: &str) {
-        let mut observations = self.observations.lock().expect("peer versions");
+        let mut cache = self.cache.lock().expect("peer versions");
+        let changed = cache
+            .observations
+            .get(&peer)
+            .is_none_or(|last| last.version != version);
         let report = Observation {
             version: version.to_owned(),
             observed_at: crate::storage::now(),
         };
-        if observations.get(&peer) != Some(&report) {
-            observations.insert(peer, report);
-            if crate::storage::save(&self.dir, FILE, &*observations).is_err() {
+        cache.observations.insert(peer, report);
+        if changed
+            || cache
+                .last_save
+                .is_none_or(|last| last.elapsed() >= SAVE_INTERVAL)
+        {
+            // Keep live observations current. For an unchanged version, a periodic
+            // checkpoint is enough for offline status and avoids fsync per connection.
+            cache.last_save = Some(Instant::now());
+            if crate::storage::save(&self.dir, FILE, &cache.observations).is_err() {
                 diagnostics::quiet(Level::Warning, "could not save peer versions");
             }
         }

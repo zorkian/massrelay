@@ -626,7 +626,6 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
                 return Ended::NotAuthorized(format!("{e:?}"));
             }
         };
-        let auth = Arc::new(auth);
         let _versions = self.versions.exchange(&conn, &auth);
         let (ended, session) = tokio::select! {
             biased;
@@ -862,7 +861,6 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
             .await
             .map_err(|e| local(&e))?;
         let (auth, mut tx, mut rx) = self.peers().authorize(&conn, true).await?;
-        let auth = Arc::new(auth);
         let versions = self.versions.exchange(&conn, &auth);
         let io = async {
             crate::wire::frame(&mut tx, &req.encode())
@@ -1010,7 +1008,7 @@ pub struct ServiceStream {
     pub conn: Connection,
     /// Disjoint from the streams, so `auth.done()` can be awaited while
     /// they are copied.
-    pub auth: Arc<Authorization>,
+    pub auth: Authorization,
     pub service: Service,
     pub tx: SendStream,
     pub rx: RecvStream,

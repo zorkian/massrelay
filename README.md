@@ -110,7 +110,7 @@ Run `massrelay logs` to read recent diagnostics for the selected profile, or `ma
 
 Run `massrelay status` in another terminal to see active inbound and outbound shells and port forwards. Each row shows the peer, service, and current route. Run `massrelay list` to see the shell and port permissions on this device, including defaults, exclusions, and temporary exposures with their targets. `massrelay peers` shows membership, approvals, and pairing state.
 
-`status` also shows the client and running daemon versions, alongside each member's last reported version and when it was observed. Devices share version reports over an encrypted connection after mutual pairing. Older peers can still connect and show up as `unknown` until they send a report. Observations are kept locally so they remain visible when the runtime is stopped.
+`status` also shows the client and running daemon versions, alongside each member's last reported version and when it was observed. Devices share version reports over an encrypted connection after mutual pairing. Older peers can still connect and show up as `unknown` until they send a report. Version changes are saved locally right away. When a version stays the same, its observation time is saved periodically for offline status.
 
 ## How connections work
 
