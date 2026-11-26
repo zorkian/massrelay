@@ -56,6 +56,7 @@ use crate::wire::{GrantRule, Service};
 
 use super::binding::EndpointKey;
 use super::codec::hex;
+use super::diagnostics::{self, Level};
 use super::mailbox::Mailbox;
 use super::membership::{Advance, Stop};
 use super::pairing::{Decision, PairError, PairingState, Refusal};
@@ -218,12 +219,23 @@ impl DeviceLog {
             Stop::Unavailable(_) | Stop::Failed(_) => false,
             _ => true,
         };
-        {
+        let recovered = {
             let mut last = lock(&self.reachable);
             if *last == Some(reached) {
                 return;
             }
-            *last = Some(reached);
+            last.replace(reached) == Some(false)
+        };
+        match (reached, recovered) {
+            (false, _) => {
+                diagnostics::event(Level::Warning, "could not sync membership with the relay")
+            }
+            (true, true) => {
+                diagnostics::event(Level::Info, "membership is syncing with the relay again")
+            }
+            (true, false) => {
+                diagnostics::quiet(Level::Info, "membership is syncing with the relay")
+            }
         }
         self.log.audit(
             "membership_sync",
@@ -241,6 +253,7 @@ impl DeviceLog {
     fn device_revoked(&self) {
         if !self.revoked.swap(true, Ordering::Relaxed) {
             self.log.state("device_revoked", None, None);
+            diagnostics::event(Level::Error, "this device was removed from the network");
         }
     }
 
@@ -315,6 +328,12 @@ impl DeviceLog {
                 if change.event == "device_revoked" {
                     self.device_revoked();
                     continue;
+                }
+                if change.event == "membership_halted" {
+                    diagnostics::event(
+                        Level::Error,
+                        "membership is halted; run 'massrelay status' for the reason",
+                    );
                 }
                 let name = change
                     .peer

@@ -19,6 +19,9 @@
 //! - `run` is the foreground runtime. Its membership pass processes invite requests, stages and
 //!   settles the Add of a reserved invite, catches up and dispatches sealed replies, all through
 //!   the runtime's owner.
+//!   Its diagnostics go to the host's native log (`super::diagnostics`), in the foreground and
+//!   under a service manager alike; the connection audit stays in its own JSONL file.
+//! - `logs` prints the profile's recent diagnostics from that log, and follows it on request.
 //! - Every other command talks to the running runtime over its authenticated local control
 //!   channel; `status` and `peers` fall back to a read-only view when it is not running.
 //!
@@ -44,6 +47,7 @@ use crate::wire::{self, Service};
 
 use super::binding::{EndpointSecret, check_device_name};
 use super::codec::{Hash, hex, unhex};
+use super::diagnostics::{self, Level};
 use super::envelope::{InviteToken, SlotId};
 use super::mailbox::{
     AckOutcome, CreateOutcome, Mailbox, MailboxError, Pin, QueueAppend, QueueItem, ReadOutcome,
@@ -133,6 +137,12 @@ pub enum Command {
     },
     /// Show this device’s enrollment and runtime.
     Status,
+    /// Show this device’s recent diagnostics from the system log.
+    Logs {
+        /// Keep printing new diagnostics as they are written.
+        #[arg(long, short)]
+        follow: bool,
+    },
     /// List members and pairing decisions, by endpoint key and local alias.
     Peers {
         /// Show full endpoint IDs in the terminal.
@@ -230,16 +240,23 @@ pub async fn execute(state_dir: &Path, command: Command) -> Result<i32> {
             bind,
             sync_every,
         } => {
-            run(
+            diagnostics::start(state_dir);
+            let ran = run(
                 &dir,
                 shell,
                 log_file.unwrap_or_else(|| state_dir.join("connections.jsonl")),
                 bind,
                 sync_every,
             )
-            .await?
+            .await;
+            if let Err(error) = &ran {
+                // The caller prints the error on the console.
+                diagnostics::quiet(Level::Error, format!("the runtime failed: {error:#}"));
+            }
+            ran?
         }
         Command::Status => status(&dir).await?,
+        Command::Logs { follow } => return diagnostics::show(state_dir, follow),
         Command::Peers { full } => peers(&dir, full).await?,
         Command::Approve {
             peer,
@@ -924,9 +941,9 @@ async fn run(
     }
     let endpoint = match bind_device(preferred).await {
         Err(error) if preferred != bind => {
-            eprintln!(
-                "massrelay: could not reuse UDP port {}: {error}",
-                preferred.port()
+            diagnostics::event(
+                Level::Warning,
+                format!("could not reuse UDP port {}: {error}", preferred.port()),
             );
             bind_device(bind).await?
         }
@@ -953,36 +970,52 @@ async fn run(
     let runtime = Runtime::start_owned(config, mailbox, Clock::System, endpoint.clone(), owner)
         .await
         .map_err(|e| anyhow!("{e:?}"))?;
-    if let Some(log_file) = runtime.log_file() {
-        eprintln!("MassRelay event log at {}", log_file.display());
-    }
-    eprintln!(
-        "MassRelay runtime running as {}",
-        hex(endpoint.id().as_bytes())
+    diagnostics::quiet(
+        Level::Info,
+        format!(
+            "the runtime started (massrelay {})",
+            env!("CARGO_PKG_VERSION")
+        ),
     );
-    eprintln!("Press Ctrl-C to stop.");
+    // The console names this device and its audit file; the system log, which other accounts
+    // can read, does not.
+    if diagnostics::console() {
+        if let Some(log_file) = runtime.log_file() {
+            eprintln!("MassRelay event log at {}", log_file.display());
+        }
+        eprintln!(
+            "MassRelay runtime running as {}",
+            hex(endpoint.id().as_bytes())
+        );
+        eprintln!("Press Ctrl-C to stop.");
+    }
     let signal = crate::shutdown().await;
     let stopped = runtime.stop().await;
     if !stopped.aborted.is_empty() {
-        eprintln!(
-            "massrelay: stopped without waiting for: {:?}",
-            stopped.aborted
+        diagnostics::event(
+            Level::Warning,
+            format!("stopped without waiting for: {:?}", stopped.aborted),
         );
     }
     if stopped.native_workers > 0 {
-        eprintln!(
-            "massrelay: {} shell cleanup worker(s) still running",
-            stopped.native_workers
+        diagnostics::event(
+            Level::Warning,
+            format!(
+                "{} shell cleanup worker(s) still running",
+                stopped.native_workers
+            ),
         );
     }
     if !stopped.owner_released {
-        eprintln!(
-            "massrelay: a membership call or shell cleanup is still running; the profile stays \
-             owned until it finishes or this process exits"
+        diagnostics::event(
+            Level::Warning,
+            "a membership call or shell cleanup is still running; the profile stays owned \
+             until it finishes or this process exits",
         );
-    } else {
+    } else if diagnostics::console() {
         eprintln!("Stopped; the profile is released.");
     }
+    diagnostics::quiet(Level::Info, "the runtime stopped");
     signal?;
     Ok(())
 }

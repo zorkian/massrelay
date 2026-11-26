@@ -180,7 +180,9 @@ fn grouped_cli() -> clap::Command {
         ),
         (
             "Manage this device",
-            &["status", "install", "start", "restart", "stop", "run"],
+            &[
+                "status", "logs", "install", "start", "restart", "stop", "run",
+            ],
         ),
         (
             "Find and pair devices",

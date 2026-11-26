@@ -16,6 +16,7 @@ from pathlib import Path
 import pty
 import re
 import select
+import shutil
 import signal
 import socket
 import subprocess
@@ -514,6 +515,23 @@ def _exercise(binary, root, processes):
         assert connected & ended, "a logged session reached native service and disconnected"
         assert relay_locator not in log.read_text() and invite not in log.read_text()
         assert "LIVE_SHELL" not in log.read_text() and target not in log.read_text()
+    # Each device's diagnostics are in the system log under its own profile. That log is not
+    # private to this account, so it names no device, peer, credential, target or payload.
+    if Path("/run/systemd/journal/socket").exists() and shutil.which("journalctl"):
+        def diagnostics(state, last):
+            return eventually(
+                lambda: (text := cli(state, "logs").stdout).rstrip().endswith(last) and text,
+                f"{state} diagnostics end with {last!r}",
+            )
+
+        logs = {state: diagnostics(state, "the runtime stopped") for state in ["a", "b", "c"]}
+        # A started runtime, the second 'run' refused above, and the halt are all on record.
+        for recorded in ["the runtime started", "the runtime failed", "membership is halted"]:
+            assert recorded in logs["a"], logs["a"]
+        removed = "this device was removed from the network"
+        assert removed in logs["b"] and removed not in logs["a"] + logs["c"], logs
+        for secret in [a, b, key("c"), relay_locator, invite, target, "LIVE_SHELL", "alice"]:
+            assert secret not in "".join(logs.values()), secret
     print("Private discovery end to end passed")
 
 
