@@ -404,6 +404,17 @@ def _exercise(binary, root, processes):
     # loopback mailbox connection. Stopping the runtime wakes that call, ends the live shell
     # into it, releases the profile and exits cleanly; the runtime then starts again at once.
     shell, master, shell_pid = open_shell("b", "alice")
+    def shows_connection(state, direction, peer, service):
+        return any(
+            row.rsplit("\t", 1) in (
+                [f"{direction}\t{peer}\t{service}", "direct"],
+                [f"{direction}\t{peer}\t{service}", "via relay"],
+            )
+            for row in status(state).splitlines()
+        )
+
+    eventually(lambda: shows_connection("a", "inbound", "bob", "shell"), "inbound shell status")
+    eventually(lambda: shows_connection("b", "outbound", "alice", "shell"), "outbound shell status")
     os.kill(relay.pid, signal.SIGSTOP)
     try:
         time.sleep(3)  # at least two pass intervals: a membership call is now in flight
@@ -453,6 +464,7 @@ def _exercise(binary, root, processes):
     cut = cli("a", "revoke", "bob")
     assert "Cut off locally" in cut.stdout, cut
     assert session.wait(timeout=20) == 1, "the open session ended at the cutoff"
+    eventually(lambda: not shows_connection("a", "inbound", "bob", tcp_service), "cut connection gone")
     # A cut-off peer's dial is closed by the destination during the pairing exchange; the
     # dialer reports either the refusal or the lost stream, and never reaches the target.
     reached = echo_target.accepted
@@ -492,6 +504,9 @@ def _exercise(binary, root, processes):
         finish(process)
     stop(relay)
     assert "Runtime: not running" in status("a")
+    for name in ["a", "b", "c", "relay"]:
+        assert not any(line.lstrip().startswith('{"timestamp":')
+                       for line in (root / f"{name}.log").read_text().splitlines())
     for log in [root / "a" / "connections.jsonl", root / "laptop-events.jsonl"]:
         records = [json.loads(line) for line in log.read_text().splitlines()]
         connected = {record["session"] for record in records if record["event"] == "connected"}

@@ -234,8 +234,9 @@ pub struct StatusView {
     pub endpoint: String,
     /// Read from the running owner (`true`) or without one (`false`).
     pub running: bool,
-    /// Registered authorizations and sessions (running owner only).
-    pub live_sessions: Option<usize>,
+    /// Established service connections (running owner only).
+    #[serde(default)]
+    pub connections: Vec<audit::ConnectionView>,
     pub peers: Vec<PeerView>,
     /// Services enabled by default for every paired peer.
     pub defaults: Vec<Service>,
@@ -287,7 +288,6 @@ fn view(
     roster: &[EndpointKey],
     st: &PairingState,
     running: bool,
-    live_sessions: Option<usize>,
     last_sync: Option<String>,
     halt: Option<String>,
 ) -> StatusView {
@@ -339,7 +339,7 @@ fn view(
     StatusView {
         endpoint: hex(endpoint),
         running,
-        live_sessions,
+        connections: vec![],
         peers,
         defaults,
         grants,
@@ -357,7 +357,7 @@ pub fn offline_status<M: Mailbox>(device: &Device<M>) -> Result<StatusView, Pair
     let st = pairing::read_state(device)?;
     let roster = device.roster().unwrap_or_default();
     let halt = state.halt.map(|h| format!("{h:?}"));
-    Ok(view(&state.endpoint, &roster, &st, false, None, None, halt))
+    Ok(view(&state.endpoint, &roster, &st, false, None, halt))
 }
 
 /// An endpoint key written as 64 hex digits or in Iroh's own form.
@@ -815,10 +815,10 @@ fn manage<M: Mailbox + Send + Sync + 'static>(
                     &roster,
                     &st,
                     true,
-                    Some(node.live_sessions()),
                     last,
                     node.halt().map_err(err)?,
                 );
+                v.connections = node.log().connections();
                 v.exposures = node
                     .exposures()
                     .into_iter()
@@ -1048,7 +1048,7 @@ async fn outbound<M: Mailbox + Send + Sync + 'static>(
         Service::Shell => ControlReply::Shell,
         _ => ControlReply::Connected,
     };
-    track.connected();
+    track.connected(Some(&stream.conn));
     let max_frame = stream.max_frame();
     let ServiceStream {
         conn,

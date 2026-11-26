@@ -1048,10 +1048,14 @@ async fn status(dir: &Path) -> Result<()> {
         return Ok(());
     }
     let view = current_view(dir).await?;
-    match view.live_sessions {
-        Some(live) => println!("Runtime: running, {live} live authorizations and sessions"),
-        None => println!("Runtime: not running"),
-    }
+    println!(
+        "Runtime: {}",
+        if view.running {
+            "running"
+        } else {
+            "not running"
+        }
+    );
     let members = view.peers.iter().filter(|p| p.member).count() + 1;
     match &view.halt {
         Some(h) => println!("Membership: halted: {}", crate::visible(h)),
@@ -1077,6 +1081,43 @@ async fn status(dir: &Path) -> Result<()> {
     }
     for (key, service) in &view.exclusions {
         println!("Excluded from default: {service} for {key}");
+    }
+    if view.running {
+        println!("Active connections: {}", view.connections.len());
+        if !view.connections.is_empty() {
+            use super::audit::Route;
+            use crate::connection_log::Direction;
+
+            let mut rows = vec![["DIRECTION", "PEER", "SERVICE", "ROUTE"].map(String::from)];
+            rows.extend(view.connections.iter().map(|connection| {
+                let peer = view
+                    .peers
+                    .iter()
+                    .find(|peer| peer.key == connection.key)
+                    .and_then(|peer| peer.alias.as_deref())
+                    .unwrap_or(&connection.key);
+                [
+                    match connection.direction {
+                        Direction::Inbound => "inbound",
+                        Direction::Outbound => "outbound",
+                    }
+                    .into(),
+                    crate::visible(peer),
+                    connection.service.to_string(),
+                    match connection.route {
+                        Route::Direct => "direct",
+                        Route::Relayed => "via relay",
+                        Route::Unknown => "unknown",
+                    }
+                    .into(),
+                ]
+            }));
+            crate::print_table(&rows, io::stdout().is_terminal());
+        }
+        println!(
+            "Temporary exposures: {} (see 'massrelay list')",
+            view.exposures.len()
+        );
     }
     if let Some(last) = &view.last_sync {
         println!("Last membership pass: {}", crate::visible(last));
@@ -1308,6 +1349,10 @@ async fn list(dir: &Path, full: bool) -> Result<()> {
     }
     for (key, service) in &view.exclusions {
         append(*service, Some(key), "excluded", None);
+    }
+    if terminal && rows.len() == 1 {
+        println!("No services enabled or exposed on this device.");
+        return Ok(());
     }
     crate::print_table(&rows, terminal);
     Ok(())

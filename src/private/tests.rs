@@ -4266,6 +4266,10 @@ mod service {
                 b"\x01opaque to the relay"
             );
             assert_eq!(events.recv().await, Some("accepted"));
+            let connections = destination.log().connections();
+            assert_eq!(connections.len(), 1);
+            assert_eq!(connections[0].service, service);
+            assert_eq!(connections[0].route, crate::private::audit::Route::Relayed);
             Ok::<_, anyhow::Error>(())
         })
         .await??;

@@ -48,12 +48,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use anyhow::Result;
-use iroh::EndpointId;
+use iroh::{EndpointId, TransportAddr, endpoint::Connection};
+use serde::{Deserialize, Serialize};
 
 use crate::connection_log::{Audit, ConnectionLog, Direction, Session};
 use crate::wire::{GrantRule, Service};
 
 use super::binding::EndpointKey;
+use super::codec::hex;
 use super::mailbox::Mailbox;
 use super::membership::{Advance, Stop};
 use super::pairing::{Decision, PairError, PairingState, Refusal};
@@ -79,11 +81,11 @@ pub struct DeviceLog {
     seen: Mutex<Option<Snapshot>>,
     reachable: Mutex<Option<bool>>,
     revoked: AtomicBool,
+    active: Mutex<BTreeMap<u64, ActiveConnection>>,
 }
 
 impl DeviceLog {
-    /// Append to `path` (created with owner-only permissions), mirrored to
-    /// standard error.
+    /// Append to `path` (created with owner-only permissions).
     pub fn open(path: &Path) -> Result<Self> {
         Ok(Self::with(
             ConnectionLog::open(Some(path))?,
@@ -104,6 +106,7 @@ impl DeviceLog {
             seen: Mutex::new(None),
             reachable: Mutex::new(None),
             revoked: AtomicBool::new(false),
+            active: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -267,14 +270,38 @@ impl DeviceLog {
     /// A session for a connection a peer opened to this device.
     pub fn inbound(&self, peer: EndpointId) -> Tracked<'_> {
         let name = self.alias(peer.as_bytes());
-        Tracked::new(self.log.session(Direction::Inbound, Some(peer), name))
+        Tracked::new(self, self.log.session(Direction::Inbound, Some(peer), name))
     }
 
     /// A session for a connection a local command opens to a peer.
     pub fn outbound(&self, service: Service) -> Tracked<'_> {
         let mut session = self.log.session(Direction::Outbound, None, None);
         session.set_service(service);
-        Tracked::new(session)
+        Tracked::new(self, session)
+    }
+
+    pub fn connections(&self) -> Vec<ConnectionView> {
+        lock(&self.active)
+            .values()
+            .filter(|active| active.connection.close_reason().is_none())
+            .map(|active| {
+                let paths = active.connection.paths();
+                let route = match paths.iter().find(|path| path.is_selected()) {
+                    Some(path) => match path.remote_addr() {
+                        TransportAddr::Ip(_) => Route::Direct,
+                        TransportAddr::Relay(_) => Route::Relayed,
+                        _ => Route::Unknown,
+                    },
+                    None => Route::Unknown,
+                };
+                ConnectionView {
+                    key: hex(active.connection.remote_id().as_bytes()),
+                    direction: active.direction,
+                    service: active.service,
+                    route,
+                }
+            })
+            .collect()
     }
 
     /// Diff a fresh snapshot against the last one and log the changes.
@@ -521,10 +548,32 @@ fn changes(own: Option<&EndpointKey>, before: &Snapshot, after: &Snapshot) -> Ve
 
 // ----------------------------------------------------------------- sessions
 
+struct ActiveConnection {
+    connection: Connection,
+    direction: Direction,
+    service: Service,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectionView {
+    pub key: String,
+    pub direction: Direction,
+    pub service: Service,
+    pub route: Route,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Route {
+    Direct,
+    Relayed,
+    Unknown,
+}
+
 /// One logged connection. Shared by reference across the connection's
 /// futures; the first `end` is recorded, and a session dropped without one
 /// ends as `interrupted`.
 pub struct Tracked<'a> {
+    log: &'a DeviceLog,
     inner: Mutex<TrackedInner<'a>>,
 }
 
@@ -536,8 +585,9 @@ struct TrackedInner<'a> {
 }
 
 impl<'a> Tracked<'a> {
-    fn new(session: Session<'a>) -> Self {
+    fn new(log: &'a DeviceLog, session: Session<'a>) -> Self {
         Self {
+            log,
             inner: Mutex::new(TrackedInner {
                 session,
                 ended: false,
@@ -559,9 +609,21 @@ impl<'a> Tracked<'a> {
     }
 
     /// The service is running.
-    pub fn connected(&self) {
+    pub fn connected(&self, connection: Option<&Connection>) {
         let mut t = lock(&self.inner);
         if !t.ended {
+            if let Some(connection) = connection
+                && let Some((id, direction, service)) = t.session.service_details()
+            {
+                lock(&self.log.active).insert(
+                    id,
+                    ActiveConnection {
+                        connection: connection.clone(),
+                        direction,
+                        service,
+                    },
+                );
+            }
             t.session.connected();
         }
     }
@@ -575,6 +637,9 @@ impl<'a> Tracked<'a> {
         let mut t = lock(&self.inner);
         if !t.ended {
             t.ended = true;
+            if let Some((id, _, _)) = t.session.service_details() {
+                lock(&self.log.active).remove(&id);
+            }
             t.session.end(reason, exit_code);
         }
     }
@@ -587,6 +652,12 @@ impl<'a> Tracked<'a> {
             other => ended_reason(other),
         };
         self.end(reason, code);
+    }
+}
+
+impl Drop for Tracked<'_> {
+    fn drop(&mut self) {
+        self.end("interrupted", None);
     }
 }
 
@@ -910,10 +981,10 @@ mod tests {
         {
             let t = log.inbound(EndpointId::from_bytes(&bob).unwrap());
             t.service(Service::Shell);
-            t.connected();
+            t.connected(None);
             t.end_served(&Ended::ShellExit(3));
             t.end("interrupted", None);
-            t.connected();
+            t.connected(None);
         }
         {
             let t = log.outbound(tcp(22));

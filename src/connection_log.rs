@@ -18,11 +18,9 @@ use crate::wire::{Member, Service};
 pub struct ConnectionLog {
     file: Option<Mutex<File>>,
     counter: AtomicU64,
-    /// Mirror each event to standard error (the supervisor log).
-    mirror: bool,
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
     Inbound,
@@ -105,7 +103,6 @@ impl ConnectionLog {
         Ok(Self {
             file,
             counter: AtomicU64::new(1),
-            mirror: true,
         })
     }
 
@@ -114,7 +111,6 @@ impl ConnectionLog {
         Self {
             file: None,
             counter: AtomicU64::new(1),
-            mirror: false,
         }
     }
 
@@ -164,9 +160,9 @@ impl ConnectionLog {
     }
 
     fn write(&self, event: impl Serialize) {
-        if self.file.is_none() && !self.mirror {
+        let Some(file) = &self.file else {
             return;
-        }
+        };
         let mut line = match serde_json::to_vec(&event) {
             Ok(line) => line,
             Err(error) => {
@@ -175,24 +171,13 @@ impl ConnectionLog {
             }
         };
         line.push(b'\n');
-        if let Some(file) = &self.file {
-            let result = file
-                .lock()
-                .map_err(|_| anyhow::anyhow!("event log lock poisoned"))
-                .and_then(|mut file| file.write_all(&line).map_err(Into::into));
-            if let Err(error) = result {
-                eprintln!("massrelay: could not write event log: {error:#}");
-            }
+        let result = file
+            .lock()
+            .map_err(|_| anyhow::anyhow!("event log lock poisoned"))
+            .and_then(|mut file| file.write_all(&line).map_err(Into::into));
+        if let Err(error) = result {
+            eprintln!("massrelay: could not write event log: {error:#}");
         }
-        if !self.mirror {
-            return;
-        }
-        // Keep events visible in the supervisor log even with a separate event file.
-        // Test builds go through the harness's captured stderr instead.
-        #[cfg(test)]
-        eprint!("{}", String::from_utf8_lossy(&line));
-        #[cfg(not(test))]
-        let _ = std::io::stderr().lock().write_all(&line);
     }
 }
 
@@ -215,6 +200,10 @@ impl<'a> Event<'a> {
 }
 
 impl Session<'_> {
+    pub(crate) fn service_details(&self) -> Option<(u64, Direction, Service)> {
+        Some((self.id, self.direction, self.service?))
+    }
+
     pub fn identify(&mut self, id: EndpointId, name: Option<String>) {
         self.peer_id = Some(id);
         self.peer_name = name;

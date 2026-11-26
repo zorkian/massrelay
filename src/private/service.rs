@@ -703,7 +703,7 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
         let outcome = tokio::select! {
             biased;
             why = session.done() => Outcome::Over(why),
-            ended = self.serve_service(&session, &req, rx, tx, &mut teardown, track) => Outcome::Served(ended),
+            ended = self.serve_service(&session, &req, rx, tx, &mut teardown, || track.connected(Some(conn))) => Outcome::Served(ended),
         };
         // The serving future is dropped here: copies stop, sockets close and
         // a shell's PTY is dropped (its reaper wakes, kills and reaps).
@@ -724,7 +724,7 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
         rx: &mut RecvStream,
         tx: &mut SendStream,
         teardown: &mut Option<pty::Teardown>,
-        track: &Tracked<'_>,
+        connected: impl FnOnce(),
     ) -> Ended {
         let target = session.target.as_deref();
         match req.service {
@@ -738,7 +738,7 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
                 {
                     Ok(Ok(mut pty)) => {
                         *teardown = Some(pty.teardown());
-                        track.connected();
+                        connected();
                         match serve_shell(session, &mut pty, rx, tx).await {
                             Ok(code) => {
                                 let _ = tx.finish();
@@ -774,7 +774,7 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
                 if wire::send(&mut *tx, ServiceReply::Ready).await.is_err() {
                     return Ended::PeerDisconnected;
                 }
-                track.connected();
+                connected();
                 let mut target = session.guard(stream);
                 let result = tcp::bridge_with(rx, tx, &mut target, tcp::MAX_FRAME).await;
                 finish_tunnel(result, tx, tcp::MAX_FRAME).await
@@ -791,7 +791,7 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
                 if wire::send(&mut *tx, ServiceReply::Ready).await.is_err() {
                     return Ended::PeerDisconnected;
                 }
-                track.connected();
+                connected();
                 let ended = || Broken::Denied(WireRefusal::PairingRequired);
                 // Each association's bind, connect and first send, and every
                 // later datagram, are handed to the OS under the guard.

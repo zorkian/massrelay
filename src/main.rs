@@ -328,12 +328,8 @@ impl ServiceAction {
 
     fn record(self, path: &Path, result: &Result<()>) {
         use connection_log::{Audit, ConnectionLog};
-        let log = ConnectionLog::open(Some(path)).or_else(|error| {
-            eprintln!("massrelay: could not open service audit log: {error:#}");
-            ConnectionLog::open(None)
-        });
-        if let Ok(log) = log {
-            log.audit(
+        match ConnectionLog::open(Some(path)) {
+            Ok(log) => log.audit(
                 "service_control",
                 Audit {
                     operation: self.name(),
@@ -342,7 +338,8 @@ impl ServiceAction {
                     ..Audit::default()
                 },
                 None,
-            );
+            ),
+            Err(error) => eprintln!("massrelay: could not open service audit log: {error:#}"),
         }
     }
 }

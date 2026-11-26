@@ -98,11 +98,17 @@ An exposure lasts while its command runs. Declining, revoking, or disabling the 
 
 On macOS and Linux with systemd, run `massrelay install` after enrollment to set up the user service. Use `massrelay start`, `restart`, or `stop` with the same state directory. On Windows, run `massrelay run` in a terminal or under your supervisor.
 
-Linux uses the `massrelay-client.service` systemd user unit for the default profile. macOS uses `com.massrelay.client` and writes its service log to `~/Library/Logs/MassRelay.log`. The installer prints the paths. In the foreground, use `massrelay run --log-file PATH` to choose a connection event log.
+Linux uses the `massrelay-client.service` systemd user unit for the default profile. macOS uses `com.massrelay.client` and writes its service log to `~/Library/Logs/MassRelay.log`. The installer prints the paths. The connection audit file is `connections.jsonl` by default. It contains one JSON object per line. `massrelay run --log-file PATH` selects a different audit file. Console and supervisor messages use plain text.
+
+## Inspect a running device
+
+Run `massrelay status` in another terminal to see active inbound and outbound shells and port forwards. Each row shows the peer, service, and current route. Run `massrelay list` to see the shell and port permissions on this device, including defaults, exclusions, and temporary exposures with their targets. `massrelay peers` shows membership, approvals, and pairing state.
 
 ## How connections work
 
-The relay forwards encrypted connections when a direct route is unavailable. It can see endpoint and traffic metadata needed to route data, including IP addresses, ciphertext sizes, and timing. Devices verify and maintain their own encrypted membership history. The relay stores opaque messages so offline devices can catch up. Shell and port traffic remains end-to-end encrypted on either route.
+The forwarding relay can see the endpoint IDs it forwards between, their relay-facing IP addresses, and the size and timing of encrypted packets. Shell and port traffic remains end-to-end encrypted on either route. The forwarding relay cannot read the service type, destination service port, or payload.
+
+The membership mailbox is a service operated by the relay. It can distinguish membership and invite operations, and sees access credentials, opaque storage handles, and ciphertext sizes and timing. Devices encrypt and verify the membership and invite contents. The mailbox has no plaintext roster or device names.
 
 A cached, reachable direct path can keep working through a relay outage, including after restart when the same UDP port can be reused. Keep the profile directory to retain the device's keys, approvals, and grants.
 
