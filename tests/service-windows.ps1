@@ -208,6 +208,19 @@ try {
     & icacls.exe $audit /remove:g '*S-1-5-32-545' | Out-Null
     Assert ($LASTEXITCODE -eq 0) 'Could not restore the private audit log permissions.'
 
+    $auditTarget = Join-Path $state 'audit-target.jsonl'
+    Move-Item -LiteralPath $audit -Destination $auditTarget
+    $auditHash = (Get-FileHash -LiteralPath $auditTarget).Hash
+    try {
+        New-Item -ItemType SymbolicLink -Path $audit -Target $auditTarget | Out-Null
+        $refused = Invoke-Device @('start')
+        Assert ($refused.ExitCode -ne 0) 'A symlink at the audit path was accepted.'
+        Assert ((Get-FileHash -LiteralPath $auditTarget).Hash -eq $auditHash) 'The service wrote through an audit symlink.'
+    } finally {
+        [IO.File]::Delete($audit)
+        Move-Item -LiteralPath $auditTarget -Destination $audit
+    }
+
     foreach ($attempt in 1..2) {
         $started = Invoke-Device @('start')
         Assert ($started.ExitCode -eq 0) "start failed: $($started.Error)"
