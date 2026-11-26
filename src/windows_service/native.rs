@@ -1,0 +1,1258 @@
+//! The Win32 side of the Windows background service: the Service Control Manager, the local
+//! security policy, file permissions, and the service control protocol.
+
+use std::{
+    env,
+    ffi::{OsStr, c_void},
+    fs::OpenOptions,
+    io::{self, BufRead as _, Read as _},
+    os::windows::{
+        ffi::OsStrExt as _,
+        io::{AsRawHandle as _, IntoRawHandle as _},
+    },
+    path::{Path, PathBuf},
+    ptr::{null, null_mut},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use tokio::sync::Notify;
+use windows_sys::Win32::{
+    Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED,
+        ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_LOGON_FAILURE,
+        ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_CANNOT_ACCEPT_CTRL,
+        ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_LOGON_FAILED, ERROR_SERVICE_NOT_ACTIVE,
+        ERROR_SERVICE_SPECIFIC_ERROR, GetLastError, LocalFree, NO_ERROR, NTSTATUS,
+        STATUS_OBJECT_NAME_NOT_FOUND,
+    },
+    Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
+        Authentication::Identity::{
+            LSA_HANDLE, LSA_OBJECT_ATTRIBUTES, LSA_UNICODE_STRING, LsaAddAccountRights, LsaClose,
+            LsaEnumerateAccountRights, LsaFreeMemory, LsaNtStatusToWinError, LsaOpenPolicy,
+            LsaRemoveAccountRights, POLICY_CREATE_ACCOUNT, POLICY_LOOKUP_NAMES,
+        },
+        Authorization::{
+            ConvertSidToStringSidW, ConvertStringSidToSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+        },
+        CheckTokenMembership, CreateWellKnownSid, DACL_SECURITY_INFORMATION, GetAce,
+        GetTokenInformation, LOGON32_LOGON_SERVICE, LOGON32_PROVIDER_DEFAULT, LogonUserW,
+        LookupAccountSidW, OWNER_SECURITY_INFORMATION, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        WinBuiltinAdministratorsSid,
+    },
+    System::{
+        Console::{
+            ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, GetConsoleMode,
+            ReadConsoleW, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode, SetStdHandle,
+        },
+        Services::{
+            ChangeServiceConfig2W, ChangeServiceConfigW, CloseServiceHandle, ControlService,
+            CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW, QUERY_SERVICE_CONFIGW,
+            QueryServiceConfigW, QueryServiceStatus, RegisterServiceCtrlHandlerExW, SC_ACTION,
+            SC_ACTION_RESTART, SC_HANDLE, SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE,
+            SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
+            SERVICE_CONFIG_DESCRIPTION, SERVICE_CONFIG_FAILURE_ACTIONS,
+            SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, SERVICE_CONTROL_INTERROGATE,
+            SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_DESCRIPTIONW,
+            SERVICE_ERROR_NORMAL, SERVICE_FAILURE_ACTIONS_FLAG, SERVICE_FAILURE_ACTIONSW,
+            SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING,
+            SERVICE_STATUS, SERVICE_STOP, SERVICE_STOP_PENDING, SERVICE_STOPPED,
+            SERVICE_TABLE_ENTRYW, SERVICE_USER_DEFINED_CONTROL, SERVICE_WIN32_OWN_PROCESS,
+            SetServiceStatus, StartServiceCtrlDispatcherW, StartServiceW,
+        },
+        SystemInformation::GetSystemDirectoryW,
+        Threading::{GetCurrentProcess, OpenProcessToken},
+    },
+};
+
+use super::{Ace, AceKind, InstallOptions, Role, Security};
+use crate::{ServiceAction, private::cli, visible};
+
+const ELEVATE: &str =
+    "Windows lets only an elevated PowerShell (Run as administrator) manage services";
+const SERVICE_LOGON_RIGHT: &str = "SeServiceLogonRight";
+const EVENT_LOG: &str = "connections.jsonl";
+const SERVICE_LOG: &str = "service.log";
+const POLL: Duration = Duration::from_millis(200);
+const START_WAIT: Duration = Duration::from_secs(60);
+/// Longer than the runtime's own ordered stop, which is bounded in several steps.
+const STOP_WAIT: Duration = Duration::from_secs(90);
+/// What the service tells the service manager to expect of a pending start or stop.
+const PENDING_HINT_MS: u32 = 60_000;
+const INHERIT_ONLY: u8 = 0x8;
+/// This service's own control code: stop, and have Windows start the service again. The
+/// restart is then Windows' to finish, so it survives the command that asked for it, which
+/// dies with its shell when that shell is one this service serves.
+const CONTROL_RESTART: u32 = 128;
+/// What the service exits with for a requested restart. Windows restarts a service that
+/// stops with an error.
+const RESTART_EXIT: u32 = 2;
+
+// ------------------------------------------------------------------ install
+
+pub fn install(dir: &Path, options: InstallOptions) -> Result<()> {
+    cli::check_enrolled(dir)?;
+    let dir = dir
+        .canonicalize()
+        .context("resolve the device state directory")?;
+    let dir = super::plain(&dir)?;
+    let binary = env::current_exe()
+        .and_then(|path| path.canonicalize())
+        .context("find the running MassRelay binary")?;
+    let binary = super::plain(&binary)?;
+    let shell = match &options.shell {
+        Some(shell) => {
+            let path = shell
+                .canonicalize()
+                .with_context(|| format!("find the shell {}", shell.display()))?;
+            ensure!(path.is_file(), "the shell {} is not a file", path.display());
+            super::plain(&path)?
+        }
+        None => powershell()?,
+    };
+
+    // The service runs as the account running this command, which must be the one that
+    // controls the profile: an elevation that switched accounts is refused here.
+    let account = Account::current()?;
+    ensure_trusted(&binary, Role::Program, &account)?;
+    ensure_trusted(&shell, Role::Program, &account)?;
+    ensure_trusted(&dir, Role::Holder, &account)?;
+    check(&Path::new(&dir).join(cli::DIR_NAME), Role::Holder, &account)?;
+
+    let name = super::service_name(&dir);
+    let command = super::command_line(&binary, &dir, &name, &shell)?;
+    let manager = manager(SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE)?;
+    ensure!(
+        options.allow_administrator || !is_administrator()?,
+        "{} is an administrator, and Windows runs an administrator's service with full \
+         administrator rights: a peer you grant the shell would get an elevated shell, unlike \
+         'massrelay run' in an ordinary terminal. To accept that, run 'massrelay install \
+         --allow-administrator'",
+        account.name()
+    );
+
+    let wide_name = wide(&name)?;
+    let existing = open(&manager, &wide_name, SERVICE_ALL_ACCESS)?;
+    let previous = match &existing {
+        Some(service) => {
+            let config = config(service)?;
+            ensure!(
+                super::is_profile_service(&config.command, &dir, &name),
+                "another service already uses the name {name}"
+            );
+            let running = state(service)?.dwCurrentState != SERVICE_STOPPED;
+            Some((config, running))
+        }
+        None => None,
+    };
+    if !previous.as_ref().is_some_and(|(_, running)| *running) {
+        let _lock =
+            cli::claim_owner(Path::new(&dir)).context("stop the foreground massrelay run first")?;
+    }
+
+    let password = password(&account, options.password_stdin)?;
+    let policy = Policy::open()?;
+    let granted = !policy.may_log_on_as_service(&account)?;
+    if granted {
+        policy
+            .set_service_logon(&account, true)
+            .context("allow the account to log on as a service")?;
+    }
+
+    let account_name = wide(account.name())?;
+    let command = wide(&command)?;
+    let mut description = wide(format!(
+        "Keeps the MassRelay device in {dir} reachable as {}. Managed by 'massrelay install'.",
+        account.name()
+    ))?;
+    let mut created = None;
+    let mut changed = false;
+    let applied = (|| {
+        // Checked before the service manager is touched, so a mistyped password cannot break
+        // a service that works.
+        check_logon(&account, &password)?;
+        let service = match &existing {
+            Some(service) => {
+                changed = true;
+                let logon = Some((account_name.as_slice(), &password));
+                reconfigure(service, SERVICE_AUTO_START, &command, logon)?;
+                service
+            }
+            None => &*created.insert(create(
+                &manager,
+                &wide_name,
+                &command,
+                &account_name,
+                &password,
+            )?),
+        };
+        annotate(service, &mut description)?;
+        // A running service takes up its new registration by restarting.
+        stop(service, CONTROL_RESTART)?;
+        start(service)
+    })();
+    drop(password);
+
+    if let Err(error) = applied {
+        let restored = (|| {
+            if let Some(service) = &created {
+                let _ = stop(service, SERVICE_CONTROL_STOP);
+                // SAFETY: the handle is an open service handle with delete access.
+                ensure!(
+                    unsafe { DeleteService(service.0) } != 0,
+                    "remove the new service: {}",
+                    io::Error::last_os_error()
+                );
+            } else if let (true, Some(service), Some((config, running))) =
+                (changed, &existing, &previous)
+            {
+                // The account and its (now verified) password stay as stored.
+                reconfigure(service, config.start, &wide(&config.command)?, None)?;
+                if *running {
+                    start(service)?;
+                }
+            }
+            if granted {
+                policy.set_service_logon(&account, false)?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })();
+        return Err(match restored {
+            Ok(()) => error,
+            Err(restore) => error.context(format!(
+                "could not restore the previous service state: {restore:#}"
+            )),
+        });
+    }
+
+    println!(
+        "Started {name} as {}; Windows starts it at boot, before sign-in",
+        account.name()
+    );
+    if granted {
+        println!("Allowed {} to log on as a service", account.name());
+    }
+    println!("Shell           {shell}");
+    println!(
+        "Event log       {}",
+        Path::new(&dir).join(EVENT_LOG).display()
+    );
+    println!(
+        "Service log     {}",
+        Path::new(&dir).join(SERVICE_LOG).display()
+    );
+    Ok(())
+}
+
+pub fn control(dir: &Path, action: ServiceAction) -> Result<()> {
+    let dir = dir
+        .canonicalize()
+        .context("resolve the device state directory")?;
+    let dir = super::plain(&dir)?;
+    let name = super::service_name(&dir);
+    let result = (|| {
+        let manager = manager(SC_MANAGER_CONNECT)?;
+        let access = SERVICE_QUERY_STATUS
+            | match action {
+                ServiceAction::Start => SERVICE_START,
+                ServiceAction::Stop => SERVICE_STOP,
+                ServiceAction::Restart => SERVICE_START | SERVICE_USER_DEFINED_CONTROL,
+            };
+        let Some(service) = open(&manager, &wide(&name)?, access)? else {
+            bail!("no installed service for this profile. Run massrelay install first");
+        };
+        match action {
+            ServiceAction::Stop => stop(&service, SERVICE_CONTROL_STOP),
+            ServiceAction::Restart => {
+                stop(&service, CONTROL_RESTART)?;
+                // Sooner than Windows would by itself.
+                start(&service)
+            }
+            ServiceAction::Start => {
+                if state(&service)?.dwCurrentState == SERVICE_STOPPED {
+                    let _lock = cli::claim_owner(Path::new(&dir))
+                        .context("stop the foreground massrelay run first")?;
+                }
+                start(&service)
+            }
+        }
+    })();
+    action.record(&Path::new(&dir).join(EVENT_LOG), &result);
+    result?;
+    println!("{} {name}", action.completed());
+    Ok(())
+}
+
+/// Windows PowerShell, by its full path in the system directory.
+fn powershell() -> Result<String> {
+    let mut buffer = [0u16; 260];
+    // SAFETY: the buffer is writable for the length given.
+    let len = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    ensure!(
+        len > 0 && len < buffer.len(),
+        "cannot find the Windows system directory"
+    );
+    let path = PathBuf::from(String::from_utf16_lossy(&buffer[..len]))
+        .join(r"WindowsPowerShell\v1.0\powershell.exe");
+    ensure!(
+        path.is_file(),
+        "Windows PowerShell is not at {}; choose a shell with --shell",
+        path.display()
+    );
+    super::plain(&path)
+}
+
+// ------------------------------------------------------------------ account
+
+/// The account running this command.
+struct Account {
+    /// A `TOKEN_USER`, whose SID pointer points into this same buffer.
+    token_user: Vec<u64>,
+    sid: String,
+    user: String,
+    domain: String,
+}
+
+impl Account {
+    fn current() -> Result<Self> {
+        let mut token = null_mut();
+        // SAFETY: the pseudo-handle of this process is always valid; `token` receives a
+        // handle that is closed below.
+        ensure!(
+            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } != 0,
+            "read this account's identity: {}",
+            io::Error::last_os_error()
+        );
+        let mut needed = 0u32;
+        // SAFETY: a size query; nothing is written but `needed`.
+        unsafe { GetTokenInformation(token, TokenUser, null_mut(), 0, &mut needed) };
+        // u64 elements keep the structure aligned.
+        let mut buffer = vec![0u64; (needed as usize).div_ceil(8).max(1)];
+        // SAFETY: the buffer is writable for at least `needed` bytes.
+        let read = unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        };
+        let error = last_error();
+        // SAFETY: `token` was opened above and is not used again.
+        unsafe { CloseHandle(token) };
+        if read == 0 {
+            return Err(os_error(error).context("read this account's identity"));
+        }
+        let mut account = Self {
+            token_user: buffer,
+            sid: String::new(),
+            user: String::new(),
+            domain: String::new(),
+        };
+        account.sid = sid_text(account.psid())?;
+        (account.user, account.domain) = lookup(account.psid())?;
+        Ok(account)
+    }
+
+    fn psid(&self) -> PSID {
+        // SAFETY: the buffer holds the TOKEN_USER that GetTokenInformation wrote, and lives
+        // as long as `self`.
+        unsafe { (*self.token_user.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+    }
+
+    fn name(&self) -> String {
+        format!("{}\\{}", self.domain, self.user)
+    }
+}
+
+/// The account and domain names of a SID.
+fn lookup(sid: PSID) -> Result<(String, String)> {
+    let (mut name, mut domain) = ([0u16; 257], [0u16; 257]);
+    let (mut name_len, mut domain_len) = (name.len() as u32, domain.len() as u32);
+    let mut kind = 0;
+    // SAFETY: `sid` is a valid SID and both buffers are writable for the lengths given.
+    let found = unsafe {
+        LookupAccountSidW(
+            null(),
+            sid,
+            name.as_mut_ptr(),
+            &mut name_len,
+            domain.as_mut_ptr(),
+            &mut domain_len,
+            &mut kind,
+        )
+    };
+    ensure!(
+        found != 0,
+        "find the account's name: {}",
+        io::Error::last_os_error()
+    );
+    Ok((
+        String::from_utf16_lossy(&name[..name_len as usize]),
+        String::from_utf16_lossy(&domain[..domain_len as usize]),
+    ))
+}
+
+fn sid_text(sid: PSID) -> Result<String> {
+    let mut out = null_mut();
+    // SAFETY: `sid` is a valid SID; `out` receives a string freed below.
+    ensure!(
+        unsafe { ConvertSidToStringSidW(sid, &mut out) } != 0,
+        "read a security identifier: {}",
+        io::Error::last_os_error()
+    );
+    // SAFETY: `out` is the NUL-terminated string just allocated for us.
+    let sid = unsafe { text(out) };
+    // SAFETY: `out` was allocated by ConvertSidToStringSidW and is not used again.
+    unsafe { LocalFree(out.cast()) };
+    Ok(sid)
+}
+
+/// A SID with its account name, for a message.
+fn describe(sid: &str) -> String {
+    if sid.is_empty() {
+        return "An access entry of an unrecognized kind".into();
+    }
+    let named = (|| {
+        let wide = wide(sid).ok()?;
+        let mut psid = null_mut();
+        // SAFETY: `wide` is NUL-terminated; `psid` receives a SID freed below.
+        if unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut psid) } == 0 {
+            return None;
+        }
+        let found = lookup(psid).ok();
+        // SAFETY: `psid` was allocated by ConvertStringSidToSidW and is not used again.
+        unsafe { LocalFree(psid) };
+        found
+    })();
+    match named {
+        Some((user, domain)) if !domain.is_empty() => format!("{domain}\\{user} ({sid})"),
+        Some((user, _)) => format!("{user} ({sid})"),
+        None => sid.to_owned(),
+    }
+}
+
+/// Whether this process holds the machine's administrator rights.
+fn is_administrator() -> Result<bool> {
+    // SECURITY_MAX_SID_SIZE is 68 bytes; u32 elements keep the SID aligned.
+    let mut sid = [0u32; 17];
+    let mut size = size_of_val(&sid) as u32;
+    // SAFETY: the buffer is writable for `size` bytes.
+    ensure!(
+        unsafe {
+            CreateWellKnownSid(
+                WinBuiltinAdministratorsSid,
+                null_mut(),
+                sid.as_mut_ptr().cast(),
+                &mut size,
+            )
+        } != 0,
+        "name the Administrators group: {}",
+        io::Error::last_os_error()
+    );
+    let mut member = 0;
+    // SAFETY: a null token checks this thread's own; `sid` is the SID built above.
+    ensure!(
+        unsafe { CheckTokenMembership(null_mut(), sid.as_mut_ptr().cast(), &mut member) } != 0,
+        "check for administrator rights: {}",
+        io::Error::last_os_error()
+    );
+    Ok(member != 0)
+}
+
+// -------------------------------------------------------------- permissions
+
+/// Refuse `path` unless only the account and the machine's administrators control it and
+/// every directory above it.
+fn ensure_trusted(path: &str, leaf: Role, account: &Account) -> Result<()> {
+    for (depth, part) in Path::new(path).ancestors().enumerate() {
+        let role = match (depth, leaf) {
+            (0, role) => role,
+            (1, Role::Program) => Role::Holder,
+            _ => Role::Ancestor,
+        };
+        check(part, role, account)?;
+    }
+    Ok(())
+}
+
+fn check(path: &Path, role: Role, account: &Account) -> Result<()> {
+    if let Some(sid) = super::untrusted(&security(path)?, role, &account.sid) {
+        bail!(
+            "{} can modify or replace {}, so no service was registered. Keep MassRelay and \
+             its state directory where only {} and administrators can write, such as that \
+             account's own profile, and leave the permissions as they are",
+            describe(sid),
+            path.display(),
+            account.name()
+        );
+    }
+    Ok(())
+}
+
+fn security(path: &Path) -> Result<Security> {
+    let name = wide(path)?;
+    let (mut owner, mut dacl, mut descriptor) = (null_mut(), null_mut::<ACL>(), null_mut());
+    // SAFETY: `name` is NUL-terminated. `owner` and `dacl` receive pointers into
+    // `descriptor`, which is freed below after its last use.
+    let code = unsafe {
+        GetNamedSecurityInfoW(
+            name.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if code != 0 {
+        return Err(os_error(code).context(format!("read the permissions of {}", path.display())));
+    }
+    let result = (|| {
+        let owner = sid_text(owner)?;
+        if dacl.is_null() {
+            return Ok(Security { owner, dacl: None });
+        }
+        let mut aces = Vec::new();
+        // SAFETY: a non-null `dacl` points at the descriptor's access list.
+        for index in 0..unsafe { (*dacl).AceCount } {
+            let mut ace: *mut c_void = null_mut();
+            // SAFETY: `index` is below the list's entry count.
+            ensure!(
+                unsafe { GetAce(dacl, index.into(), &mut ace) } != 0,
+                "read an access entry of {}",
+                path.display()
+            );
+            // SAFETY: every entry starts with this header.
+            let header = unsafe { *ace.cast::<ACE_HEADER>() };
+            // Plain and conditional entries, which share one layout.
+            let kind = match header.AceType {
+                0 | 9 => AceKind::Allow,
+                1 | 10 => AceKind::Deny,
+                _ => AceKind::Other,
+            };
+            let (mask, sid) = if kind == AceKind::Other {
+                (0, String::new())
+            } else {
+                let entry = ace.cast::<ACCESS_ALLOWED_ACE>();
+                // SAFETY: entries of these kinds hold a mask and then the SID, which starts
+                // at `SidStart`.
+                unsafe {
+                    let sid = (&raw mut (*entry).SidStart).cast::<c_void>();
+                    ((*entry).Mask, sid_text(sid)?)
+                }
+            };
+            aces.push(Ace {
+                kind,
+                inherit_only: header.AceFlags & INHERIT_ONLY != 0,
+                mask,
+                sid,
+            });
+        }
+        Ok(Security {
+            owner,
+            dacl: Some(aces),
+        })
+    })();
+    // SAFETY: `descriptor` was allocated by GetNamedSecurityInfoW; nothing points into it
+    // any more.
+    unsafe { LocalFree(descriptor) };
+    result
+}
+
+// ----------------------------------------------------------------- password
+
+/// NUL-terminated UTF-16 that is wiped when dropped.
+struct Secret(Vec<u16>);
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
+    }
+}
+
+fn wipe<T: Default>(data: &mut [T]) {
+    for item in data {
+        // SAFETY: `item` is a valid, exclusive reference. The volatile write keeps the
+        // compiler from dropping the wipe as a dead store.
+        unsafe { std::ptr::write_volatile(item, T::default()) };
+    }
+}
+
+/// The account's password, for the service manager to store. It is never written anywhere by
+/// MassRelay.
+fn password(account: &Account, from_stdin: bool) -> Result<Secret> {
+    let mut secret = if from_stdin {
+        stdin_line()?
+    } else {
+        eprintln!(
+            "Windows runs the service as {} and needs that account's password. It goes to the \
+             Windows service manager and is not saved by MassRelay.",
+            account.name()
+        );
+        console_line(&format!("Password for {}: ", account.name()))?
+    };
+    // Every buffer has room for these edits, so no copy is left behind by a reallocation.
+    while matches!(secret.0.last(), Some(0x0A | 0x0D)) {
+        secret.0.pop();
+    }
+    if secret.0.first() == Some(&0xFEFF) {
+        secret.0.remove(0);
+    }
+    ensure!(
+        !secret.0.is_empty(),
+        "Windows cannot run a service as an account without a password"
+    );
+    ensure!(!secret.0.contains(&0), "the password contains a NUL");
+    secret.0.push(0);
+    Ok(secret)
+}
+
+fn stdin_line() -> Result<Secret> {
+    const LIMIT: usize = 1024;
+    let mut bytes = Vec::with_capacity(LIMIT);
+    let read = io::stdin()
+        .lock()
+        .take(LIMIT as u64)
+        .read_until(b'\n', &mut bytes);
+    let secret = match (read, std::str::from_utf8(&bytes)) {
+        (Err(error), _) => Err(anyhow!(error).context("read the password from standard input")),
+        (Ok(_), Err(_)) => Err(anyhow!("the password on standard input is not UTF-8")),
+        (Ok(_), Ok(text)) => {
+            let mut units = Vec::with_capacity(bytes.len() + 1);
+            units.extend(text.encode_utf16());
+            Ok(Secret(units))
+        }
+    };
+    wipe(&mut bytes);
+    secret
+}
+
+/// Read one line from the console with echo off.
+fn console_line(prompt: &str) -> Result<Secret> {
+    const LIMIT: usize = 512;
+    let console = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("CONIN$")
+        .context("there is no console to ask for the password; pass --password-stdin")?;
+    let handle = console.as_raw_handle();
+    let mut mode = 0;
+    // SAFETY: `handle` is the open console input handle.
+    ensure!(
+        unsafe { GetConsoleMode(handle, &mut mode) } != 0,
+        "read the console mode: {}",
+        io::Error::last_os_error()
+    );
+    eprint!("{prompt}");
+    let quiet = (mode | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT) & !ENABLE_ECHO_INPUT;
+    let mut secret = Secret(vec![0; LIMIT + 1]);
+    let mut read = 0u32;
+    // SAFETY: `handle` stays open; the buffer is writable for LIMIT UTF-16 units. The
+    // console's mode is restored whatever the read returns.
+    let (done, error) = unsafe {
+        SetConsoleMode(handle, quiet);
+        let done = ReadConsoleW(
+            handle,
+            secret.0.as_mut_ptr().cast(),
+            LIMIT as u32,
+            &mut read,
+            null(),
+        );
+        let error = GetLastError();
+        SetConsoleMode(handle, mode);
+        (done, error)
+    };
+    eprintln!();
+    if done == 0 {
+        return Err(os_error(error).context("read the password"));
+    }
+    secret.0.truncate(read as usize);
+    Ok(secret)
+}
+
+/// Log on once the way the service manager will, so a wrong password or a refused logon is
+/// reported here and not as a service that will not start.
+fn check_logon(account: &Account, password: &Secret) -> Result<()> {
+    let (user, domain) = (wide(&account.user)?, wide(&account.domain)?);
+    let mut token = null_mut();
+    // SAFETY: the three strings are NUL-terminated; `token` receives a handle closed below.
+    let logged_on = unsafe {
+        LogonUserW(
+            user.as_ptr(),
+            domain.as_ptr(),
+            password.0.as_ptr(),
+            LOGON32_LOGON_SERVICE,
+            LOGON32_PROVIDER_DEFAULT,
+            &mut token,
+        )
+    };
+    if logged_on == 0 {
+        return Err(match last_error() {
+            ERROR_LOGON_FAILURE => anyhow!(
+                "Windows did not accept that password for {}. Enter the account's password, \
+                 not a PIN",
+                account.name()
+            ),
+            code => os_error(code).context(format!(
+                "log on as {} the way a service does",
+                account.name()
+            )),
+        });
+    }
+    // SAFETY: `token` was returned by LogonUserW and is not used again.
+    unsafe { CloseHandle(token) };
+    Ok(())
+}
+
+// ------------------------------------------------------- "log on as a service"
+
+/// The local security policy, which holds each account's logon rights.
+struct Policy(LSA_HANDLE);
+
+impl Drop for Policy {
+    fn drop(&mut self) {
+        // SAFETY: the handle was opened by LsaOpenPolicy and is not used again.
+        unsafe { LsaClose(self.0) };
+    }
+}
+
+impl Policy {
+    fn open() -> Result<Self> {
+        let attributes = LSA_OBJECT_ATTRIBUTES {
+            Length: size_of::<LSA_OBJECT_ATTRIBUTES>() as u32,
+            ..Default::default()
+        };
+        let mut handle = 0;
+        let access = (POLICY_CREATE_ACCOUNT | POLICY_LOOKUP_NAMES) as u32;
+        // SAFETY: a null system name is this machine; `attributes` is initialized as the
+        // API requires; `handle` receives a handle closed on drop.
+        lsa(unsafe { LsaOpenPolicy(null(), &attributes, access, &mut handle) })
+            .context("open the local security policy")?;
+        Ok(Self(handle))
+    }
+
+    /// Whether the account itself (not a group it is in) holds the right already.
+    fn may_log_on_as_service(&self, account: &Account) -> Result<bool> {
+        let (mut rights, mut count) = (null_mut::<LSA_UNICODE_STRING>(), 0u32);
+        // SAFETY: the SID is valid; `rights` receives an array freed below.
+        let status =
+            unsafe { LsaEnumerateAccountRights(self.0, account.psid(), &mut rights, &mut count) };
+        // An account with no rights of its own has no entry.
+        if status == STATUS_OBJECT_NAME_NOT_FOUND {
+            return Ok(false);
+        }
+        lsa(status).context("read the account's logon rights")?;
+        let held = (0..count as usize).any(|index| {
+            // SAFETY: the array holds `count` strings, each `Length` bytes of UTF-16.
+            let name = unsafe {
+                let right = &*rights.add(index);
+                std::slice::from_raw_parts(right.Buffer, usize::from(right.Length) / 2)
+            };
+            String::from_utf16_lossy(name) == SERVICE_LOGON_RIGHT
+        });
+        // SAFETY: `rights` was allocated by LsaEnumerateAccountRights and is not used again.
+        unsafe { LsaFreeMemory(rights.cast()) };
+        Ok(held)
+    }
+
+    fn set_service_logon(&self, account: &Account, allow: bool) -> Result<()> {
+        let mut name: Vec<u16> = SERVICE_LOGON_RIGHT.encode_utf16().collect();
+        let bytes = (name.len() * 2) as u16;
+        let right = LSA_UNICODE_STRING {
+            Length: bytes,
+            MaximumLength: bytes,
+            Buffer: name.as_mut_ptr(),
+        };
+        // SAFETY: the SID is valid and `right` describes `name`, which outlives the call.
+        lsa(unsafe {
+            if allow {
+                LsaAddAccountRights(self.0, account.psid(), &right, 1)
+            } else {
+                LsaRemoveAccountRights(self.0, account.psid(), false, &right, 1)
+            }
+        })
+    }
+}
+
+fn lsa(status: NTSTATUS) -> Result<()> {
+    if status >= 0 {
+        return Ok(());
+    }
+    // SAFETY: a pure conversion.
+    Err(os_error(unsafe { LsaNtStatusToWinError(status) }))
+}
+
+// ---------------------------------------------------------- service manager
+
+/// A service manager or service handle.
+struct Handle(SC_HANDLE);
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        // SAFETY: the handle is open and not used again.
+        unsafe { CloseServiceHandle(self.0) };
+    }
+}
+
+struct Config {
+    command: String,
+    start: u32,
+}
+
+fn denied(code: u32, action: &str) -> anyhow::Error {
+    if code == ERROR_ACCESS_DENIED {
+        anyhow!(ELEVATE)
+    } else {
+        os_error(code).context(action.to_owned())
+    }
+}
+
+fn manager(access: u32) -> Result<Handle> {
+    // SAFETY: null names select this machine's active service database.
+    let handle = unsafe { OpenSCManagerW(null(), null(), access) };
+    if handle.is_null() {
+        return Err(denied(
+            last_error(),
+            "connect to the Windows service manager",
+        ));
+    }
+    Ok(Handle(handle))
+}
+
+fn open(manager: &Handle, name: &[u16], access: u32) -> Result<Option<Handle>> {
+    // SAFETY: the manager handle is open and `name` is NUL-terminated.
+    let handle = unsafe { OpenServiceW(manager.0, name.as_ptr(), access) };
+    if !handle.is_null() {
+        return Ok(Some(Handle(handle)));
+    }
+    match last_error() {
+        ERROR_SERVICE_DOES_NOT_EXIST => Ok(None),
+        code => Err(denied(code, "open the service")),
+    }
+}
+
+fn create(
+    manager: &Handle,
+    name: &[u16],
+    command: &[u16],
+    account: &[u16],
+    password: &Secret,
+) -> Result<Handle> {
+    // SAFETY: every string is NUL-terminated and outlives the call. The service manager
+    // copies the password into its own protected store.
+    let handle = unsafe {
+        CreateServiceW(
+            manager.0,
+            name.as_ptr(),
+            name.as_ptr(),
+            SERVICE_ALL_ACCESS,
+            SERVICE_WIN32_OWN_PROCESS,
+            SERVICE_AUTO_START,
+            SERVICE_ERROR_NORMAL,
+            command.as_ptr(),
+            null(),
+            null_mut(),
+            null(),
+            account.as_ptr(),
+            password.0.as_ptr(),
+        )
+    };
+    if handle.is_null() {
+        return Err(denied(last_error(), "register the service"));
+    }
+    Ok(Handle(handle))
+}
+
+/// Change a service's start type and command line, and its logon when one is given.
+fn reconfigure(
+    service: &Handle,
+    start: u32,
+    command: &[u16],
+    logon: Option<(&[u16], &Secret)>,
+) -> Result<()> {
+    let (account, password) = logon.map_or((null(), null()), |(account, password)| {
+        (account.as_ptr(), password.0.as_ptr())
+    });
+    // SAFETY: the handle is open; the strings are NUL-terminated or null (unchanged).
+    let changed = unsafe {
+        ChangeServiceConfigW(
+            service.0,
+            SERVICE_WIN32_OWN_PROCESS,
+            start,
+            SERVICE_ERROR_NORMAL,
+            command.as_ptr(),
+            null(),
+            null_mut(),
+            null(),
+            account,
+            password,
+            null(),
+        )
+    };
+    ensure!(
+        changed != 0,
+        "update the service: {}",
+        io::Error::last_os_error()
+    );
+    Ok(())
+}
+
+/// Describe the service, and have Windows restart it when it fails: at boot the network may
+/// not be ready yet.
+fn annotate(service: &Handle, description: &mut [u16]) -> Result<()> {
+    let set = |level, info: *const c_void| {
+        // SAFETY: the handle is open and `info` points at the structure for `level`.
+        ensure!(
+            unsafe { ChangeServiceConfig2W(service.0, level, info) } != 0,
+            "configure the service: {}",
+            io::Error::last_os_error()
+        );
+        Ok(())
+    };
+    let text = SERVICE_DESCRIPTIONW {
+        lpDescription: description.as_mut_ptr(),
+    };
+    set(SERVICE_CONFIG_DESCRIPTION, (&raw const text).cast())?;
+
+    // The last delay repeats; the count of failures resets after an hour without one. A
+    // requested restart counts as a failure too.
+    let mut actions = [5_000, 5_000, 60_000].map(|delay| SC_ACTION {
+        Type: SC_ACTION_RESTART,
+        Delay: delay,
+    });
+    let failure = SERVICE_FAILURE_ACTIONSW {
+        dwResetPeriod: 3600,
+        lpRebootMsg: null_mut(),
+        lpCommand: null_mut(),
+        cActions: actions.len() as u32,
+        lpsaActions: actions.as_mut_ptr(),
+    };
+    set(SERVICE_CONFIG_FAILURE_ACTIONS, (&raw const failure).cast())?;
+    // Also when the runtime reports an error and stops, not only when the process dies.
+    let flag = SERVICE_FAILURE_ACTIONS_FLAG {
+        fFailureActionsOnNonCrashFailures: 1,
+    };
+    set(
+        SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
+        (&raw const flag).cast(),
+    )
+}
+
+fn config(service: &Handle) -> Result<Config> {
+    // The service manager never returns more than 8 KiB. u64 elements keep it aligned.
+    let mut buffer = vec![0u64; 1024];
+    let mut needed = 0;
+    // SAFETY: the handle is open and the buffer is writable for the size given.
+    ensure!(
+        unsafe {
+            QueryServiceConfigW(
+                service.0,
+                buffer.as_mut_ptr().cast(),
+                size_of_val(buffer.as_slice()) as u32,
+                &mut needed,
+            )
+        } != 0,
+        "read the service configuration: {}",
+        io::Error::last_os_error()
+    );
+    // SAFETY: the call filled the buffer with this structure, whose strings point into it.
+    unsafe {
+        let config = &*buffer.as_ptr().cast::<QUERY_SERVICE_CONFIGW>();
+        Ok(Config {
+            command: text(config.lpBinaryPathName),
+            start: config.dwStartType,
+        })
+    }
+}
+
+fn state(service: &Handle) -> Result<SERVICE_STATUS> {
+    let mut status = SERVICE_STATUS::default();
+    // SAFETY: the handle is open and `status` is writable.
+    ensure!(
+        unsafe { QueryServiceStatus(service.0, &mut status) } != 0,
+        "read the service status: {}",
+        io::Error::last_os_error()
+    );
+    Ok(status)
+}
+
+/// Start the service and wait until its runtime is up. A running service is left as it is.
+fn start(service: &Handle) -> Result<()> {
+    // SAFETY: the handle is open; no arguments are passed.
+    if unsafe { StartServiceW(service.0, 0, null()) } == 0 {
+        match last_error() {
+            ERROR_SERVICE_ALREADY_RUNNING => {}
+            ERROR_SERVICE_LOGON_FAILED => bail!(
+                "Windows could not log the service on. If the account's password changed, \
+                 run 'massrelay install' again to store the new one"
+            ),
+            code => return Err(denied(code, "start the service")),
+        }
+    }
+    let deadline = Instant::now() + START_WAIT;
+    loop {
+        let status = state(service)?;
+        match status.dwCurrentState {
+            SERVICE_RUNNING => return Ok(()),
+            SERVICE_STOPPED => {
+                let code = match status.dwWin32ExitCode {
+                    ERROR_SERVICE_SPECIFIC_ERROR => status.dwServiceSpecificExitCode,
+                    code => code,
+                };
+                bail!("the service stopped while starting (exit code {code}); see its service log")
+            }
+            _ => ensure!(
+                Instant::now() < deadline,
+                "the service did not finish starting in {} seconds",
+                START_WAIT.as_secs()
+            ),
+        }
+        thread::sleep(POLL);
+    }
+}
+
+/// Send a running service `control` (stop, or this service's restart) and wait until it has
+/// stopped. A stopped service is left as it is.
+fn stop(service: &Handle, control: u32) -> Result<()> {
+    let deadline = Instant::now() + STOP_WAIT;
+    loop {
+        let mut status = state(service)?;
+        match status.dwCurrentState {
+            SERVICE_STOPPED => return Ok(()),
+            SERVICE_RUNNING => {
+                // SAFETY: the handle is open and `status` is writable.
+                let asked = unsafe { ControlService(service.0, control, &mut status) };
+                match last_error() {
+                    _ if asked != 0 => {}
+                    // It stopped, or began stopping, in the meantime.
+                    ERROR_SERVICE_NOT_ACTIVE | ERROR_SERVICE_CANNOT_ACCEPT_CTRL => {}
+                    code => return Err(denied(code, "stop the service")),
+                }
+            }
+            // Still starting or already stopping.
+            _ => {}
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "the service did not stop in {} seconds",
+            STOP_WAIT.as_secs()
+        );
+        thread::sleep(POLL);
+    }
+}
+
+// ------------------------------------------------ the service control protocol
+
+type Body = Box<dyn FnOnce() -> u32 + Send>;
+
+static NAME: OnceLock<Vec<u16>> = OnceLock::new();
+static BODY: Mutex<Option<Body>> = Mutex::new(None);
+/// The handle this service reports its status on; null until the service manager started it.
+static STATUS: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+static CHECKPOINT: AtomicU32 = AtomicU32::new(0);
+static STOPPING: AtomicBool = AtomicBool::new(false);
+static RESTARTING: AtomicBool = AtomicBool::new(false);
+static STOP: Notify = Notify::const_new();
+
+/// Run `body` as the service `name` under the service manager, which must have started this
+/// process. `body`'s output is appended to `log`. Returns once the service has stopped.
+pub fn serve(
+    name: &str,
+    log: PathBuf,
+    body: impl FnOnce() -> Result<i32> + Send + 'static,
+) -> Result<i32> {
+    let body: Body = Box::new(move || {
+        // A service has no console: if the log cannot be opened, there is nowhere to say so.
+        let _ = redirect_output(&log);
+        eprintln!(
+            "{} MassRelay {} service starting",
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            env!("CARGO_PKG_VERSION")
+        );
+        match body() {
+            Ok(code) => code as u32,
+            Err(error) => {
+                eprintln!("massrelay: {}", visible(&format!("{error:#}")));
+                1
+            }
+        }
+    });
+    *BODY
+        .lock()
+        .map_err(|_| anyhow!("service state is poisoned"))? = Some(body);
+    let name = NAME.get_or_init(|| name.encode_utf16().chain([0]).collect());
+    let table = [
+        SERVICE_TABLE_ENTRYW {
+            lpServiceName: name.as_ptr().cast_mut(),
+            lpServiceProc: Some(service_main),
+        },
+        SERVICE_TABLE_ENTRYW {
+            lpServiceName: null_mut(),
+            lpServiceProc: None,
+        },
+    ];
+    // SAFETY: the table ends with a null entry, and it and the name outlive the call, which
+    // returns when the service has stopped.
+    if unsafe { StartServiceCtrlDispatcherW(table.as_ptr()) } == 0 {
+        return Err(match last_error() {
+            ERROR_FAILED_SERVICE_CONTROLLER_CONNECT => {
+                anyhow!("this command is run by the Windows service manager; use 'massrelay start'")
+            }
+            code => os_error(code).context("connect to the Windows service manager"),
+        });
+    }
+    Ok(0)
+}
+
+/// Whether this process is running as a service under the service manager.
+pub fn serving() -> bool {
+    !STATUS.load(Ordering::SeqCst).is_null()
+}
+
+/// Report the service as running, then wait for the service manager's stop request.
+pub async fn until_stopped() {
+    if !STOPPING.load(Ordering::SeqCst) {
+        report(SERVICE_RUNNING, 0);
+    }
+    STOP.notified().await;
+}
+
+/// Send the service's output to its log file.
+fn redirect_output(log: &Path) -> io::Result<()> {
+    let file = OpenOptions::new().create(true).append(true).open(log)?;
+    // The handle stays open for the life of the process.
+    let handle = file.into_raw_handle();
+    // SAFETY: `handle` is an open file handle that is never closed.
+    unsafe {
+        SetStdHandle(STD_ERROR_HANDLE, handle);
+        SetStdHandle(STD_OUTPUT_HANDLE, handle);
+    }
+    Ok(())
+}
+
+fn report(state: u32, exit: u32) {
+    let handle = STATUS.load(Ordering::SeqCst);
+    if handle.is_null() {
+        return;
+    }
+    let pending = matches!(state, SERVICE_START_PENDING | SERVICE_STOP_PENDING);
+    let status = SERVICE_STATUS {
+        dwServiceType: SERVICE_WIN32_OWN_PROCESS,
+        dwCurrentState: state,
+        dwControlsAccepted: if state == SERVICE_RUNNING {
+            SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN
+        } else {
+            0
+        },
+        dwWin32ExitCode: if exit == 0 {
+            NO_ERROR
+        } else {
+            ERROR_SERVICE_SPECIFIC_ERROR
+        },
+        dwServiceSpecificExitCode: exit,
+        dwCheckPoint: if pending {
+            CHECKPOINT.fetch_add(1, Ordering::SeqCst) + 1
+        } else {
+            0
+        },
+        dwWaitHint: if pending { PENDING_HINT_MS } else { 0 },
+    };
+    // SAFETY: `handle` is the status handle the service manager gave this service.
+    unsafe { SetServiceStatus(handle, &status) };
+}
+
+/// Called by the service manager on its own thread once it has started this service.
+unsafe extern "system" fn service_main(_count: u32, _arguments: *mut *mut u16) {
+    let Some(name) = NAME.get() else { return };
+    // SAFETY: `name` is NUL-terminated and static; the handler is a plain function.
+    let handle = unsafe { RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(handler), null()) };
+    if handle.is_null() {
+        return;
+    }
+    STATUS.store(handle, Ordering::SeqCst);
+    report(SERVICE_START_PENDING, 0);
+    let body = BODY.lock().ok().and_then(|mut body| body.take());
+    // A panic must not unwind into the service manager's frame.
+    let exit = body.map_or(1, |body| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or(1)
+    });
+    let exit = if RESTARTING.load(Ordering::SeqCst) {
+        RESTART_EXIT
+    } else if STOPPING.load(Ordering::SeqCst) {
+        // A requested stop is never a failure for Windows to recover from; what went wrong in
+        // it is in the service log.
+        0
+    } else {
+        exit
+    };
+    // Windows may end the process as soon as this is reported.
+    report(SERVICE_STOPPED, exit);
+}
+
+/// Called by the service manager for each control request.
+unsafe extern "system" fn handler(
+    control: u32,
+    _event: u32,
+    _data: *mut c_void,
+    _context: *mut c_void,
+) -> u32 {
+    match control {
+        SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN | CONTROL_RESTART => {
+            RESTARTING.store(control == CONTROL_RESTART, Ordering::SeqCst);
+            STOPPING.store(true, Ordering::SeqCst);
+            report(SERVICE_STOP_PENDING, 0);
+            // Holds a permit if the runtime is not waiting yet.
+            STOP.notify_one();
+            NO_ERROR
+        }
+        SERVICE_CONTROL_INTERROGATE => NO_ERROR,
+        _ => ERROR_CALL_NOT_IMPLEMENTED,
+    }
+}
+
+// ------------------------------------------------------------------ helpers
+
+/// NUL-terminated UTF-16 for a Windows call.
+fn wide(text: impl AsRef<OsStr>) -> Result<Vec<u16>> {
+    let mut wide: Vec<u16> = text.as_ref().encode_wide().collect();
+    ensure!(!wide.contains(&0), "text for Windows contains a NUL");
+    wide.push(0);
+    Ok(wide)
+}
+
+/// The text of a NUL-terminated UTF-16 string from Windows.
+///
+/// # Safety
+/// `text` is null or points at a NUL-terminated UTF-16 string.
+unsafe fn text(text: *const u16) -> String {
+    if text.is_null() {
+        return String::new();
+    }
+    let mut len = 0;
+    // SAFETY: the string is NUL-terminated, so every unit read is inside it.
+    unsafe {
+        while *text.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(text, len))
+    }
+}
+
+fn last_error() -> u32 {
+    // SAFETY: reads this thread's last error code.
+    unsafe { GetLastError() }
+}
+
+fn os_error(code: u32) -> anyhow::Error {
+    io::Error::from_raw_os_error(code as i32).into()
+}

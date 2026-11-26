@@ -370,7 +370,7 @@ impl Profile {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub fn check_enrolled(state_dir: &Path) -> Result<()> {
     let dir = state_dir.join(DIR_NAME);
     load(&dir)?;
@@ -384,7 +384,7 @@ pub fn check_enrolled(state_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub fn claim_owner(state_dir: &Path) -> Result<Owner> {
     Owner::acquire(&state_dir.join(DIR_NAME)).map_err(|error| anyhow!("{error:?}"))
 }
@@ -1499,5 +1499,33 @@ mod tests {
         }
         assert!(InviteEnvelope::open(&format!("{INVITE_PREFIX}AAAA")).is_err());
         assert!(InviteEnvelope::open(&good.encode().unwrap()).is_err());
+    }
+
+    /// Not a check: writes an enrolled profile into the state directory named by
+    /// MASSRELAY_FIXTURE_STATE_DIR, for native fixtures that need a real profile where no
+    /// relay can be hosted (`tests/service-windows.ps1`). Its relay is an unused loopback
+    /// port, so the runtime starts, serves local commands and stays offline.
+    #[test]
+    #[ignore = "writes a profile for a native service fixture"]
+    fn write_an_offline_fixture_profile() {
+        let Some(state_dir) = std::env::var_os("MASSRELAY_FIXTURE_STATE_DIR") else {
+            return;
+        };
+        let dir = Path::new(&state_dir).join(DIR_NAME);
+        let locator = locator(1, 2);
+        let _owner = claim(&dir).unwrap();
+        let (profile, fresh) = setup_profile(&dir, &locator).unwrap();
+        assert!(fresh, "the fixture directory already holds a profile");
+        crate::storage::save(&dir, PROFILE_FILE, &profile).unwrap();
+        Device::create_network_named(
+            &dir,
+            &EndpointSecret::from_bytes(&profile.key.0),
+            *locator.server.id.as_bytes(),
+            locator.incarnation.0.to_vec(),
+            Offline,
+            Clock::System,
+            Some("service-fixture"),
+        )
+        .unwrap();
     }
 }

@@ -26,6 +26,9 @@ mod tcp;
 mod terminal;
 mod tunnel;
 mod udp;
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+mod windows_service;
 mod wire;
 
 use std::{
@@ -45,6 +48,8 @@ use iroh::{
     endpoint::{RelayMode, presets},
 };
 use iroh_mdns_address_lookup::MdnsAddressLookup;
+#[cfg(windows)]
+use windows_service as background_service;
 
 #[derive(Parser)]
 #[command(
@@ -144,24 +149,49 @@ enum Command {
     /// Set up and start this device's background service.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Install,
+    /// Set up and start this device's background service, which Windows starts before sign-in.
+    #[cfg(windows)]
+    Install(windows_service::InstallOptions),
     /// Start this device's installed background service.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     Start,
     /// Restart this device's installed background service.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     Restart,
-    /// Stop this device's installed background service for this login.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg_attr(
+        not(windows),
+        doc = "Stop this device's installed background service for this login."
+    )]
+    #[cfg_attr(
+        windows,
+        doc = "Stop this device's installed background service until it is started or Windows restarts."
+    )]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     Stop,
+    /// Run as the installed background service. Only the Windows service manager starts this.
+    #[cfg(windows)]
+    #[command(hide = true)]
+    Service {
+        /// The registered service name.
+        name: String,
+        #[arg(long)]
+        shell: Option<PathBuf>,
+    },
     #[command(flatten)]
     Device(private::cli::Command),
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let cli =
         Cli::from_arg_matches(&grouped_cli().get_matches()).unwrap_or_else(|error| error.exit());
-    match execute(cli).await {
+    #[cfg(windows)]
+    let result = match cli.command {
+        Some(Command::Service { name, shell }) => serve(cli.state_dir, &name, shell),
+        _ => run(cli),
+    };
+    #[cfg(not(windows))]
+    let result = run(cli);
+    match result {
         Ok(0) => {}
         Ok(code) => std::process::exit(code),
         Err(error) => {
@@ -172,6 +202,32 @@ async fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn run(cli: Cli) -> Result<i32> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("start the async runtime")?
+        .block_on(execute(cli))
+}
+
+/// Run the device as its Windows service: the ordinary `run` command, started and stopped by
+/// the service manager.
+#[cfg(windows)]
+fn serve(state_dir: Option<PathBuf>, name: &str, shell: Option<PathBuf>) -> Result<i32> {
+    let dir = match state_dir {
+        Some(dir) => dir,
+        None => default_state_dir()?,
+    };
+    let mut arguments: Vec<std::ffi::OsString> = Vec::new();
+    arguments.extend(["massrelay".into(), "--state-dir".into()]);
+    arguments.extend([dir.clone().into(), "run".into()]);
+    if let Some(shell) = shell {
+        arguments.extend(["--shell".into(), shell.into()]);
+    }
+    let cli = Cli::try_parse_from(arguments)?;
+    windows_service::serve(name, dir.join("service.log"), move || run(cli))
 }
 
 fn grouped_cli() -> clap::Command {
@@ -251,12 +307,17 @@ async fn execute(cli: Cli) -> Result<i32> {
     match command {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         Command::Install => background_service::install(&dir)?,
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(windows)]
+        Command::Install(options) => background_service::install(&dir, options)?,
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         Command::Start => background_service::control(&dir, ServiceAction::Start)?,
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         Command::Restart => background_service::control(&dir, ServiceAction::Restart)?,
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         Command::Stop => background_service::control(&dir, ServiceAction::Stop)?,
+        // `main` hands this to the service manager before any runtime exists.
+        #[cfg(windows)]
+        Command::Service { .. } => anyhow::bail!("the service command cannot be run here"),
 
         Command::Device(command) => return private::cli::execute(&dir, command).await,
         #[cfg(unix)]
@@ -305,7 +366,7 @@ fn default_state_dir() -> Result<PathBuf> {
         .to_path_buf())
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[derive(Clone, Copy)]
 enum ServiceAction {
     Start,
@@ -313,7 +374,7 @@ enum ServiceAction {
     Stop,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 impl ServiceAction {
     fn name(self) -> &'static str {
         match self {
@@ -387,7 +448,18 @@ async fn shutdown() -> io::Result<()> {
             _ = terminate.recv() => Ok(()),
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // Under the Windows service manager there is no console. Waiting here is the point
+        // at which the runtime is up, so it reports the service as running, and the service
+        // manager's stop request ends the wait.
+        if windows_service::serving() {
+            windows_service::until_stopped().await;
+            return Ok(());
+        }
+        tokio::signal::ctrl_c().await
+    }
+    #[cfg(not(any(unix, windows)))]
     tokio::signal::ctrl_c().await
 }
 

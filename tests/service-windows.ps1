@@ -1,0 +1,269 @@
+#Requires -Version 7
+<#
+Exercises 'massrelay install', 'start', 'stop' and 'restart' against the real Windows Service
+Control Manager, using a profile whose relay is an unused loopback port.
+
+The service logs on as the account running this script, so Windows needs that account's
+password:
+
+  -ResetAccountPassword   Sets the account's password to a random one. Only allowed on a
+                          GitHub Actions runner, which is thrown away afterwards.
+  -Password               The account's existing password, on a machine you keep:
+                          ./tests/service-windows.ps1 -Password (Read-Host -AsSecureString)
+
+Run it from an elevated PowerShell in the repository, after 'cargo build --release'. It
+registers a service for a throwaway state directory under the user profile and removes it.
+With -Password the account keeps the "Log on as a service" right the install granted.
+
+-ConPty also runs the ignored ConPTY unit tests under a service logon (session 0, no
+console, this account), by registering their executable as a throwaway service.
+#>
+[CmdletBinding()]
+param(
+    [string]$Binary,
+    [securestring]$Password,
+    [switch]$ResetAccountPassword,
+    [switch]$ConPty
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+if (-not $IsWindows) {
+    throw 'This fixture needs Windows.'
+}
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$administrator = [Security.Principal.WindowsBuiltInRole]::Administrator
+if (-not [Security.Principal.WindowsPrincipal]::new($identity).IsInRole($administrator)) {
+    throw 'Run this fixture from an elevated PowerShell.'
+}
+$repository = Split-Path $PSScriptRoot -Parent
+if (-not $Binary) {
+    $Binary = Join-Path $repository 'target\release\massrelay.exe'
+}
+$user = $identity.Name.Split('\')[-1]
+
+if ($Password) {
+    $secret = [Net.NetworkCredential]::new('', $Password).Password
+} elseif ($ResetAccountPassword) {
+    if ($env:GITHUB_ACTIONS -ne 'true') {
+        throw '-ResetAccountPassword changes this account''s password and is only allowed on a CI runner. Pass -Password instead.'
+    }
+    $random = [byte[]]::new(24)
+    [Security.Cryptography.RandomNumberGenerator]::Fill($random)
+    # The prefix satisfies a password complexity policy.
+    $secret = 'Mr1!' + [Convert]::ToHexString($random)
+    ([ADSI]"WinNT://$env:COMPUTERNAME/$user,user").SetPassword($secret)
+} else {
+    throw 'Pass -Password, or -ResetAccountPassword on a disposable CI runner.'
+}
+
+# Run a program with exact arguments and standard input, without PowerShell's own handling
+# of native output.
+function Invoke-Tool {
+    param([string]$Path, [string[]]$Arguments, [string]$Stdin)
+    $start = [Diagnostics.ProcessStartInfo]::new($Path)
+    $start.UseShellExecute = $false
+    $start.RedirectStandardInput = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    foreach ($argument in $Arguments) {
+        $start.ArgumentList.Add($argument)
+    }
+    $process = [Diagnostics.Process]::Start($start)
+    $output = $process.StandardOutput.ReadToEndAsync()
+    $errors = $process.StandardError.ReadToEndAsync()
+    if ($Stdin) {
+        $process.StandardInput.WriteLine($Stdin)
+    }
+    $process.StandardInput.Close()
+    $process.WaitForExit()
+    [pscustomobject]@{
+        ExitCode = $process.ExitCode
+        Output   = $output.GetAwaiter().GetResult()
+        Error    = $errors.GetAwaiter().GetResult()
+    }
+}
+
+function Assert {
+    param([bool]$Condition, [string]$Message)
+    if (-not $Condition) {
+        throw $Message
+    }
+}
+
+$id = [Guid]::NewGuid().ToString('N')
+# Under the user profile, which only this account and administrators can write. The
+# temporary directory is avoided: its path is often a short (8.3) name.
+$root = Join-Path $env:USERPROFILE "massrelay-service-test-$id"
+$state = Join-Path $root 'state with spaces'
+$exe = Join-Path $root 'bin\massrelay.exe'
+$marker = Join-Path $state 'private-experimental-0\private-runtime.json'
+$install = @('--state-dir', $state, 'install', '--password-stdin')
+
+# Every service this run registered has the throwaway directory in its command line.
+function Get-TestService {
+    Get-CimInstance Win32_Service -Filter "PathName LIKE '%$id%'"
+}
+
+function Get-DeviceService {
+    param([string]$Name)
+    Get-CimInstance Win32_Service -Filter "Name='$Name'"
+}
+
+function Invoke-Device {
+    param([string[]]$Arguments)
+    Invoke-Tool $exe (@('--state-dir', $state) + $Arguments) ''
+}
+
+function Test-Runtime {
+    (Invoke-Device @('status')).Output -match 'Runtime: running'
+}
+
+Push-Location $repository
+try {
+    New-Item -ItemType Directory -Path (Split-Path $exe -Parent) | Out-Null
+    Copy-Item -LiteralPath $Binary -Destination $exe
+
+    $env:MASSRELAY_FIXTURE_STATE_DIR = $state
+    try {
+        & cargo +stable test --locked --release write_an_offline_fixture_profile -- --ignored
+        Assert ($LASTEXITCODE -eq 0) 'The fixture profile test failed.'
+    } finally {
+        Remove-Item Env:MASSRELAY_FIXTURE_STATE_DIR
+    }
+    Assert (Test-Path -LiteralPath (Join-Path $state 'private-experimental-0\private-device.json')) 'No fixture profile was written.'
+
+    # An administrator account must opt in to a service with administrator rights.
+    $refused = Invoke-Tool $exe $install $secret
+    Assert ($refused.ExitCode -ne 0 -and $refused.Error -match '--allow-administrator') "An administrator's service was not refused: $($refused.Error)"
+    $install += '--allow-administrator'
+
+    # A program that other accounts can replace must not become a service.
+    $loose = Join-Path $root 'loose'
+    New-Item -ItemType Directory -Path $loose | Out-Null
+    Copy-Item -LiteralPath $exe -Destination $loose
+    & icacls.exe $loose /grant '*S-1-5-32-545:(OI)(CI)M' | Out-Null
+    Assert ($LASTEXITCODE -eq 0) 'Could not loosen the test directory.'
+    $refused = Invoke-Tool (Join-Path $loose 'massrelay.exe') $install $secret
+    Assert ($refused.ExitCode -ne 0 -and $refused.Error -match 'S-1-5-32-545') "A program writable by Users was not refused: $($refused.Error)"
+
+    # A wrong password is found before anything is registered.
+    $refused = Invoke-Tool $exe $install 'not-the-password'
+    Assert ($refused.ExitCode -ne 0) 'A wrong password was accepted.'
+    Assert (@(Get-TestService).Count -eq 0) 'A refused install left a service behind.'
+
+    $installed = Invoke-Tool $exe $install $secret
+    Assert ($installed.ExitCode -eq 0) "install failed: $($installed.Error)"
+    Assert ($installed.Output -match 'MassRelay-[0-9a-f]{16}') "install did not name its service: $($installed.Output)"
+    $name = $Matches[0]
+    $service = Get-DeviceService $name
+    Assert ($null -ne $service) "The service $name is not registered."
+    Assert ($service.StartMode -eq 'Auto') "The service does not start with Windows: $($service.StartMode)"
+    Assert ($service.StartName -match ('\\' + [regex]::Escape($user) + '$')) "The service runs as $($service.StartName), not $user."
+    Assert ($service.PathName.StartsWith("`"$exe`" ", [StringComparison]::OrdinalIgnoreCase)) "Unexpected command line: $($service.PathName)"
+    Assert ($service.State -eq 'Running') "The service is $($service.State) after install."
+    $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($service.ProcessId)"
+    Assert ($process.SessionId -eq 0) "The service runs in session $($process.SessionId), not the services session."
+    $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwner
+    Assert ($owner.User -eq $user) "The service process belongs to $($owner.User)."
+    Assert (Test-Runtime) 'The runtime does not answer local commands under the service.'
+    $first = $service.ProcessId
+
+    # A second install replaces the registration and restarts the one service.
+    $again = Invoke-Tool $exe $install $secret
+    Assert ($again.ExitCode -eq 0) "The second install failed: $($again.Error)"
+    Assert (@(Get-TestService).Count -eq 1) 'The second install registered another service.'
+    $service = Get-DeviceService $name
+    Assert ($service.State -eq 'Running' -and $service.ProcessId -ne $first) 'The second install did not restart the service.'
+
+    foreach ($attempt in 1..2) {
+        $stopped = Invoke-Device @('stop')
+        Assert ($stopped.ExitCode -eq 0) "stop failed: $($stopped.Error)"
+    }
+    $service = Get-DeviceService $name
+    Assert ($service.State -eq 'Stopped') "The service is $($service.State) after stop."
+    Assert ($service.ExitCode -eq 0) "The service reported exit code $($service.ExitCode) for a requested stop."
+    # The runtime removes its marker only in its ordered stop.
+    Assert (-not (Test-Path -LiteralPath $marker)) 'The runtime did not stop in order.'
+
+    foreach ($attempt in 1..2) {
+        $started = Invoke-Device @('start')
+        Assert ($started.ExitCode -eq 0) "start failed: $($started.Error)"
+    }
+    $service = Get-DeviceService $name
+    Assert ($service.State -eq 'Running') "The service is $($service.State) after start."
+    Assert (Test-Runtime) 'The runtime does not answer after start.'
+    $first = $service.ProcessId
+
+    $restarted = Invoke-Device @('restart')
+    Assert ($restarted.ExitCode -eq 0) "restart failed: $($restarted.Error)"
+    $service = Get-DeviceService $name
+    Assert ($service.State -eq 'Running' -and $service.ProcessId -ne $first) 'restart did not start a new process.'
+    Assert (Test-Runtime) 'The runtime does not answer after restart.'
+
+    # A restart whose sender is gone, as when it ran in a shell this service serves: Windows
+    # itself starts the service again.
+    $first = $service.ProcessId
+    & sc.exe control $name 128 | Out-Null
+    $deadline = (Get-Date).AddSeconds(90)
+    do {
+        Start-Sleep -Milliseconds 500
+        $service = Get-DeviceService $name
+    } until (($service.State -eq 'Running' -and $service.ProcessId -ne $first) -or (Get-Date) -ge $deadline)
+    Assert ($service.State -eq 'Running' -and $service.ProcessId -ne $first) "Windows did not restart the service by itself: $($service.State)"
+    Assert (Test-Runtime) 'The runtime does not answer after an unattended restart.'
+
+    if ($ConPty) {
+        $tests = & cargo +stable test --locked --release --no-run --message-format=json |
+            ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.executable } |
+            Select-Object -Last 1 -ExpandProperty executable
+        Assert ([bool]$tests) 'Could not find the unit-test executable.'
+        $log = Join-Path $root 'conpty.log'
+        $done = Join-Path $root 'conpty.exit'
+        $script = Join-Path $root 'conpty.cmd'
+        Set-Content -LiteralPath $script -Encoding ascii -Value @(
+            '@echo off'
+            "`"$tests`" conpty --ignored --test-threads=1 > `"$log`" 2>&1"
+            "echo %errorlevel% > `"$done`""
+        )
+        $probe = "MassRelayConPtyProbe-$($id.Substring(0, 8))"
+        $credential = [pscredential]::new("$env:COMPUTERNAME\$user", (ConvertTo-SecureString $secret -AsPlainText -Force))
+        New-Service -Name $probe -BinaryPathName "`"$env:ComSpec`" /d /c `"$script`"" -Credential $credential -StartupType Manual | Out-Null
+        # cmd.exe does not speak the service protocol, so Windows reports a failed start. It
+        # has still run the tests under a service logon.
+        try {
+            Start-Service -Name $probe
+        } catch {
+        }
+        $deadline = (Get-Date).AddSeconds(120)
+        while (-not (Test-Path -LiteralPath $done) -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 500
+        }
+        $output = if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Raw } else { '' }
+        Assert (Test-Path -LiteralPath $done) "The ConPTY tests did not finish under a service logon: $output"
+        Assert ((Get-Content -LiteralPath $done -Raw).Trim() -eq '0' -and $output -match 'test result: ok\. [1-9]') "The ConPTY tests failed under a service logon: $output"
+    }
+    Write-Output "The Windows service fixture passed for $name."
+} catch {
+    $log = Join-Path $state 'service.log'
+    if (Test-Path -LiteralPath $log) {
+        Write-Host '--- service.log ---'
+        Get-Content -LiteralPath $log | Write-Host
+    }
+    throw
+} finally {
+    Pop-Location
+    foreach ($service in Get-TestService) {
+        & sc.exe stop $service.Name | Out-Null
+        $deadline = (Get-Date).AddSeconds(90)
+        while ((Get-DeviceService $service.Name).State -ne 'Stopped' -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 500
+        }
+        & sc.exe delete $service.Name | Out-Null
+    }
+    if (Test-Path -LiteralPath $root) {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}

@@ -41,11 +41,15 @@ ed25519-dalek = { version = "3" }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authentication_Identity",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_EventLog",
     "Win32_System_IO",
     "Win32_System_Pipes",
+    "Win32_System_Services",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
 
