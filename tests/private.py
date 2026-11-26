@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import signal
 import socket
@@ -146,7 +147,7 @@ def _exercise(binary, root, processes):
         return bytes(output)
 
     def open_shell(source, target):
-        """A live private shell that has proven it runs; returns the process and its terminal."""
+        """Return the command, its terminal, and the PID of the live destination shell."""
         master, slave = pty.openpty()
         proc = subprocess.Popen(
             args(source, "shell", target), stdin=slave, stdout=slave, stderr=slave,
@@ -155,13 +156,21 @@ def _exercise(binary, root, processes):
         os.close(slave)
         processes.append(proc)
         output = bytearray()
-        os.write(master, b"printf '%s%s\\n' LIVE_ SHELL\r")
+        os.write(master, b"printf '%s%s=%s\\n' LIVE_ SHELL \"$$\"\r")
         deadline = time.monotonic() + 30
-        while b"LIVE_SHELL" not in output and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
+            if match := re.search(rb"LIVE_SHELL=(\d+)\r?\n", output):
+                return proc, master, int(match[1])
             if select.select([master], [], [], 0.1)[0]:
                 output.extend(os.read(master, 65536))
-        assert b"LIVE_SHELL" in output, bytes(output)
-        return proc, master
+        raise AssertionError(bytes(output))
+
+    def process_gone(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        return False
 
     def forward(source, target, service, data=b""):
         # A UDP forward listens on an ephemeral port: the target holds the service's port here.
@@ -394,7 +403,7 @@ def _exercise(binary, root, processes):
     # The relay process is frozen, so the issuer's next membership call stalls on its open
     # loopback mailbox connection. Stopping the runtime wakes that call, ends the live shell
     # into it, releases the profile and exits cleanly; the runtime then starts again at once.
-    shell, master = open_shell("b", "alice")
+    shell, master, shell_pid = open_shell("b", "alice")
     os.kill(relay.pid, signal.SIGSTOP)
     try:
         time.sleep(3)  # at least two pass intervals: a membership call is now in flight
@@ -409,13 +418,17 @@ def _exercise(binary, root, processes):
         shutdown_log = log_path.read_text()[before_stop:].strip()
         assert "stopped without waiting for" not in shutdown_log, shutdown_log
         assert "the profile is released" in shutdown_log, shutdown_log
-        assert shell.wait(timeout=30) != 0, "the live shell ended with its runtime"
-        os.close(master)
+        assert process_gone(shell_pid), "the runtime stopped and reaped its shell"
         assert "Runtime: not running" in status("a")
         run_a = run("a")
         assert json.loads(profile_file.read_text())["udp_port"] == previous_port
     finally:
         os.kill(relay.pid, signal.SIGCONT)
+    # A relayed session can receive its close only after the relay can forward again.
+    try:
+        assert shell.wait(timeout=45) != 0, "the client left the closed session"
+    finally:
+        os.close(master)
     print(f"Stopped with a stalled relay call in {stop_seconds:.1f}s; owner released")
     print(f"  runtime said: {shutdown_log!r}")
     terminal("b", "alice", True)
