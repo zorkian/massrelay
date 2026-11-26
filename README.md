@@ -48,6 +48,8 @@ Release binaries and their checksums are also available on the [Releases page](h
 
 ## Set up a network
 
+If you used relay-managed membership in v0.4.0 or earlier, create a new encrypted network and enroll its devices. For an existing encrypted network, update every device before adding members with display names.
+
 Ask your relay operator for a locator, or [run your own relay](docs/private-discovery-setup.md). On the first device run `massrelay create`, paste the locator, and start `massrelay run`. Send the invite printed by `create` to the second device over a trusted channel. On the second device run `massrelay join`, paste the invite, and start `massrelay run`.
 
 `massrelay create --relay LOCATOR` and `MASSRELAY_RELAY` are also supported. Use `massrelay create --copy` or `massrelay invite --copy` to copy an invite to the clipboard. On Linux this uses `wl-copy` or `xclip`. Invites work once and expire in ten minutes. An enrolled device can issue a new one using `massrelay invite` while its runtime is running.
@@ -96,9 +98,13 @@ An exposure lasts while its command runs. Declining, revoking, or disabling the 
 
 ## Run in the background
 
-On macOS and Linux with systemd, run `massrelay install` after enrollment to set up the user service. Use `massrelay start`, `restart`, or `stop` with the same state directory. On Windows, run `massrelay run` in a terminal or under your supervisor.
+After `massrelay create` or `massrelay join`, run `massrelay install` to set up background operation. Use `massrelay start`, `restart`, or `stop` with the same state directory. Stop any foreground instance of `massrelay run` before installing the service.
 
-Linux uses the `massrelay-client.service` systemd user unit for the default profile. macOS uses `com.massrelay.client` and writes its service log to `~/Library/Logs/MassRelay.log`. The installer prints the paths. The connection audit file is `connections.jsonl` by default. It contains one JSON object per line. `massrelay run --log-file PATH` selects a different audit file. Console and supervisor messages use plain text.
+On Windows, install from an elevated terminal under the same account that enrolled the device. The service runs under that account and starts at boot, including when Windows is waiting at the sign-in screen. Remote shells run in the service’s noninteractive session. If the account password changes, update the service’s credentials before the next reboot.
+
+Linux uses a systemd user unit. macOS uses a LaunchAgent in your login session.
+
+Run `massrelay logs` to read recent diagnostics for the selected profile, or `massrelay logs --follow` for new messages. Diagnostics use journald on Linux, Unified Logging on macOS, and Windows Event Log. The operating system manages retention. The separate JSONL connection audit file contains one event per line. Use `massrelay run --log-file PATH` to select its location. Install and run print the audit path.
 
 ## Inspect a running device
 
