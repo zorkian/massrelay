@@ -98,7 +98,6 @@ jobs:
         shell: pwsh
         run: ./tests/service-windows.ps1 -ResetAccountPassword -ConPty
       - name: Stage binary
-        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         shell: bash
         env:
           BINARY: ${{ matrix.binary }}
@@ -108,7 +107,6 @@ jobs:
           mkdir -p dist
           cp "target/release/$BINARY" "dist/$ASSET"
       - uses: actions/upload-artifact@v7
-        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         with:
           name: ${{ matrix.asset }}
           path: dist/${{ matrix.asset }}
