@@ -71,7 +71,7 @@ use windows_sys::Win32::{
             SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
             SetServiceStatus, StartServiceCtrlDispatcherW, StartServiceW,
         },
-        SystemInformation::GetSystemDirectoryW,
+        SystemInformation::{ComputerNameNetBIOS, GetComputerNameExW, GetSystemDirectoryW},
         Threading::{GetCurrentProcess, OpenProcessToken},
     },
 };
@@ -404,7 +404,23 @@ fn lookup(sid: PSID) -> Result<(String, String)> {
 }
 
 fn service_account_sid(name: &str) -> Result<String> {
-    let name = wide(name)?;
+    let lookup_name = if let Some(user) = name.strip_prefix(".\\") {
+        // SCM stores local users with a dot qualifier. LookupAccountNameW expects
+        // the actual computer name as the qualifier for a local SID lookup.
+        let mut computer = [0u16; 256];
+        let mut len = computer.len() as u32;
+        // SAFETY: `computer` and `len` are writable for the lengths given.
+        ensure!(
+            unsafe { GetComputerNameExW(ComputerNameNetBIOS, computer.as_mut_ptr(), &mut len) }
+                != 0,
+            "read the local computer name: {}",
+            io::Error::last_os_error()
+        );
+        format!("{}\\{user}", String::from_utf16(&computer[..len as usize])?)
+    } else {
+        name.to_owned()
+    };
+    let wide_name = wide(&lookup_name)?;
     let mut sid = [0u32; 17];
     let mut sid_len = size_of_val(&sid) as u32;
     let mut domain = [0u16; 257];
@@ -414,7 +430,7 @@ fn service_account_sid(name: &str) -> Result<String> {
     let found = unsafe {
         LookupAccountNameW(
             null(),
-            name.as_ptr(),
+            wide_name.as_ptr(),
             sid.as_mut_ptr().cast(),
             &mut sid_len,
             domain.as_mut_ptr(),
@@ -424,7 +440,7 @@ fn service_account_sid(name: &str) -> Result<String> {
     };
     ensure!(
         found != 0,
-        "resolve the existing service account: {}",
+        "resolve the existing service account {name}: {}",
         io::Error::last_os_error()
     );
     sid_text(sid.as_mut_ptr().cast())
