@@ -803,7 +803,9 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
                         refuse(tx, WireRefusal::TargetUnavailable, MSG_SHELL_UNSUPPORTED).await;
                         Ended::Refused(WireRefusal::TargetUnavailable)
                     }
-                    Ok(Err(_)) => {
+                    Ok(Err(_error)) => {
+                        #[cfg(all(test, windows))]
+                        eprintln!("Windows shell startup: {_error}");
                         #[cfg(windows)]
                         let message = if req.elevated {
                             MSG_ELEVATED_UNAVAILABLE

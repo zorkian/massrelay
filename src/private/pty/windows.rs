@@ -387,6 +387,10 @@ impl TestInput {
     }
 }
 
+fn pty_error(action: &str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{action}: {error}"))
+}
+
 /// Start the shell attached to `con` under `identity`, returning its
 /// process handle.
 fn start(con: HPCON, shell: Option<&Path>, identity: &Identity) -> io::Result<Handle> {
@@ -460,6 +464,13 @@ fn start(con: HPCON, shell: Option<&Path>, identity: &Identity) -> io::Result<Ha
                 &mut process,
             ),
         }
+    })
+    .map_err(|error| {
+        let action = match identity {
+            Identity::Inherited => "CreateProcessW",
+            Identity::Filtered(_) => "CreateProcessAsUserW",
+        };
+        pty_error(action, error)
     })?;
     drop(Handle(process.hThread));
     Ok(Handle(process.hProcess))
@@ -606,7 +617,8 @@ fn filtered_token(kept: &[LUID]) -> io::Result<Handle> {
             null(),
             &mut filtered,
         )
-    })?;
+    })
+    .map_err(|error| pty_error("CreateRestrictedToken", error))?;
     let filtered = Handle(filtered);
 
     // Filtering leaves the integrity level alone. A token's level may always
@@ -630,7 +642,8 @@ fn filtered_token(kept: &[LUID]) -> io::Result<Handle> {
                 (&raw const label).cast(),
                 bytes,
             )
-        })?;
+        })
+        .map_err(|error| pty_error("set regular shell integrity", error))?;
     }
 
     // An administrator's token names Administrators as the owner of what it
@@ -646,7 +659,8 @@ fn filtered_token(kept: &[LUID]) -> io::Result<Handle> {
             (&raw const owner).cast(),
             std::mem::size_of::<TOKEN_OWNER>() as u32,
         )
-    })?;
+    })
+    .map_err(|error| pty_error("set regular shell token owner", error))?;
     let groups = token_info(&filtered, TokenGroups)?;
     // SAFETY: `groups` holds the TOKEN_GROUPS just read.
     let logon = unsafe { group_entries(&groups) }?
@@ -669,7 +683,8 @@ fn filtered_token(kept: &[LUID]) -> io::Result<Handle> {
             (&raw const dacl).cast(),
             std::mem::size_of::<TOKEN_DEFAULT_DACL>() as u32,
         )
-    })?;
+    })
+    .map_err(|error| pty_error("set regular shell default access list", error))?;
 
     if !is_regular_token(&filtered, kept)? {
         return Err(other(

@@ -55,6 +55,10 @@ jobs:
           # Each release tag can restore the corresponding default-branch cache.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo +stable build --locked --release
+      - name: Test Windows pseudoconsole cutoff and teardown
+        if: runner.os == 'Windows'
+        timeout-minutes: 3
+        run: cargo +stable test --locked --release conpty -- --ignored --test-threads=1
       - run: cargo +stable test --locked --release -- --test-threads=1
       - name: Repeat private membership publication on an independent x64 host
         if: matrix.runner == 'ubuntu-22.04'
@@ -77,10 +81,6 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           python3 tests/private.py target/release/massrelay
-      - name: Test Windows pseudoconsole cutoff and teardown
-        if: runner.os == 'Windows'
-        timeout-minutes: 3
-        run: cargo +stable test --locked --release conpty -- --ignored --test-threads=1
       - name: Test Windows native diagnostic log
         if: runner.os == 'Windows'
         timeout-minutes: 3
