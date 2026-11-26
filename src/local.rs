@@ -43,7 +43,7 @@ pub async fn listen_on(dir: &Path, channel: &Channel) -> Result<(TcpListener, Ru
         addr: listener.local_addr()?,
         key: wire::random()?,
     };
-    storage::save(dir, channel.marker, &runtime)?;
+    storage::save_control_marker(dir, channel.marker, &runtime)?;
     Ok((listener, runtime))
 }
 

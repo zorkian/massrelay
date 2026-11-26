@@ -100,7 +100,7 @@ An exposure lasts while its command runs. Declining, revoking, or disabling the 
 
 After `massrelay create` or `massrelay join`, run `massrelay install` to set up background operation. Use `massrelay start`, `restart`, or `stop` with the same state directory. Stop any foreground instance of `massrelay run` before installing the service.
 
-On Windows, open PowerShell as administrator under the same account that enrolled the device. Run `massrelay install --allow-administrator` to acknowledge that peers with shell access will get an administrator shell. Enter the account password when prompted. The service starts at boot before sign-in and uses Windows PowerShell by default. Use the elevated terminal for `start`, `stop`, and `restart`. If the account password changes, repeat `install` to update Windows’ service credentials. Stop the service before using `install.ps1` to replace the executable.
+On Windows, open PowerShell as administrator under the same account that enrolled the device. Run `massrelay install --allow-administrator` to acknowledge that peers with shell access will get an administrator shell. Enter the account password when prompted. The service starts at boot before sign-in and uses Windows PowerShell by default. Use a local elevated terminal for `start`, `stop`, and `restart`. If the account password changes, repeat `install` to update Windows’ service credentials. Stop the service before using `install.ps1` to replace the executable.
 
 Linux uses a systemd user unit. macOS uses a LaunchAgent in your login session.
 

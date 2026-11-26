@@ -4,9 +4,13 @@
 use std::{
     env,
     ffi::{OsStr, c_void},
-    fs::OpenOptions,
+    fs::{self, File, OpenOptions},
     io::{self, BufRead as _, Read as _},
-    os::windows::{ffi::OsStrExt as _, io::AsRawHandle as _},
+    os::windows::{
+        ffi::OsStrExt as _,
+        fs::MetadataExt as _,
+        io::{AsRawHandle as _, FromRawHandle as _},
+    },
     path::{Path, PathBuf},
     ptr::{null, null_mut},
     sync::{
@@ -25,8 +29,8 @@ use windows_sys::Win32::{
         ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_LOGON_FAILURE,
         ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_CANNOT_ACCEPT_CTRL,
         ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_LOGON_FAILED, ERROR_SERVICE_NOT_ACTIVE,
-        ERROR_SERVICE_SPECIFIC_ERROR, GetLastError, LocalFree, NO_ERROR, NTSTATUS,
-        STATUS_OBJECT_NAME_NOT_FOUND,
+        ERROR_SERVICE_SPECIFIC_ERROR, GENERIC_READ, GENERIC_WRITE, GetLastError,
+        INVALID_HANDLE_VALUE, LocalFree, NO_ERROR, NTSTATUS, STATUS_OBJECT_NAME_NOT_FOUND,
     },
     Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
@@ -36,12 +40,17 @@ use windows_sys::Win32::{
             LsaRemoveAccountRights, POLICY_CREATE_ACCOUNT, POLICY_LOOKUP_NAMES,
         },
         Authorization::{
-            ConvertSidToStringSidW, ConvertStringSidToSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+            ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            ConvertStringSidToSidW, GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
         },
         CheckTokenMembership, CreateWellKnownSid, DACL_SECURITY_INFORMATION, GetAce,
         GetTokenInformation, LOGON32_LOGON_SERVICE, LOGON32_PROVIDER_DEFAULT, LogonUserW,
-        LookupAccountSidW, OWNER_SECURITY_INFORMATION, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
-        WinBuiltinAdministratorsSid,
+        LookupAccountNameW, LookupAccountSidW, OWNER_SECURITY_INFORMATION, PSID,
+        SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid,
+    },
+    Storage::FileSystem::{
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     },
     System::{
         Console::{
@@ -51,16 +60,13 @@ use windows_sys::Win32::{
         Services::{
             ChangeServiceConfig2W, ChangeServiceConfigW, CloseServiceHandle, ControlService,
             CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW, QUERY_SERVICE_CONFIGW,
-            QueryServiceConfigW, QueryServiceStatus, RegisterServiceCtrlHandlerExW, SC_ACTION,
-            SC_ACTION_RESTART, SC_HANDLE, SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE,
-            SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
-            SERVICE_CONFIG_DESCRIPTION, SERVICE_CONFIG_FAILURE_ACTIONS,
-            SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, SERVICE_CONTROL_INTERROGATE,
-            SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_DESCRIPTIONW,
-            SERVICE_ERROR_NORMAL, SERVICE_FAILURE_ACTIONS_FLAG, SERVICE_FAILURE_ACTIONSW,
-            SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING,
-            SERVICE_STATUS, SERVICE_STOP, SERVICE_STOP_PENDING, SERVICE_STOPPED,
-            SERVICE_TABLE_ENTRYW, SERVICE_USER_DEFINED_CONTROL, SERVICE_WIN32_OWN_PROCESS,
+            QueryServiceConfigW, QueryServiceStatus, RegisterServiceCtrlHandlerExW, SC_HANDLE,
+            SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE, SERVICE_ACCEPT_SHUTDOWN,
+            SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
+            SERVICE_CONFIG_DESCRIPTION, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_SHUTDOWN,
+            SERVICE_CONTROL_STOP, SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_QUERY_STATUS,
+            SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STOP,
+            SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
             SetServiceStatus, StartServiceCtrlDispatcherW, StartServiceW,
         },
         SystemInformation::GetSystemDirectoryW,
@@ -88,18 +94,10 @@ const STOP_WAIT: Duration = Duration::from_secs(90);
 /// What the service tells the service manager to expect of a pending start or stop.
 const PENDING_HINT_MS: u32 = 60_000;
 const INHERIT_ONLY: u8 = 0x8;
-/// This service's own control code: stop, and have Windows start the service again. The
-/// restart is then Windows' to finish, so it survives the command that asked for it, which
-/// dies with its shell when that shell is one this service serves.
-const CONTROL_RESTART: u32 = 128;
-/// What the service exits with for a requested restart. Windows restarts a service that
-/// stops with an error.
-const RESTART_EXIT: u32 = 2;
 
 // ------------------------------------------------------------------ install
 
 pub fn install(dir: &Path, options: InstallOptions) -> Result<()> {
-    cli::check_enrolled(dir)?;
     let dir = dir
         .canonicalize()
         .context("resolve the device state directory")?;
@@ -125,7 +123,8 @@ pub fn install(dir: &Path, options: InstallOptions) -> Result<()> {
     ensure_trusted(&binary, Role::Program, &account)?;
     ensure_trusted(&shell, Role::Program, &account)?;
     ensure_trusted(&dir, Role::Holder, &account)?;
-    check(&Path::new(&dir).join(cli::DIR_NAME), Role::Holder, &account)?;
+    check_private_profile(&Path::new(&dir).join(cli::DIR_NAME), &account)?;
+    cli::check_enrolled(Path::new(&dir))?;
 
     let name = super::service_name(&dir);
     let command = super::command_line(&binary, &dir, &name, &shell)?;
@@ -147,6 +146,10 @@ pub fn install(dir: &Path, options: InstallOptions) -> Result<()> {
             ensure!(
                 super::is_profile_service(&config.command, &dir, &name),
                 "another service already uses the name {name}"
+            );
+            ensure!(
+                service_account_sid(&config.account)? == account.sid,
+                "the existing service runs under another account"
             );
             let running = state(service)?.dwCurrentState != SERVICE_STOPPED;
             Some((config, running))
@@ -196,7 +199,7 @@ pub fn install(dir: &Path, options: InstallOptions) -> Result<()> {
         };
         annotate(service, &mut description)?;
         // A running service takes up its new registration by restarting.
-        stop(service, CONTROL_RESTART)?;
+        stop(service)?;
         start(service)
     })();
     drop(password);
@@ -204,7 +207,7 @@ pub fn install(dir: &Path, options: InstallOptions) -> Result<()> {
     if let Err(error) = applied {
         let restored = (|| {
             if let Some(service) = &created {
-                let _ = stop(service, SERVICE_CONTROL_STOP);
+                let _ = stop(service);
                 // SAFETY: the handle is an open service handle with delete access.
                 ensure!(
                     unsafe { DeleteService(service.0) } != 0,
@@ -261,16 +264,15 @@ pub fn control(dir: &Path, action: ServiceAction) -> Result<()> {
             | match action {
                 ServiceAction::Start => SERVICE_START,
                 ServiceAction::Stop => SERVICE_STOP,
-                ServiceAction::Restart => SERVICE_START | SERVICE_USER_DEFINED_CONTROL,
+                ServiceAction::Restart => SERVICE_START | SERVICE_STOP,
             };
         let Some(service) = open(&manager, &wide(&name)?, access)? else {
             bail!("no installed service for this profile. Run massrelay install first");
         };
         match action {
-            ServiceAction::Stop => stop(&service, SERVICE_CONTROL_STOP),
+            ServiceAction::Stop => stop(&service),
             ServiceAction::Restart => {
-                stop(&service, CONTROL_RESTART)?;
-                // Sooner than Windows would by itself.
+                stop(&service)?;
                 start(&service)
             }
             ServiceAction::Start => {
@@ -399,6 +401,33 @@ fn lookup(sid: PSID) -> Result<(String, String)> {
     ))
 }
 
+fn service_account_sid(name: &str) -> Result<String> {
+    let name = wide(name)?;
+    let mut sid = [0u32; 17];
+    let mut sid_len = size_of_val(&sid) as u32;
+    let mut domain = [0u16; 257];
+    let mut domain_len = domain.len() as u32;
+    let mut kind = 0;
+    // SAFETY: both output buffers are writable and `name` is NUL-terminated.
+    let found = unsafe {
+        LookupAccountNameW(
+            null(),
+            name.as_ptr(),
+            sid.as_mut_ptr().cast(),
+            &mut sid_len,
+            domain.as_mut_ptr(),
+            &mut domain_len,
+            &mut kind,
+        )
+    };
+    ensure!(
+        found != 0,
+        "resolve the existing service account: {}",
+        io::Error::last_os_error()
+    );
+    sid_text(sid.as_mut_ptr().cast())
+}
+
 fn sid_text(sid: PSID) -> Result<String> {
     let mut out = null_mut();
     // SAFETY: `sid` is a valid SID; `out` receives a string freed below.
@@ -485,15 +514,81 @@ fn ensure_trusted(path: &str, leaf: Role, account: &Account) -> Result<()> {
 fn check(path: &Path, role: Role, account: &Account) -> Result<()> {
     if let Some(sid) = super::untrusted(&security(path)?, role, &account.sid) {
         bail!(
-            "{} can modify or replace {}, so no service was registered. Keep MassRelay and \
-             its state directory where only {} and administrators can write, such as that \
-             account's own profile, and leave the permissions as they are",
+            "{} has unsafe access to {}. Keep the binary and profile in a private directory \
+             controlled by {} and administrators",
             describe(sid),
             path.display(),
             account.name()
         );
     }
     Ok(())
+}
+
+fn check_private_profile(path: &Path, account: &Account) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+        "the private profile contains a reparse point at {}",
+        path.display()
+    );
+    check(path, Role::Private, account)?;
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            check_private_profile(&entry?.path(), account)?;
+        }
+    }
+    Ok(())
+}
+
+/// Create the control marker with its own ACL before writing the control key.
+pub fn private_marker(dir: &Path) -> Result<tempfile::NamedTempFile> {
+    let account = Account::current()?;
+    let sddl = wide(format!(
+        "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{})",
+        account.sid
+    ))?;
+    let mut descriptor = null_mut();
+    // SAFETY: `sddl` is NUL-terminated and the output is writable.
+    ensure!(
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                null_mut(),
+            )
+        } != 0,
+        "prepare the control file permissions: {}",
+        io::Error::last_os_error()
+    );
+    let access = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let file = tempfile::Builder::new().make_in(dir, |path| {
+        let name: Vec<_> = path.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: the path is NUL-terminated and the security descriptor is live.
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                &access,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: this is a new owned file handle.
+        Ok(unsafe { File::from_raw_handle(handle) })
+    });
+    // SAFETY: Windows allocated the descriptor and the call above has returned.
+    unsafe { LocalFree(descriptor) };
+    file.context("create a private control marker")
 }
 
 fn security(path: &Path) -> Result<Security> {
@@ -806,6 +901,7 @@ impl Drop for Handle {
 struct Config {
     command: String,
     start: u32,
+    account: String,
 }
 
 fn denied(code: u32, action: &str) -> anyhow::Error {
@@ -906,45 +1002,24 @@ fn reconfigure(
     Ok(())
 }
 
-/// Describe the service, and have Windows restart it when it fails: at boot the network may
-/// not be ready yet.
+/// Describe the service in the Windows service manager.
 fn annotate(service: &Handle, description: &mut [u16]) -> Result<()> {
-    let set = |level, info: *const c_void| {
-        // SAFETY: the handle is open and `info` points at the structure for `level`.
-        ensure!(
-            unsafe { ChangeServiceConfig2W(service.0, level, info) } != 0,
-            "configure the service: {}",
-            io::Error::last_os_error()
-        );
-        Ok(())
-    };
     let text = SERVICE_DESCRIPTIONW {
         lpDescription: description.as_mut_ptr(),
     };
-    set(SERVICE_CONFIG_DESCRIPTION, (&raw const text).cast())?;
-
-    // The last delay repeats; the count of failures resets after an hour without one. A
-    // requested restart counts as a failure too.
-    let mut actions = [5_000, 5_000, 60_000].map(|delay| SC_ACTION {
-        Type: SC_ACTION_RESTART,
-        Delay: delay,
-    });
-    let failure = SERVICE_FAILURE_ACTIONSW {
-        dwResetPeriod: 3600,
-        lpRebootMsg: null_mut(),
-        lpCommand: null_mut(),
-        cActions: actions.len() as u32,
-        lpsaActions: actions.as_mut_ptr(),
-    };
-    set(SERVICE_CONFIG_FAILURE_ACTIONS, (&raw const failure).cast())?;
-    // Also when the runtime reports an error and stops, not only when the process dies.
-    let flag = SERVICE_FAILURE_ACTIONS_FLAG {
-        fFailureActionsOnNonCrashFailures: 1,
-    };
-    set(
-        SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
-        (&raw const flag).cast(),
-    )
+    // SAFETY: the handle and description are live for the call.
+    ensure!(
+        unsafe {
+            ChangeServiceConfig2W(
+                service.0,
+                SERVICE_CONFIG_DESCRIPTION,
+                (&raw const text).cast(),
+            )
+        } != 0,
+        "set the service description: {}",
+        io::Error::last_os_error()
+    );
+    Ok(())
 }
 
 fn config(service: &Handle) -> Result<Config> {
@@ -970,6 +1045,7 @@ fn config(service: &Handle) -> Result<Config> {
         Ok(Config {
             command: text(config.lpBinaryPathName),
             start: config.dwStartType,
+            account: text(config.lpServiceStartName),
         })
     }
 }
@@ -1020,9 +1096,8 @@ fn start(service: &Handle) -> Result<()> {
     }
 }
 
-/// Send a running service `control` (stop, or this service's restart) and wait until it has
-/// stopped. A stopped service is left as it is.
-fn stop(service: &Handle, control: u32) -> Result<()> {
+/// Stop the service and wait for its runtime to release the profile.
+fn stop(service: &Handle) -> Result<()> {
     let deadline = Instant::now() + STOP_WAIT;
     loop {
         let mut status = state(service)?;
@@ -1030,7 +1105,7 @@ fn stop(service: &Handle, control: u32) -> Result<()> {
             SERVICE_STOPPED => return Ok(()),
             SERVICE_RUNNING => {
                 // SAFETY: the handle is open and `status` is writable.
-                let asked = unsafe { ControlService(service.0, control, &mut status) };
+                let asked = unsafe { ControlService(service.0, SERVICE_CONTROL_STOP, &mut status) };
                 match last_error() {
                     _ if asked != 0 => {}
                     // It stopped, or began stopping, in the meantime.
@@ -1060,7 +1135,6 @@ static BODY: Mutex<Option<Body>> = Mutex::new(None);
 static STATUS: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 static CHECKPOINT: AtomicU32 = AtomicU32::new(0);
 static STOPPING: AtomicBool = AtomicBool::new(false);
-static RESTARTING: AtomicBool = AtomicBool::new(false);
 static STOP: Notify = Notify::const_new();
 
 /// Run `body` under the service manager and return once the service stops.
@@ -1071,6 +1145,15 @@ pub fn serve(
 ) -> Result<i32> {
     let body: Body = Box::new(move || {
         diagnostics::start(&dir);
+        let trusted = Account::current()
+            .and_then(|account| check_private_profile(&dir.join(cli::DIR_NAME), &account));
+        if trusted.is_err() {
+            diagnostics::quiet(
+                Level::Error,
+                "the service cannot use an insecure or inaccessible profile",
+            );
+            return 1;
+        }
         match body() {
             Ok(code) => code as u32,
             Err(_) => {
@@ -1165,15 +1248,6 @@ unsafe extern "system" fn service_main(_count: u32, _arguments: *mut *mut u16) {
     let exit = body.map_or(1, |body| {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or(1)
     });
-    let exit = if RESTARTING.load(Ordering::SeqCst) {
-        RESTART_EXIT
-    } else if STOPPING.load(Ordering::SeqCst) {
-        // A requested stop is never a failure for Windows to recover from; what went wrong in
-        // it is in the service log.
-        0
-    } else {
-        exit
-    };
     // Windows may end the process as soon as this is reported.
     report(SERVICE_STOPPED, exit);
 }
@@ -1186,8 +1260,7 @@ unsafe extern "system" fn handler(
     _context: *mut c_void,
 ) -> u32 {
     match control {
-        SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN | CONTROL_RESTART => {
-            RESTARTING.store(control == CONTROL_RESTART, Ordering::SeqCst);
+        SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
             STOPPING.store(true, Ordering::SeqCst);
             report(SERVICE_STOP_PENDING, 0);
             // Holds a permit if the runtime is not waiting yet.

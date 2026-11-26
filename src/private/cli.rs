@@ -249,9 +249,12 @@ pub async fn execute(state_dir: &Path, command: Command) -> Result<i32> {
                 sync_every,
             )
             .await;
-            if let Err(error) = &ran {
+            if ran.is_err() {
                 // The caller prints the error on the console.
-                diagnostics::quiet(Level::Error, format!("the runtime failed: {error:#}"));
+                diagnostics::quiet(
+                    Level::Error,
+                    "the runtime failed; run it in a terminal for details",
+                );
             }
             ran?
         }
@@ -941,10 +944,13 @@ async fn run(
     }
     let endpoint = match bind_device(preferred).await {
         Err(error) if preferred != bind => {
-            diagnostics::event(
-                Level::Warning,
-                format!("could not reuse UDP port {}: {error}", preferred.port()),
-            );
+            diagnostics::quiet(Level::Warning, "could not reuse the previous UDP port");
+            if diagnostics::console() {
+                eprintln!(
+                    "massrelay: could not reuse UDP port {}: {error}",
+                    preferred.port()
+                );
+            }
             bind_device(bind).await?
         }
         result => result?,

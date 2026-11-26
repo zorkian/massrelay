@@ -9,9 +9,7 @@
 //! The service manager runs `massrelay --state-dir DIR service NAME --shell SHELL`, which is
 //! the ordinary `run` command under the service control protocol: it reports "running" once
 //! the runtime waits for shutdown, and a stop request ends that wait, so the runtime stops in
-//! its usual order. Windows starts the service again when it fails, and `massrelay restart`
-//! uses that: the service stops with an error on request, so the restart completes even when
-//! the command that asked ran in a shell the service was serving.
+//! its usual order. The service controller performs the stop and start for a restart.
 //!
 //! What the install refuses, so the service cannot be turned against its account:
 //!
@@ -33,7 +31,7 @@ use sha2::{Digest, Sha256};
 #[cfg(windows)]
 mod native;
 #[cfg(windows)]
-pub use native::{control, install, serve, serving, until_stopped};
+pub use native::{control, install, private_marker, serve, serving, until_stopped};
 
 #[derive(clap::Args)]
 pub struct InstallOptions {
@@ -118,6 +116,8 @@ enum Role {
     Holder,
     /// A directory above one of those. It only has to keep the path below it in place.
     Ancestor,
+    /// Private profile state. Its contents and inherited permissions must be private.
+    Private,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,6 +143,7 @@ struct Security {
 }
 
 const FILE_WRITE_DATA: u32 = 0x2; // On a directory: add a file.
+const FILE_READ_DATA: u32 = 0x1; // On a directory: list its contents.
 const FILE_APPEND_DATA: u32 = 0x4; // On a directory: add a subdirectory.
 const FILE_DELETE_CHILD: u32 = 0x40;
 const DELETE: u32 = 0x1_0000;
@@ -150,6 +151,7 @@ const WRITE_DAC: u32 = 0x4_0000;
 const WRITE_OWNER: u32 = 0x8_0000;
 const GENERIC_ALL: u32 = 0x1000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
+const GENERIC_READ: u32 = 0x8000_0000;
 
 const SYSTEM: &str = "S-1-5-18";
 const ADMINISTRATORS: &str = "S-1-5-32-544";
@@ -180,6 +182,14 @@ fn untrusted<'a>(security: &'a Security, role: Role, account: &str) -> Option<&'
             Role::Program => FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE,
             Role::Holder => FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_DELETE_CHILD | GENERIC_WRITE,
             Role::Ancestor => FILE_DELETE_CHILD,
+            Role::Private => {
+                FILE_READ_DATA
+                    | FILE_WRITE_DATA
+                    | FILE_APPEND_DATA
+                    | FILE_DELETE_CHILD
+                    | GENERIC_READ
+                    | GENERIC_WRITE
+            }
         };
     dacl.iter()
         .find(|ace| {
@@ -190,7 +200,7 @@ fn untrusted<'a>(security: &'a Security, role: Role, account: &str) -> Option<&'
                 AceKind::Other => true,
             };
             grants
-                && !ace.inherit_only
+                && (!ace.inherit_only || role == Role::Private)
                 && !trusted(&ace.sid)
                 && ![CREATOR_OWNER, OWNER_RIGHTS].contains(&ace.sid.as_str())
         })

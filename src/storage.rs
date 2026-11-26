@@ -33,8 +33,28 @@ pub fn load<T: DeserializeOwned>(dir: &Path, filename: &str) -> Result<T> {
 
 pub fn save(dir: &Path, filename: &str, value: &impl Serialize) -> Result<()> {
     let mut file = tempfile::NamedTempFile::new_in(dir)?;
+    save_temporary(&mut file, value)?;
+    publish(dir, filename, file)
+}
+
+pub fn save_control_marker(dir: &Path, filename: &str, value: &impl Serialize) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let mut file = crate::windows_service::private_marker(dir)?;
+        save_temporary(&mut file, value)?;
+        publish(dir, filename, file)
+    }
+    #[cfg(not(windows))]
+    save(dir, filename, value)
+}
+
+fn save_temporary(file: &mut tempfile::NamedTempFile, value: &impl Serialize) -> Result<()> {
     serde_json::to_writer(file.as_file_mut(), value)?;
     file.as_file().sync_all()?;
+    Ok(())
+}
+
+fn publish(dir: &Path, filename: &str, file: tempfile::NamedTempFile) -> Result<()> {
     let path = dir.join(filename);
     file.persist(&path)
         .with_context(|| format!("write {}", path.display()))?;

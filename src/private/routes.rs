@@ -62,10 +62,13 @@ impl Routes {
         if addresses.get(&peer) != Some(&addr) {
             addresses.insert(peer, addr);
             if let Err(error) = crate::storage::save(&self.dir, FILE, &*addresses) {
-                super::diagnostics::event(
+                super::diagnostics::quiet(
                     super::diagnostics::Level::Warning,
-                    format!("could not save direct routes: {error}"),
+                    "could not save direct routes",
                 );
+                if super::diagnostics::console() {
+                    eprintln!("massrelay: could not save direct routes: {error}");
+                }
             }
         }
     }

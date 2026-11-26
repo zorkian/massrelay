@@ -532,6 +532,17 @@ def _exercise(binary, root, processes):
         assert removed in logs["b"] and removed not in logs["a"] + logs["c"], logs
         for secret in [a, b, key("c"), relay_locator, invite, target, "LIVE_SHELL", "alice"]:
             assert secret not in "".join(logs.values()), secret
+
+        follower = popen("a", "logs", "--follow")
+        try:
+            read_line(follower.stdout, "the runtime stopped")
+            again = run("a")
+            try:
+                read_line(follower.stdout, f"massrelay[{again.pid}]: the runtime started")
+            finally:
+                finish(again)
+        finally:
+            stop(follower)
     print("Private discovery end to end passed")
 
 

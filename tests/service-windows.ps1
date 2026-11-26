@@ -139,6 +139,15 @@ try {
     Assert ($refused.ExitCode -ne 0 -and $refused.Error -match '--allow-administrator') "An administrator's service was not refused: $($refused.Error)"
     $install += '--allow-administrator'
 
+    # An account with read access to enrollment secrets could impersonate the service.
+    $profile = Join-Path $state 'private-experimental-0\private-device.json'
+    & icacls.exe $profile /grant '*S-1-5-32-545:(R)' | Out-Null
+    Assert ($LASTEXITCODE -eq 0) 'Could not make the deliberately readable profile.'
+    $refused = Invoke-Tool $exe $install $secret
+    Assert ($refused.ExitCode -ne 0 -and $refused.Error -match 'unsafe access') "A readable profile was not refused: $($refused.Error)"
+    & icacls.exe $profile /remove:g '*S-1-5-32-545' | Out-Null
+    Assert ($LASTEXITCODE -eq 0) 'Could not restore the private profile permissions.'
+
     # A program that other accounts can replace must not become a service.
     $loose = Join-Path $root 'loose'
     New-Item -ItemType Directory -Path $loose | Out-Null
@@ -168,6 +177,7 @@ try {
     $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwner
     Assert ($owner.User -eq $user) "The service process belongs to $($owner.User)."
     Assert (Test-Runtime) 'The runtime does not answer local commands under the service.'
+    Assert (Get-Acl -LiteralPath $marker).AreAccessRulesProtected 'The control key inherits the directory ACL.'
     $logged = Invoke-Device @('logs')
     Assert ($logged.ExitCode -eq 0 -and $logged.Output -match 'the runtime started') "Service diagnostics did not reach the Windows Event Log: $($logged.Output) $($logged.Error)"
     $first = $service.ProcessId
@@ -204,17 +214,10 @@ try {
     Assert ($service.State -eq 'Running' -and $service.ProcessId -ne $first) 'restart did not start a new process.'
     Assert (Test-Runtime) 'The runtime does not answer after restart.'
 
-    # A restart whose sender is gone, as when it ran in a shell this service serves: Windows
-    # itself starts the service again.
-    $first = $service.ProcessId
-    & sc.exe control $name 128 | Out-Null
-    $deadline = (Get-Date).AddSeconds(90)
-    do {
-        Start-Sleep -Milliseconds 500
-        $service = Get-DeviceService $name
-    } until (($service.State -eq 'Running' -and $service.ProcessId -ne $first) -or (Get-Date) -ge $deadline)
-    Assert ($service.State -eq 'Running' -and $service.ProcessId -ne $first) "Windows did not restart the service by itself: $($service.State)"
-    Assert (Test-Runtime) 'The runtime does not answer after an unattended restart.'
+    $stopped = Invoke-Device @('stop')
+    Assert ($stopped.ExitCode -eq 0) "stop after restart failed: $($stopped.Error)"
+    Start-Sleep -Seconds 6
+    Assert ((Get-DeviceService $name).State -eq 'Stopped') 'The service unexpectedly started again after stop.'
 
     if ($ConPty) {
         $tests = & cargo +stable test --locked --release --no-run --message-format=json |
