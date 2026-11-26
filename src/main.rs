@@ -227,7 +227,7 @@ fn serve(state_dir: Option<PathBuf>, name: &str, shell: Option<PathBuf>) -> Resu
         arguments.extend(["--shell".into(), shell.into()]);
     }
     let cli = Cli::try_parse_from(arguments)?;
-    windows_service::serve(name, dir.join("service.log"), move || run(cli))
+    windows_service::serve(name, dir, move || run(cli))
 }
 
 fn grouped_cli() -> clap::Command {

@@ -91,6 +91,11 @@ jobs:
           ./tests/install-windows.ps1
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./tests/install-windows.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test Windows background service
+        if: runner.os == 'Windows'
+        timeout-minutes: 10
+        shell: pwsh
+        run: ./tests/service-windows.ps1 -ResetAccountPassword -ConPty
       - name: Stage binary
         if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         shell: bash

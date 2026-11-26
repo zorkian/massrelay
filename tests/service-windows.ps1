@@ -168,6 +168,8 @@ try {
     $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwner
     Assert ($owner.User -eq $user) "The service process belongs to $($owner.User)."
     Assert (Test-Runtime) 'The runtime does not answer local commands under the service.'
+    $logged = Invoke-Device @('logs')
+    Assert ($logged.ExitCode -eq 0 -and $logged.Output -match 'the runtime started') "Service diagnostics did not reach the Windows Event Log: $($logged.Output) $($logged.Error)"
     $first = $service.ProcessId
 
     # A second install replaces the registration and restarts the one service.
@@ -247,10 +249,10 @@ try {
     }
     Write-Output "The Windows service fixture passed for $name."
 } catch {
-    $log = Join-Path $state 'service.log'
-    if (Test-Path -LiteralPath $log) {
-        Write-Host '--- service.log ---'
-        Get-Content -LiteralPath $log | Write-Host
+    if (Test-Path -LiteralPath $exe) {
+        $logged = Invoke-Device @('logs')
+        Write-Host $logged.Output
+        Write-Host $logged.Error
     }
     throw
 } finally {

@@ -96,6 +96,9 @@ pub fn profile_id(state_dir: &Path) -> String {
 /// Send this process's diagnostics for the profile in `state_dir` to the
 /// native log. Called once, by `run`.
 pub fn start(state_dir: &Path) {
+    if ACTIVE.get().is_some() {
+        return;
+    }
     let native = match native::Log::open(&profile_id(state_dir)) {
         Ok(log) => Some(log),
         Err(error) => {

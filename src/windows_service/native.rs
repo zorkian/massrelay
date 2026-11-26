@@ -6,10 +6,7 @@ use std::{
     ffi::{OsStr, c_void},
     fs::OpenOptions,
     io::{self, BufRead as _, Read as _},
-    os::windows::{
-        ffi::OsStrExt as _,
-        io::{AsRawHandle as _, IntoRawHandle as _},
-    },
+    os::windows::{ffi::OsStrExt as _, io::AsRawHandle as _},
     path::{Path, PathBuf},
     ptr::{null, null_mut},
     sync::{
@@ -49,7 +46,7 @@ use windows_sys::Win32::{
     System::{
         Console::{
             ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, GetConsoleMode,
-            ReadConsoleW, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode, SetStdHandle,
+            ReadConsoleW, SetConsoleMode,
         },
         Services::{
             ChangeServiceConfig2W, ChangeServiceConfigW, CloseServiceHandle, ControlService,
@@ -72,13 +69,18 @@ use windows_sys::Win32::{
 };
 
 use super::{Ace, AceKind, InstallOptions, Role, Security};
-use crate::{ServiceAction, private::cli, visible};
+use crate::{
+    ServiceAction,
+    private::{
+        cli,
+        diagnostics::{self, Level},
+    },
+};
 
 const ELEVATE: &str =
     "Windows lets only an elevated PowerShell (Run as administrator) manage services";
 const SERVICE_LOGON_RIGHT: &str = "SeServiceLogonRight";
 const EVENT_LOG: &str = "connections.jsonl";
-const SERVICE_LOG: &str = "service.log";
 const POLL: Duration = Duration::from_millis(200);
 const START_WAIT: Duration = Duration::from_secs(60);
 /// Longer than the runtime's own ordered stop, which is bounded in several steps.
@@ -243,10 +245,7 @@ pub fn install(dir: &Path, options: InstallOptions) -> Result<()> {
         "Event log       {}",
         Path::new(&dir).join(EVENT_LOG).display()
     );
-    println!(
-        "Service log     {}",
-        Path::new(&dir).join(SERVICE_LOG).display()
-    );
+    println!("Read service diagnostics with 'massrelay logs'.");
     Ok(())
 }
 
@@ -1009,7 +1008,7 @@ fn start(service: &Handle) -> Result<()> {
                     ERROR_SERVICE_SPECIFIC_ERROR => status.dwServiceSpecificExitCode,
                     code => code,
                 };
-                bail!("the service stopped while starting (exit code {code}); see its service log")
+                bail!("the service stopped while starting (exit code {code}); see 'massrelay logs'")
             }
             _ => ensure!(
                 Instant::now() < deadline,
@@ -1064,25 +1063,18 @@ static STOPPING: AtomicBool = AtomicBool::new(false);
 static RESTARTING: AtomicBool = AtomicBool::new(false);
 static STOP: Notify = Notify::const_new();
 
-/// Run `body` as the service `name` under the service manager, which must have started this
-/// process. `body`'s output is appended to `log`. Returns once the service has stopped.
+/// Run `body` under the service manager and return once the service stops.
 pub fn serve(
     name: &str,
-    log: PathBuf,
+    dir: PathBuf,
     body: impl FnOnce() -> Result<i32> + Send + 'static,
 ) -> Result<i32> {
     let body: Body = Box::new(move || {
-        // A service has no console: if the log cannot be opened, there is nowhere to say so.
-        let _ = redirect_output(&log);
-        eprintln!(
-            "{} MassRelay {} service starting",
-            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            env!("CARGO_PKG_VERSION")
-        );
+        diagnostics::start(&dir);
         match body() {
             Ok(code) => code as u32,
-            Err(error) => {
-                eprintln!("massrelay: {}", visible(&format!("{error:#}")));
+            Err(_) => {
+                diagnostics::quiet(Level::Error, "the Windows service failed");
                 1
             }
         }
@@ -1125,19 +1117,6 @@ pub async fn until_stopped() {
         report(SERVICE_RUNNING, 0);
     }
     STOP.notified().await;
-}
-
-/// Send the service's output to its log file.
-fn redirect_output(log: &Path) -> io::Result<()> {
-    let file = OpenOptions::new().create(true).append(true).open(log)?;
-    // The handle stays open for the life of the process.
-    let handle = file.into_raw_handle();
-    // SAFETY: `handle` is an open file handle that is never closed.
-    unsafe {
-        SetStdHandle(STD_ERROR_HANDLE, handle);
-        SetStdHandle(STD_OUTPUT_HANDLE, handle);
-    }
-    Ok(())
 }
 
 fn report(state: u32, exit: u32) {
