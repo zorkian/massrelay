@@ -80,6 +80,10 @@ jobs:
         if: runner.os == 'Windows'
         timeout-minutes: 3
         run: cargo +stable test --locked --release conpty -- --ignored --test-threads=1
+      - name: Test Windows native diagnostic log
+        if: runner.os == 'Windows'
+        timeout-minutes: 3
+        run: cargo +stable test --locked --release native_log_round_trip -- --ignored --test-threads=1
       - name: Test Windows installer
         if: runner.os == 'Windows'
         shell: pwsh

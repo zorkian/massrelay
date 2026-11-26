@@ -464,44 +464,10 @@ mod native {
 
     pub const FACILITY: &str = "macOS Unified Logging";
     const SUBSYSTEM: &CStr = c"com.massrelay.client";
-    /// `os_log_type_t`. Default entries are stored; info entries are not.
-    const OS_LOG_TYPE_DEFAULT: u8 = 0x00;
-    const OS_LOG_TYPE_ERROR: u8 = 0x10;
 
-    // `os_log` is a C macro over these. It passes the image, a format string
-    // constant in that image, and the arguments encoded as clang's
-    // `__builtin_os_log_format` lays them out.
     unsafe extern "C" {
-        #[allow(non_upper_case_globals)]
-        static __dso_handle: u8;
         fn os_log_create(subsystem: *const c_char, category: *const c_char) -> *mut c_void;
-        fn os_log_type_enabled(log: *mut c_void, kind: u8) -> bool;
-        fn _os_log_impl(
-            dso: *mut c_void,
-            log: *mut c_void,
-            kind: u8,
-            format: *const c_char,
-            buffer: *mut u8,
-            size: u32,
-        );
-    }
-
-    #[unsafe(link_section = "__TEXT,__oslogstring,cstring_literals")]
-    static FORMAT: [u8; 11] = *b"%{public}s\0";
-
-    /// The encoded arguments of `FORMAT`: one public C string.
-    #[repr(C, align(16))]
-    struct Arguments([u8; 12]);
-
-    impl Arguments {
-        fn new(text: &CStr) -> Self {
-            let mut encoded = [0; 12];
-            // Summary: has non-scalar items. One argument. Its descriptor
-            // (string kind, public) and size, then the pointer.
-            encoded[..4].copy_from_slice(&[0x02, 0x01, 0x22, 0x08]);
-            encoded[4..].copy_from_slice(&(text.as_ptr() as usize as u64).to_ne_bytes());
-            Self(encoded)
-        }
+        fn massrelay_oslog_write(log: *mut c_void, error: bool, text: *const c_char);
     }
 
     /// An `os_log_t` for the subsystem, with the profile as its category.
@@ -524,27 +490,9 @@ mod native {
         }
 
         pub fn send(&self, level: Level, text: &str) -> io::Result<()> {
-            let kind = match level {
-                Level::Info | Level::Warning => OS_LOG_TYPE_DEFAULT,
-                Level::Error => OS_LOG_TYPE_ERROR,
-            };
             let text = CString::new(text).map_err(io::Error::other)?;
-            let mut arguments = Arguments::new(&text);
-            // SAFETY: the log handle is live, the format is a constant C
-            // string in this image, and the argument buffer matches it and
-            // points at `text`, which outlives the call.
-            unsafe {
-                if os_log_type_enabled(self.0, kind) {
-                    _os_log_impl(
-                        (&raw const __dso_handle).cast_mut().cast(),
-                        self.0,
-                        kind,
-                        FORMAT.as_ptr().cast(),
-                        arguments.0.as_mut_ptr(),
-                        arguments.0.len() as u32,
-                    );
-                }
-            }
+            // SAFETY: the log handle and C string are live for the call.
+            unsafe { massrelay_oslog_write(self.0, level == Level::Error, text.as_ptr()) };
             Ok(())
         }
     }
@@ -935,10 +883,11 @@ mod tests {
         let (profile, other) = (profile_id(root.path()), profile_id(&root.path().join("x")));
         let log = match native::Log::open(&profile) {
             Ok(log) => log,
-            Err(error) => {
+            Err(error) if cfg!(target_os = "linux") => {
                 eprintln!("skipped: {} is not available: {error}", native::FACILITY);
                 return;
             }
+            Err(error) => panic!("could not open {}: {error}", native::FACILITY),
         };
         let active = Diagnostics {
             native: Some(log),

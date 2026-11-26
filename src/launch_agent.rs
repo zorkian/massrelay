@@ -86,7 +86,7 @@ pub fn install(dir: &Path) -> Result<()> {
     }
     println!("Loaded {} for this login session", job.label);
     println!("Event log       {}", job.events.display());
-    println!("Service log     {}", job.log.display());
+    println!("Read service diagnostics with 'massrelay logs'.");
     Ok(())
 }
 
@@ -147,7 +147,6 @@ struct Job {
     label: String,
     plist: PathBuf,
     events: PathBuf,
-    log: PathBuf,
 }
 
 impl Job {
@@ -172,7 +171,6 @@ impl Job {
         Ok(Self {
             plist: library.join("LaunchAgents").join(format!("{label}.plist")),
             events: logs.join(format!("{name}-connections.jsonl")),
-            log: logs.join(format!("{name}.log")),
             label,
         })
     }
@@ -181,7 +179,6 @@ impl Job {
         let binary = escape_xml(path_text(binary)?);
         let state = escape_xml(path_text(dir)?);
         let events = escape_xml(path_text(&self.events)?);
-        let log = escape_xml(path_text(&self.log)?);
         let label = &self.label;
         Ok(format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -201,10 +198,6 @@ impl Job {
   </array>
   <key>KeepAlive</key>
   <true/>
-  <key>StandardOutPath</key>
-  <string>{log}</string>
-  <key>StandardErrorPath</key>
-  <string>{log}</string>
 </dict>
 </plist>
 "#

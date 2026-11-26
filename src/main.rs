@@ -165,7 +165,10 @@ async fn main() {
         Ok(0) => {}
         Ok(code) => std::process::exit(code),
         Err(error) => {
-            eprintln!("massrelay: {}", visible(&format!("{error:#}")));
+            // A runtime failure was already sent to the system log by `run`.
+            if private::diagnostics::console() {
+                eprintln!("massrelay: {}", visible(&format!("{error:#}")));
+            }
             std::process::exit(1);
         }
     }
