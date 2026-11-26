@@ -195,7 +195,12 @@ pub enum Command {
         target: Option<String>,
     },
     /// Open an interactive shell on a paired peer.
-    Shell { peer: String },
+    Shell {
+        peer: String,
+        /// Request an administrator shell on Windows.
+        #[arg(long)]
+        elevated: bool,
+    },
     /// Connect to a peer's shell or forwarded port.
     Connect {
         peer: Option<String>,
@@ -319,7 +324,9 @@ pub async fn execute(state_dir: &Path, command: Command) -> Result<i32> {
             };
             runtime::expose(&dir, service, peer_key(&dir, &to).await?, target).await?;
         }
-        Command::Shell { peer } => return runtime::shell(&dir, peer_key(&dir, &peer).await?).await,
+        Command::Shell { peer, elevated } => {
+            return runtime::shell(&dir, peer_key(&dir, &peer).await?, elevated).await;
+        }
         Command::Connect {
             peer,
             service,
@@ -335,7 +342,7 @@ pub async fn execute(state_dir: &Path, command: Command) -> Result<i32> {
             match service.unwrap_or(Service::Shell) {
                 Service::Shell => {
                     ensure!(listen.is_none(), "--listen applies to udp services");
-                    return runtime::shell(&dir, peer).await;
+                    return runtime::shell(&dir, peer, false).await;
                 }
                 service => runtime::connect(&dir, peer, service, listen).await?,
             }

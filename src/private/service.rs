@@ -125,6 +125,9 @@ const REQUEST_LEN: usize = 8;
 const MSG_NOT_AUTHORIZED: &str = "not authorized on this device";
 const MSG_SHELL: &str = "could not start the shell";
 const MSG_SHELL_UNSUPPORTED: &str = "private shells are not supported on this platform";
+const MSG_ELEVATED_UNSUPPORTED: &str = "elevated shells are only available on Windows";
+#[cfg(windows)]
+const MSG_ELEVATED_UNAVAILABLE: &str = "this device cannot start an administrator shell";
 const MSG_CONNECT: &str = "could not connect to the target";
 const MSG_RESOLVE: &str = "could not resolve the target";
 const MSG_ENDED: &str = "authorization ended";
@@ -132,6 +135,9 @@ const REPLY_MESSAGES: &[&str] = &[
     MSG_NOT_AUTHORIZED,
     MSG_SHELL,
     MSG_SHELL_UNSUPPORTED,
+    MSG_ELEVATED_UNSUPPORTED,
+    #[cfg(windows)]
+    MSG_ELEVATED_UNAVAILABLE,
     MSG_CONNECT,
     MSG_RESOLVE,
     MSG_ENDED,
@@ -175,12 +181,16 @@ pub struct PrivateRequest {
     pub service: Service,
     /// Initial shell columns and rows.
     pub terminal: Option<(u16, u16)>,
+    pub elevated: bool,
 }
 
 impl PrivateRequest {
     fn encode(&self) -> Vec<u8> {
         let (kind, port) = match self.service {
-            Service::Shell => (1, 0),
+            // Kind 1 was allowed to inherit the runtime's privileges. Keep
+            // it receive-only so old hosts cannot misread either request.
+            Service::Shell if self.elevated => (5, 0),
+            Service::Shell => (4, 0),
             Service::Tcp(p) => (2, p.get()),
             Service::Udp(p) => (3, p.get()),
         };
@@ -205,14 +215,39 @@ impl PrivateRequest {
         let rows = u16::from_be_bytes(d.fixed().ok()?);
         d.end().ok()?;
         let service = match kind {
-            1 if port == 0 => Service::Shell,
+            1 | 4 | 5 if port == 0 => Service::Shell,
             2 => Service::Tcp(std::num::NonZeroU16::new(port)?),
             3 => Service::Udp(std::num::NonZeroU16::new(port)?),
             _ => return None,
         };
         let terminal = (service == Service::Shell && cols > 0 && rows > 0).then_some((cols, rows));
-        Some(Self { service, terminal })
+        Some(Self {
+            service,
+            terminal,
+            elevated: kind == 5,
+        })
     }
+}
+
+#[cfg(test)]
+#[test]
+fn shell_privilege_survives_framing_and_legacy_means_regular() {
+    let regular = PrivateRequest {
+        service: Service::Shell,
+        terminal: Some((80, 24)),
+        elevated: false,
+    };
+    let elevated = PrivateRequest {
+        elevated: true,
+        ..regular
+    };
+    // Deployed peers accept only 1 (shell), 2 (TCP), or 3 (UDP).
+    assert!(regular.encode()[1] > 3);
+    assert!(elevated.encode()[1] > 3);
+    assert_eq!(PrivateRequest::decode(&regular.encode()), Some(regular));
+    assert_eq!(PrivateRequest::decode(&elevated.encode()), Some(elevated));
+    let legacy = [1, 1, 0, 0, 0, 80, 0, 24];
+    assert_eq!(PrivateRequest::decode(&legacy), Some(regular));
 }
 
 /// Why a served connection ended (for logs and tests).
@@ -738,13 +773,21 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
         let target = session.target.as_deref();
         match req.service {
             Service::Shell => {
+                #[cfg(not(windows))]
+                if req.elevated {
+                    refuse(tx, WireRefusal::TargetUnavailable, MSG_ELEVATED_UNSUPPORTED).await;
+                    return Ended::Refused(WireRefusal::TargetUnavailable);
+                }
                 let (cols, rows) = req.terminal.unwrap_or((80, 24));
                 let shell = self.shell.as_deref();
                 let token = self.workers.clone();
-                match session
-                    .start(async { pty::spawn(cols, rows, shell, token) })
-                    .await
-                {
+                #[cfg(windows)]
+                let spawn = async {
+                    pty::Pty::spawn_with_privilege(cols, rows, shell, token, req.elevated)
+                };
+                #[cfg(not(windows))]
+                let spawn = async { pty::spawn(cols, rows, shell, token) };
+                match session.start(spawn).await {
                     Ok(Ok(mut pty)) => {
                         *teardown = Some(pty.teardown());
                         connected();
@@ -761,7 +804,15 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
                         Ended::Refused(WireRefusal::TargetUnavailable)
                     }
                     Ok(Err(_)) => {
-                        refuse(tx, WireRefusal::TargetUnavailable, MSG_SHELL).await;
+                        #[cfg(windows)]
+                        let message = if req.elevated {
+                            MSG_ELEVATED_UNAVAILABLE
+                        } else {
+                            MSG_SHELL
+                        };
+                        #[cfg(not(windows))]
+                        let message = MSG_SHELL;
+                        refuse(tx, WireRefusal::TargetUnavailable, message).await;
                         Ended::Refused(WireRefusal::TargetUnavailable)
                     }
                     Err(_) => denied(tx).await,

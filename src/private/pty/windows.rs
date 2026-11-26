@@ -6,6 +6,35 @@
 //! every input write one `WriteFile` that returns at once: it writes what
 //! fits (possibly nothing) and never waits for the console host to read.
 //! See the parent module for the boundary this gives.
+//!
+//! # Privilege
+//!
+//! A shell is *regular* unless the caller asks for an elevated one.
+//!
+//! A regular shell never holds administrator rights. When this process has
+//! none (a standard account, or an administrator's UAC-limited token) the
+//! shell inherits its token. Otherwise (an elevated terminal, or a service
+//! of an administrator account, whose service logon has no limited twin)
+//! the shell gets a filtered copy of this process's own primary token:
+//! `CreateRestrictedToken` with `LUA_TOKEN`, `BUILTIN\Administrators` made
+//! deny-only and every privilege a standard user lacks deleted; then medium
+//! integrity, the user as owner and a default DACL for the user. The copy
+//! is checked (primary, Administrators not enabled, not elevated, at most
+//! medium integrity, no other privilege) before `CreateProcessAsUserW` uses
+//! it, and any failure refuses the shell. A restricted child of the
+//! caller's own token needs no `SeAssignPrimaryTokenPrivilege`. Neither the
+//! linked token nor the desktop shell's token is used, so nothing depends
+//! on a limited token or a signed-in desktop existing.
+//!
+//! An elevated shell inherits this process's token, and only when that
+//! token is an administrator's: Administrators enabled, elevated and at
+//! high integrity or above. Nothing asks UAC for consent; without such a
+//! token the shell is refused.
+//!
+//! Limits: the pseudoconsole host is started by `CreatePseudoConsole` under
+//! this process's token whatever the shell's, and a regular shell is still
+//! the same account, so it can read and write what the account itself (not
+//! the Administrators group) is granted.
 
 use super::*;
 use std::ffi::{OsStr, OsString, c_void};
@@ -20,15 +49,31 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, LUID,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows_sys::Win32::Security::{
+    ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAce, CheckTokenMembership,
+    CreateRestrictedToken, CreateWellKnownSid, DuplicateToken, EqualSid, GetLengthSid,
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, InitializeAcl, LUA_TOKEN,
+    LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, PSID, SE_CHANGE_NOTIFY_NAME,
+    SE_INC_WORKING_SET_NAME, SE_SHUTDOWN_NAME, SE_TIME_ZONE_NAME, SE_UNDOCK_NAME,
+    SID_AND_ATTRIBUTES, SecurityIdentification, SetTokenInformation, TOKEN_ACCESS_MASK,
+    TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DEFAULT_DACL, TOKEN_DUPLICATE,
+    TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_OWNER,
+    TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_TYPE, TOKEN_USER, TokenDefaultDacl, TokenElevation,
+    TokenGroups, TokenIntegrityLevel, TokenOwner, TokenPrimary, TokenPrivileges, TokenType,
+    TokenUser, WELL_KNOWN_SID_TYPE, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    WinMediumLabelSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON};
 use windows_sys::Win32::System::Pipes::{CreatePipe, PIPE_NOWAIT, SetNamedPipeHandleState};
 use windows_sys::Win32::System::Threading::{
-    CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
+    CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateProcessW,
+    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+    GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    OpenProcessToken, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
     STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
     WaitForSingleObject,
 };
@@ -46,6 +91,27 @@ const WRITE_RETRY: Duration = Duration::from_millis(10);
 const REAP_POLL: Duration = Duration::from_millis(30);
 /// Output read size.
 const READ_CHUNK: usize = 8192;
+
+/// `SE_GROUP_ENABLED`: the group counts in access checks. A deny-only group
+/// does not have it.
+const GROUP_ENABLED: u32 = 0x4;
+/// `SE_GROUP_INTEGRITY`: the attribute of a mandatory label.
+const GROUP_INTEGRITY: u32 = 0x20;
+/// `SE_GROUP_LOGON_ID`: the group is the logon session's own SID.
+const GROUP_LOGON_ID: u32 = 0xC000_0000;
+/// `SECURITY_MANDATORY_MEDIUM_RID`, a standard user's integrity level.
+const INTEGRITY_MEDIUM: u32 = 0x2000;
+/// `SECURITY_MANDATORY_HIGH_RID`, an administrator's integrity level.
+const INTEGRITY_HIGH: u32 = 0x3000;
+/// The privileges of a standard user (the ones UAC leaves in an
+/// administrator's limited token). A regular shell holds no other.
+const REGULAR_PRIVILEGES: [windows_sys::core::PCWSTR; 5] = [
+    SE_CHANGE_NOTIFY_NAME,
+    SE_SHUTDOWN_NAME,
+    SE_UNDOCK_NAME,
+    SE_INC_WORKING_SET_NAME,
+    SE_TIME_ZONE_NAME,
+];
 
 /// An owned kernel handle (pipe end or process).
 struct Handle(HANDLE);
@@ -124,10 +190,44 @@ struct Output {
     at: usize,
 }
 
-/// Spawn `shell` (or `%ComSpec%`, else `cmd.exe`) on a new pseudoconsole.
-/// `token` is held by the reaper until the shell is reaped and the
-/// pseudoconsole closed, and by the output reader until the output ends.
+/// Spawn `shell` (or `%ComSpec%`, else `cmd.exe`) on a new pseudoconsole,
+/// as a regular shell: one without administrator rights, whatever this
+/// process holds. `token` is held by the reaper until the shell is reaped
+/// and the pseudoconsole closed, and by the output reader until the output
+/// ends.
+#[cfg(test)]
 pub fn spawn(cols: u16, rows: u16, shell: Option<&Path>, token: Arc<()>) -> io::Result<Pty> {
+    Pty::spawn_with_privilege(cols, rows, shell, token, false)
+}
+
+impl Pty {
+    /// Start a shell at the chosen privilege. A regular shell (`elevated` false)
+    /// never holds administrator rights; it is refused when a token without
+    /// them cannot be made and verified. An elevated shell runs with this
+    /// process's administrator token and is refused with
+    /// `ErrorKind::PermissionDenied` when this process has none: nothing
+    /// prompts for elevation. The token is settled before any pipe,
+    /// pseudoconsole or thread exists.
+    pub fn spawn_with_privilege(
+        cols: u16,
+        rows: u16,
+        shell: Option<&Path>,
+        token: Arc<()>,
+        elevated: bool,
+    ) -> io::Result<Pty> {
+        let identity = Identity::select(elevated)?;
+        launch(cols, rows, shell, token, &identity)
+    }
+}
+
+/// Start the shell under `identity` on a new pseudoconsole.
+fn launch(
+    cols: u16,
+    rows: u16,
+    shell: Option<&Path>,
+    token: Arc<()>,
+    identity: &Identity,
+) -> io::Result<Pty> {
     let (input_read, input) = input_pipe()?;
     let (output, output_write) = pipe()?;
     // Start the reaper before creating ConPTY. A thread creation failure
@@ -158,7 +258,7 @@ pub fn spawn(cols: u16, rows: u16, shell: Option<&Path>, token: Arc<()>) -> io::
             .name("massrelay-private-pty-read".into())
             .spawn(move || read_output(output, chunks, token))?
     };
-    let shell = Shell(start(con, shell)?);
+    let shell = Shell(start(con, shell, identity)?);
     let (exit_tx, exited) = oneshot::channel();
     let (_stop, stop) = std::sync::mpsc::channel::<()>();
     if let Err(unsent) = start_reaper.send((shell, console, reader, exit_tx, stop, token)) {
@@ -287,8 +387,9 @@ impl TestInput {
     }
 }
 
-/// Start the shell attached to `con`, returning its process handle.
-fn start(con: HPCON, shell: Option<&Path>) -> io::Result<Handle> {
+/// Start the shell attached to `con` under `identity`, returning its
+/// process handle.
+fn start(con: HPCON, shell: Option<&Path>, identity: &Identity) -> io::Result<Handle> {
     let program: OsString = match shell {
         Some(path) => path.as_os_str().to_owned(),
         None => std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into()),
@@ -324,26 +425,431 @@ fn start(con: HPCON, shell: Option<&Path>) -> io::Result<Handle> {
     info.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
     info.lpAttributeList = attributes.list();
     let mut process = PROCESS_INFORMATION::default();
+    let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT;
+    let directory = directory.as_ref().map_or(null(), |d| d.as_ptr());
     // SAFETY: every pointer is valid for the call: the command line is a
     // mutable NUL-terminated buffer, the environment a double-NUL-terminated
     // UTF-16 block, the directory NUL-terminated or null. No handle is
-    // inherited.
+    // inherited. A filtered token is an open primary token with
+    // TOKEN_QUERY, TOKEN_DUPLICATE and TOKEN_ASSIGN_PRIMARY access.
     check(unsafe {
-        CreateProcessW(
-            null(),
-            command_line.as_mut_ptr(),
-            null(),
-            null(),
-            0,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-            environment.as_ptr() as *const c_void,
-            directory.as_ref().map_or(null(), |d| d.as_ptr()),
-            &info.StartupInfo,
-            &mut process,
-        )
+        match identity {
+            Identity::Inherited => CreateProcessW(
+                null(),
+                command_line.as_mut_ptr(),
+                null(),
+                null(),
+                0,
+                flags,
+                environment.as_ptr() as *const c_void,
+                directory,
+                &info.StartupInfo,
+                &mut process,
+            ),
+            Identity::Filtered(token) => CreateProcessAsUserW(
+                token.0,
+                null(),
+                command_line.as_mut_ptr(),
+                null(),
+                null(),
+                0,
+                flags,
+                environment.as_ptr() as *const c_void,
+                directory,
+                &info.StartupInfo,
+                &mut process,
+            ),
+        }
     })?;
     drop(Handle(process.hThread));
     Ok(Handle(process.hProcess))
+}
+
+/// The token a shell runs under.
+enum Identity {
+    /// This process's own token, which `CreateProcessW` hands on.
+    Inherited,
+    /// A filtered copy of this process's token without administrator
+    /// rights, for `CreateProcessAsUserW`.
+    Filtered(Handle),
+}
+
+impl Identity {
+    /// Settle the token for a shell, or refuse the shell. See the module
+    /// documentation for what each privilege requires.
+    fn select(elevated: bool) -> io::Result<Self> {
+        if elevated {
+            let own = process_token(TOKEN_QUERY | TOKEN_DUPLICATE)?;
+            if !Standing::of(&own)?.is_administrator() || !effective_admin(&own)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "an elevated shell needs MassRelay itself to run with administrator rights",
+                ));
+            }
+            return Ok(Self::Inherited);
+        }
+        let kept = regular_privileges()?;
+        if is_regular_token(&process_token(TOKEN_QUERY)?, &kept)? {
+            return Ok(Self::Inherited);
+        }
+        filtered_token(&kept).map(Self::Filtered)
+    }
+}
+
+/// Check membership against the exact runtime token, including restricting
+/// SIDs, without impersonating on this thread.
+fn effective_admin(token: &Handle) -> io::Result<bool> {
+    let mut duplicate = null_mut();
+    // SAFETY: the source has TOKEN_DUPLICATE; the output pointer is valid.
+    check(unsafe { DuplicateToken(token.0, SecurityIdentification, &mut duplicate) })?;
+    let duplicate = Handle(duplicate);
+    let admins = Sid::well_known(WinBuiltinAdministratorsSid)?;
+    let mut member = 0;
+    // SAFETY: the duplicate is an open impersonation token; the SID and output
+    // pointer are valid.
+    check(unsafe { CheckTokenMembership(duplicate.0, admins.as_psid(), &mut member) })?;
+    Ok(member != 0)
+}
+
+/// What a token may do, as far as choosing a shell's privilege goes.
+struct Standing {
+    /// `BUILTIN\Administrators` is enabled for access checks.
+    administrator: bool,
+    /// Windows reports the token as elevated: it holds an administrative
+    /// group or privilege.
+    elevated: bool,
+    /// The mandatory integrity level (the label's last subauthority).
+    integrity: u32,
+}
+
+impl Standing {
+    fn of(token: &Handle) -> io::Result<Self> {
+        let admins = Sid::well_known(WinBuiltinAdministratorsSid)?;
+        let groups = token_info(token, TokenGroups)?;
+        // SAFETY: `groups` holds the TOKEN_GROUPS just read.
+        let groups = unsafe { group_entries(&groups) }?;
+        let administrator = groups.iter().any(|group| {
+            // SAFETY: both are valid SIDs: one from the token, one built above.
+            group.Attributes & GROUP_ENABLED != 0
+                && unsafe { EqualSid(group.Sid, admins.as_psid()) } != 0
+        });
+        let elevation = token_info(token, TokenElevation)?;
+        // SAFETY: the buffer holds the TOKEN_ELEVATION just read.
+        let elevated = unsafe { (*elevation.as_ptr().cast::<TOKEN_ELEVATION>()).TokenIsElevated };
+        Ok(Self {
+            administrator,
+            elevated: elevated != 0,
+            integrity: integrity(token)?,
+        })
+    }
+
+    /// No administrator rights of any kind.
+    fn is_regular(&self) -> bool {
+        !self.administrator && !self.elevated && self.integrity <= INTEGRITY_MEDIUM
+    }
+
+    /// An administrator's token as a process actually runs with it; a
+    /// UAC-limited token of an administrator account is not one.
+    fn is_administrator(&self) -> bool {
+        self.administrator && self.elevated && self.integrity >= INTEGRITY_HIGH
+    }
+}
+
+/// A filtered copy of this process's primary token that passed every check
+/// for a regular shell.
+fn filtered_token(kept: &[LUID]) -> io::Result<Handle> {
+    // The new token's handle carries the same access as this one.
+    let own =
+        process_token(TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_DEFAULT)?;
+    let user = token_info(&own, TokenUser)?;
+    // SAFETY: the buffer holds the TOKEN_USER just read; its SID points into
+    // the buffer, which lives to the end of this function.
+    let user = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    let system = Sid::well_known(WinLocalSystemSid)?;
+    // SAFETY: both are valid SIDs.
+    if unsafe { EqualSid(user, system.as_psid()) } != 0 {
+        // Filtering cannot take away what the SYSTEM account itself is granted.
+        return Err(other("a shell run by the SYSTEM account cannot be regular"));
+    }
+
+    let held = token_info(&own, TokenPrivileges)?;
+    // SAFETY: `held` holds the TOKEN_PRIVILEGES just read.
+    let held = unsafe { privilege_entries(&held) }?;
+    let delete: Vec<LUID_AND_ATTRIBUTES> = held
+        .iter()
+        .filter(|privilege| !kept.iter().any(|keep| same_luid(keep, &privilege.Luid)))
+        .map(|privilege| LUID_AND_ATTRIBUTES {
+            Luid: privilege.Luid,
+            Attributes: 0,
+        })
+        .collect();
+    let admins = Sid::well_known(WinBuiltinAdministratorsSid)?;
+    let deny_only = [SID_AND_ATTRIBUTES {
+        Sid: admins.as_psid(),
+        Attributes: 0,
+    }];
+    let mut filtered = null_mut();
+    // SAFETY: `own` is open with TOKEN_DUPLICATE; both lists are valid for
+    // the counts given; `filtered` is a valid out pointer. LUA_TOKEN applies
+    // the UAC filter (administrative groups deny-only, administrative
+    // privileges removed); the lists make the two outcomes this relies on
+    // explicit.
+    check(unsafe {
+        CreateRestrictedToken(
+            own.0,
+            LUA_TOKEN,
+            deny_only.len() as u32,
+            deny_only.as_ptr(),
+            delete.len() as u32,
+            delete.as_ptr(),
+            0,
+            null(),
+            &mut filtered,
+        )
+    })?;
+    let filtered = Handle(filtered);
+
+    // Filtering leaves the integrity level alone. A token's level may always
+    // be lowered.
+    if integrity(&filtered)? > INTEGRITY_MEDIUM {
+        let medium = Sid::well_known(WinMediumLabelSid)?;
+        let label = TOKEN_MANDATORY_LABEL {
+            Label: SID_AND_ATTRIBUTES {
+                Sid: medium.as_psid(),
+                Attributes: GROUP_INTEGRITY,
+            },
+        };
+        // SAFETY: `label` and its SID are valid for the call.
+        let bytes = std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32
+            + unsafe { GetLengthSid(medium.as_psid()) };
+        // SAFETY: as above; the handle has TOKEN_ADJUST_DEFAULT access.
+        check(unsafe {
+            SetTokenInformation(
+                filtered.0,
+                TokenIntegrityLevel,
+                (&raw const label).cast(),
+                bytes,
+            )
+        })?;
+    }
+
+    // An administrator's token names Administrators as the owner of what it
+    // creates and grants those objects to Administrators and SYSTEM only.
+    // With Administrators deny-only, the shell could not reopen its own
+    // objects. Give it what a standard user's token has.
+    let owner = TOKEN_OWNER { Owner: user };
+    // SAFETY: `owner` and the user SID are valid for the call.
+    check(unsafe {
+        SetTokenInformation(
+            filtered.0,
+            TokenOwner,
+            (&raw const owner).cast(),
+            std::mem::size_of::<TOKEN_OWNER>() as u32,
+        )
+    })?;
+    let groups = token_info(&filtered, TokenGroups)?;
+    // SAFETY: `groups` holds the TOKEN_GROUPS just read.
+    let logon = unsafe { group_entries(&groups) }?
+        .iter()
+        .find(|group| group.Attributes & GROUP_LOGON_ID == GROUP_LOGON_ID)
+        .map(|group| (group.Sid, GENERIC_READ | GENERIC_EXECUTE));
+    let grants: Vec<(PSID, u32)> = [(user, GENERIC_ALL), (system.as_psid(), GENERIC_ALL)]
+        .into_iter()
+        .chain(logon)
+        .collect();
+    let mut acl = acl(&grants)?;
+    let dacl = TOKEN_DEFAULT_DACL {
+        DefaultDacl: acl.as_mut_ptr().cast(),
+    };
+    // SAFETY: `dacl` points at the access list built above.
+    check(unsafe {
+        SetTokenInformation(
+            filtered.0,
+            TokenDefaultDacl,
+            (&raw const dacl).cast(),
+            std::mem::size_of::<TOKEN_DEFAULT_DACL>() as u32,
+        )
+    })?;
+
+    if !is_regular_token(&filtered, kept)? {
+        return Err(other(
+            "Windows did not produce a token without administrator rights for a regular shell",
+        ));
+    }
+    Ok(filtered)
+}
+
+/// An inherited or filtered regular token must satisfy the same checks.
+fn is_regular_token(token: &Handle, kept: &[LUID]) -> io::Result<bool> {
+    if !Standing::of(token)?.is_regular() {
+        return Ok(false);
+    }
+    let kind = token_info(token, TokenType)?;
+    // SAFETY: the buffer holds the TOKEN_TYPE just read.
+    let primary = unsafe { *kind.as_ptr().cast::<TOKEN_TYPE>() } == TokenPrimary;
+    let held = token_info(token, TokenPrivileges)?;
+    // SAFETY: `held` holds the TOKEN_PRIVILEGES just read.
+    let held = unsafe { privilege_entries(&held) }?;
+    Ok(primary
+        && held
+            .iter()
+            .all(|privilege| kept.iter().any(|keep| same_luid(keep, &privilege.Luid))))
+}
+
+/// This process's primary token.
+fn process_token(access: TOKEN_ACCESS_MASK) -> io::Result<Handle> {
+    let mut token = null_mut();
+    // SAFETY: the pseudo-handle of this process is always valid; `token` is
+    // a valid out pointer.
+    check(unsafe { OpenProcessToken(GetCurrentProcess(), access, &mut token) })?;
+    Ok(Handle(token))
+}
+
+/// One class of a token's information. `u64` elements keep the structure in
+/// it aligned.
+fn token_info(token: &Handle, class: TOKEN_INFORMATION_CLASS) -> io::Result<Vec<u64>> {
+    let mut bytes = 0u32;
+    // SAFETY: a size query; nothing is written but `bytes`.
+    unsafe { GetTokenInformation(token.0, class, null_mut(), 0, &mut bytes) };
+    let mut buf = vec![0u64; (bytes as usize).div_ceil(8).max(1)];
+    // SAFETY: `buf` is writable for the length given.
+    check(unsafe {
+        GetTokenInformation(
+            token.0,
+            class,
+            buf.as_mut_ptr().cast(),
+            std::mem::size_of_val(buf.as_slice()) as u32,
+            &mut bytes,
+        )
+    })?;
+    Ok(buf)
+}
+
+/// The groups of a `TOKEN_GROUPS`.
+///
+/// # Safety
+/// `buf` is a `TokenGroups` result of [`token_info`].
+unsafe fn group_entries(buf: &[u64]) -> io::Result<&[SID_AND_ATTRIBUTES]> {
+    let list = buf.as_ptr().cast::<TOKEN_GROUPS>();
+    // SAFETY: Windows wrote the structure, its count and that many entries.
+    unsafe { entries(buf, (*list).GroupCount, (&raw const (*list).Groups).cast()) }
+}
+
+/// The privileges of a `TOKEN_PRIVILEGES`.
+///
+/// # Safety
+/// `buf` is a `TokenPrivileges` result of [`token_info`].
+unsafe fn privilege_entries(buf: &[u64]) -> io::Result<&[LUID_AND_ATTRIBUTES]> {
+    let list = buf.as_ptr().cast::<TOKEN_PRIVILEGES>();
+    // SAFETY: Windows wrote the structure, its count and that many entries.
+    unsafe {
+        entries(
+            buf,
+            (*list).PrivilegeCount,
+            (&raw const (*list).Privileges).cast(),
+        )
+    }
+}
+
+/// The `count` entries starting at `first` of a counted list that Windows
+/// wrote to `buf`, refused if they would not fit in it.
+///
+/// # Safety
+/// `first` points into `buf`, where Windows wrote that many entries.
+unsafe fn entries<T>(buf: &[u64], count: u32, first: *const T) -> io::Result<&[T]> {
+    let offset = (first as usize).wrapping_sub(buf.as_ptr() as usize);
+    let end = (count as usize)
+        .checked_mul(std::mem::size_of::<T>())
+        .and_then(|bytes| bytes.checked_add(offset));
+    if end.is_none_or(|end| end > std::mem::size_of_val(buf)) {
+        return Err(other("a token list is larger than its buffer"));
+    }
+    // SAFETY: the entries lie inside `buf` (checked above), which the
+    // returned slice borrows.
+    Ok(unsafe { std::slice::from_raw_parts(first, count as usize) })
+}
+
+/// A token's integrity level: the last subauthority of its mandatory label.
+fn integrity(token: &Handle) -> io::Result<u32> {
+    let label = token_info(token, TokenIntegrityLevel)?;
+    // SAFETY: the buffer holds the TOKEN_MANDATORY_LABEL just read, whose
+    // SID points into it; a subauthority below the count is in the SID.
+    unsafe {
+        let sid = (*label.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()).Label.Sid;
+        match *GetSidSubAuthorityCount(sid) {
+            0 => Err(other("the token's integrity label is empty")),
+            count => Ok(*GetSidSubAuthority(sid, u32::from(count) - 1)),
+        }
+    }
+}
+
+/// The identifiers of [`REGULAR_PRIVILEGES`] on this machine.
+fn regular_privileges() -> io::Result<Vec<LUID>> {
+    REGULAR_PRIVILEGES
+        .iter()
+        .map(|&name| {
+            let mut luid = LUID::default();
+            // SAFETY: `name` is a NUL-terminated constant; `luid` is a valid
+            // out pointer. A null system name is this machine.
+            check(unsafe { LookupPrivilegeValueW(null(), name, &mut luid) })?;
+            Ok(luid)
+        })
+        .collect()
+}
+
+fn same_luid(a: &LUID, b: &LUID) -> bool {
+    a.LowPart == b.LowPart && a.HighPart == b.HighPart
+}
+
+/// A well-known SID. `SECURITY_MAX_SID_SIZE` is 68 bytes; `u32` elements
+/// keep it aligned.
+struct Sid([u32; 17]);
+
+impl Sid {
+    fn well_known(kind: WELL_KNOWN_SID_TYPE) -> io::Result<Self> {
+        let mut sid = Self([0; 17]);
+        let mut bytes = std::mem::size_of_val(&sid.0) as u32;
+        // SAFETY: the buffer is writable for `bytes` bytes; these SIDs have
+        // no domain part.
+        check(unsafe {
+            CreateWellKnownSid(kind, null_mut(), sid.0.as_mut_ptr().cast(), &mut bytes)
+        })?;
+        Ok(sid)
+    }
+
+    /// For calls that only read the SID.
+    fn as_psid(&self) -> PSID {
+        self.0.as_ptr().cast_mut().cast()
+    }
+}
+
+/// An access list that allows each SID its mask. `u32` elements keep it
+/// aligned.
+fn acl(grants: &[(PSID, u32)]) -> io::Result<Vec<u32>> {
+    // Each entry ends with its SID, whose first four bytes the entry
+    // structure already counts.
+    let fixed = std::mem::size_of::<ACCESS_ALLOWED_ACE>() - std::mem::size_of::<u32>();
+    let bytes = grants
+        .iter()
+        .fold(std::mem::size_of::<ACL>(), |bytes, (sid, _)| {
+            // SAFETY: every SID given is valid.
+            bytes + fixed + unsafe { GetLengthSid(*sid) } as usize
+        });
+    let mut acl = vec![0u32; bytes.div_ceil(4)];
+    let list = acl.as_mut_ptr().cast::<ACL>();
+    // SAFETY: the buffer is writable for the length given.
+    check(unsafe {
+        InitializeAcl(
+            list,
+            std::mem::size_of_val(acl.as_slice()) as u32,
+            ACL_REVISION,
+        )
+    })?;
+    for &(sid, mask) in grants {
+        // SAFETY: the list was initialized with room for every entry.
+        check(unsafe { AddAccessAllowedAce(list, ACL_REVISION, mask, sid) })?;
+    }
+    Ok(acl)
 }
 
 /// A process thread attribute list with room for one attribute.

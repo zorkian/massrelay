@@ -74,7 +74,7 @@ Run `massrelay decline PEER` to end a pairing. Run `massrelay revoke PEER` to cu
 
 ## Share services
 
-A destination chooses which peers can access each service. Shell access gives the peer the privileges of the account running MassRelay. The destination can choose the executable with `massrelay run --shell PATH`. For Windows PowerShell, use `massrelay run --shell powershell.exe`.
+A destination chooses which peers can access each service. On Windows, `massrelay shell PEER` opens a regular shell. Use `massrelay shell PEER --elevated` to request an administrator shell from an administrator runtime. A single shell grant permits both choices. On Linux and macOS, the shell runs as the account running MassRelay and can use that account's usual `sudo` permissions. Upgrade both ends before using the new shell client. It requires a local daemon and a destination that understand explicit shell privilege requests. The destination can choose the executable with `massrelay run --shell PATH`. For Windows PowerShell, use `massrelay run --shell powershell.exe`.
 
 ```sh
 # On the workstation
@@ -100,7 +100,7 @@ An exposure lasts while its command runs. Declining, revoking, or disabling the 
 
 After `massrelay create` or `massrelay join`, run `massrelay install` to set up background operation. Use `massrelay start`, `restart`, or `stop` with the same state directory. Stop any foreground instance of `massrelay run` before installing the service.
 
-On Windows, open PowerShell as administrator under the same account that enrolled the device. Run `massrelay install --allow-administrator` to acknowledge that peers with shell access will get an administrator shell. Enter the account password when prompted. The service starts at boot before sign-in and uses Windows PowerShell by default. Use a local elevated terminal for `start`, `stop`, and `restart`. If the account password changes, repeat `install` to update Windows’ service credentials. Stop the service before using `install.ps1` to replace the executable.
+On Windows, open PowerShell as administrator under the same account that enrolled the device. Run `massrelay install --allow-administrator` to acknowledge that peers with shell access can request an administrator shell. Enter the account password when prompted. The service starts at boot before sign-in and uses Windows PowerShell by default. Use a local elevated terminal for `start`, `stop`, and `restart`. If the account password changes, repeat `install` to update Windows’ service credentials. Stop the service before using `install.ps1` to replace the executable.
 
 Linux uses a systemd user unit. macOS uses a LaunchAgent in your login session.
 

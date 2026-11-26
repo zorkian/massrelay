@@ -109,10 +109,10 @@ def _exercise(binary, root, processes):
     def members(state):
         return {k for k, row in peers(state).items() if row[2] == "yes"}
 
-    def terminal(source, target, allowed):
+    def terminal(source, target, allowed, *flags):
         master, slave = pty.openpty()
         proc = subprocess.Popen(
-            args(source, "shell", target), stdin=slave, stdout=slave, stderr=slave,
+            args(source, "shell", target, *flags), stdin=slave, stdout=slave, stderr=slave,
             env=inherited,
         )
         os.close(slave)
@@ -319,6 +319,7 @@ def _exercise(binary, root, processes):
 
     cli("a", "enable", "shell", "bob")
     terminal("b", "workstation", True)
+    terminal("b", "workstation", False, "--elevated")
 
     echo_target, other_target = TcpTarget(echo), TcpTarget(echo)
     tcp_service, other_service = f"tcp:{echo_target.port}", f"tcp:{other_target.port}"

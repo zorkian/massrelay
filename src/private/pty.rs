@@ -62,10 +62,10 @@ use std::sync::Arc;
 pub use unix::{Pty, Teardown, spawn};
 
 #[cfg(windows)]
-pub use windows::{Pty, Teardown, spawn};
+pub use windows::{Pty, Teardown};
 
 #[cfg(all(test, windows))]
-pub(crate) use windows::TestInput;
+pub(crate) use windows::{TestInput, spawn};
 
 #[cfg(not(any(unix, windows)))]
 pub use other::{Pty, Teardown, spawn};

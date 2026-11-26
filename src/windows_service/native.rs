@@ -134,7 +134,7 @@ pub fn install(dir: &Path, options: InstallOptions) -> Result<()> {
     ensure!(
         options.allow_administrator || !is_administrator()?,
         "{} is an administrator, and Windows runs an administrator's service with full \
-         administrator rights: a peer you grant the shell would get an elevated shell, unlike \
+         administrator rights: a peer with shell access can request an elevated shell, unlike \
          'massrelay run' in an ordinary terminal. To accept that, run 'massrelay install \
          --allow-administrator'",
         account.name()
@@ -1390,9 +1390,28 @@ fn os_error(code: u32) -> anyhow::Error {
 #[cfg(test)]
 mod service_fixture {
     use super::*;
+    use crate::private::pty::Pty;
     use serde::Deserialize;
     use std::sync::Arc;
-    use tokio::{io::AsyncWriteExt, time::timeout};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        time::timeout,
+    };
+
+    /// Typed into PowerShell, which inspects its own token and exits with what it found: 32,
+    /// plus 1 if it is an administrator, 2 at medium integrity, 4 at high integrity and 8 if
+    /// it holds the privilege to debug other accounts' processes.
+    const REPORT: &str = concat!(
+        "$i=[Security.Principal.WindowsIdentity]::GetCurrent();",
+        "$a=([Security.Principal.WindowsPrincipal]$i)",
+        ".IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator);",
+        "$w=whoami /groups /priv /fo csv;",
+        "exit (32+[int]$a+2*[int][bool]($w -match 'S-1-16-8192')",
+        "+4*[int][bool]($w -match 'S-1-16-12288')",
+        "+8*[int][bool]($w -match 'SeDebugPrivilege'))\r",
+    );
+    const REGULAR: i32 = 32 + 2;
+    const ELEVATED: i32 = 32 + 1 + 4 + 8;
 
     #[derive(Deserialize)]
     struct Probe {
@@ -1412,7 +1431,7 @@ mod service_fixture {
                 .build()?;
             runtime.block_on(async {
                 let (_, recorded) = tokio::join!(until_stopped(), async {
-                    let result = match exercise_powershell().await {
+                    let result = match exercise_as_administrator().await {
                         Ok(()) => "ok".into(),
                         Err(error) => format!("{error:#}"),
                     };
@@ -1425,21 +1444,114 @@ mod service_fixture {
         Ok(())
     }
 
-    async fn exercise_powershell() -> Result<()> {
+    /// The same shells from whatever runs the tests: an elevated terminal has an
+    /// administrator's token like the service does, and an ordinary one must be refused an
+    /// elevated shell.
+    #[tokio::test]
+    #[ignore = "starts native ConPTY shells and Windows PowerShell"]
+    async fn conpty_shells_run_at_the_requested_privilege() -> Result<()> {
+        exercise_privileges().await
+    }
+
+    /// The service case: an administrator's service logon in the services session, which
+    /// has no limited token to fall back on.
+    async fn exercise_as_administrator() -> Result<()> {
+        ensure!(
+            is_administrator()?,
+            "the probe service does not run with administrator rights"
+        );
+        exercise_privileges().await
+    }
+
+    /// A regular shell holds no administrator rights whatever this process holds. An
+    /// elevated shell holds this process's administrator rights, or is refused when there
+    /// are none. Starting either leaves this process's own rights as they were.
+    async fn exercise_privileges() -> Result<()> {
+        let administrator = is_administrator()?;
         let shell = PathBuf::from(powershell()?);
-        let mut pty = crate::private::pty::spawn(80, 24, Some(&shell), Arc::new(()))?;
-        let exit = pty.take_exit();
+        let start =
+            |elevated| Pty::spawn_with_privilege(80, 24, Some(&shell), Arc::new(()), elevated);
+        let regular = start(false).context("start a regular shell")?;
+        let elevated = match start(true) {
+            Ok(pty) if administrator => Some(pty),
+            Ok(_) => bail!("a process without administrator rights started an elevated shell"),
+            Err(error) if administrator => return Err(error).context("start an elevated shell"),
+            Err(error) => {
+                ensure!(
+                    error.kind() == io::ErrorKind::PermissionDenied,
+                    "an elevated shell was not refused as a permission error: {error}"
+                );
+                None
+            }
+        };
+        // Both at once, as two sessions of one service would be.
+        let (regular, elevated) = tokio::join!(report(regular, "regular", REGULAR), async {
+            match elevated {
+                Some(pty) => report(pty, "elevated", ELEVATED).await,
+                None => Ok(()),
+            }
+        });
+        regular?;
+        elevated?;
+        ensure!(
+            is_administrator()? == administrator,
+            "starting shells changed this process's own administrator rights"
+        );
+        Ok(())
+    }
+
+    /// Have the shell report on its own token, and check the report.
+    async fn report(mut pty: Pty, kind: &str, expected: i32) -> Result<()> {
+        let mut exit = pty.take_exit();
         let teardown = pty.teardown();
-        let result = timeout(Duration::from_secs(30), async {
-            pty.writer().write_all(b"exit 37\r").await?;
-            let code = exit.await??;
-            ensure!(code == 37, "PowerShell exited with {code} instead of 37");
-            Ok::<_, anyhow::Error>(())
-        })
-        .await;
+        let mut output = Vec::new();
+        let code = {
+            let mut reader = pty.reader();
+            timeout(Duration::from_secs(30), async {
+                pty.writer().write_all(REPORT.as_bytes()).await?;
+                // Keep reading, so the console host never waits on a full output pipe.
+                let mut chunk = [0u8; 4096];
+                loop {
+                    tokio::select! {
+                        code = &mut exit => return Ok::<_, anyhow::Error>(code??),
+                        read = reader.read(&mut chunk) => match read {
+                            Ok(read) if read > 0 => output.extend_from_slice(&chunk[..read]),
+                            // The output ended; the exit code follows.
+                            _ => return Ok((&mut exit).await??),
+                        },
+                    }
+                }
+            })
+            .await
+        };
         drop(pty);
         timeout(Duration::from_secs(10), teardown.wait()).await?;
-        result??;
+        let seen = String::from_utf8_lossy(&output[output.len().saturating_sub(2048)..]);
+        let code = code
+            .map_err(|_| anyhow!("the {kind} shell did not report in 30 seconds"))
+            .flatten()
+            .with_context(|| format!("the {kind} shell failed; its output ended {seen:?}"))?;
+        ensure!(
+            code == expected,
+            "the {kind} shell reported {} instead of {}; its output ended {seen:?}",
+            reading(code),
+            reading(expected)
+        );
         Ok(())
+    }
+
+    /// A report's exit code in words.
+    fn reading(code: i32) -> String {
+        match code - 32 {
+            flags @ 0..16 => format!(
+                "exit code {code} (administrator: {}, medium integrity: {}, high integrity: {}, \
+                 debug privilege: {})",
+                flags & 1 != 0,
+                flags & 2 != 0,
+                flags & 4 != 0,
+                flags & 8 != 0
+            ),
+            _ => format!("exit code {code}, which is not a report"),
+        }
     }
 }

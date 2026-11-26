@@ -17,7 +17,7 @@
 //!   on every directory up to the drive root). It never changes permissions to pass the check;
 //! - a state directory owned by a different account than the one running the install;
 //! - an administrator account, unless `--allow-administrator` is given. Windows gives a
-//!   service logon the full administrator token, so peers granted the shell would get an
+//!   service logon the full administrator token, so peers granted the shell can request an
 //!   elevated shell, unlike `massrelay run` in an ordinary terminal.
 //!
 //! This file holds the decisions, which are tested on every platform. `native` holds the
@@ -41,7 +41,7 @@ pub struct InstallOptions {
     /// Read the account password from standard input instead of asking at the console.
     #[arg(long)]
     pub password_stdin: bool,
-    /// Accept that an administrator account's service gives peers with shell access an
+    /// Accept that an administrator account's service lets peers with shell access request an
     /// elevated shell.
     #[arg(long)]
     pub allow_administrator: bool,

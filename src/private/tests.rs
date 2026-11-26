@@ -3965,6 +3965,7 @@ mod service {
     async fn open(from: &Peer, to: &Peer, service: Service) -> ServiceStream {
         let req = PrivateRequest {
             service,
+            elevated: false,
             terminal: Some((80, 24)),
         };
         tokio::time::timeout(
@@ -4171,6 +4172,7 @@ mod service {
         let restarted = start(&network, &alice, false).await;
         let request = PrivateRequest {
             service,
+            elevated: false,
             terminal: None,
         };
         let stream = tokio::time::timeout(
@@ -4244,6 +4246,7 @@ mod service {
             let addr = EndpointAddr::new(b.id()).with_relay_url(url);
             let request = PrivateRequest {
                 service,
+                elevated: false,
                 terminal: None,
             };
             let first = source
@@ -4298,6 +4301,27 @@ mod service {
         let (uport, mut useen) = udp_echo().await;
         let (a, b) = (start(&n, &alice, false).await, start(&n, &bob, true).await);
         authorize(&a, &b, &[Service::Shell, tcp(tport), udp(uport)]).await;
+
+        #[cfg(not(windows))]
+        {
+            let req = PrivateRequest {
+                service: Service::Shell,
+                terminal: Some((80, 24)),
+                elevated: true,
+            };
+            let shell =
+                tokio::time::timeout(T, a.node.open_service(&a.endpoint, addr(&b.endpoint), req))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(matches!(
+                shell.reply,
+                ServiceReply::Refused {
+                    refusal: WireRefusal::TargetUnavailable,
+                    ..
+                }
+            ));
+        }
 
         let mut sh = open(&a, &b, Service::Shell).await;
         assert!(matches!(sh.reply, ServiceReply::Ready));
@@ -4393,6 +4417,7 @@ mod service {
         c.node.approve("bob", &b.ep, false).unwrap();
         let req = PrivateRequest {
             service: Service::Shell,
+            elevated: false,
             terminal: None,
         };
         let r = tokio::time::timeout(T, c.node.open_service(&c.endpoint, addr(&b.endpoint), req))
@@ -4521,6 +4546,7 @@ mod service {
         // A new attempt is refused before any exchange completes.
         let req = PrivateRequest {
             service: Service::Shell,
+            elevated: false,
             terminal: None,
         };
         assert!(
@@ -4675,6 +4701,7 @@ mod service {
         approved.await.unwrap();
         let req = PrivateRequest {
             service: Service::Shell,
+            elevated: false,
             terminal: None,
         };
         let r = tokio::time::timeout(T, a.node.open_service(&a.endpoint, addr(&eb), req))
@@ -4887,6 +4914,7 @@ mod runtime {
     ) {
         let life = crate::local::Lifetime::bind().await.unwrap();
         let req = ControlRequest::Shell {
+            elevated: false,
             peer: peer.into(),
             cols: 80,
             rows: 24,
@@ -5531,6 +5559,7 @@ mod runtime {
             .await
             .unwrap();
         let req = ControlRequest::Shell {
+            elevated: false,
             peer: key(&carol),
             cols: 80,
             rows: 24,

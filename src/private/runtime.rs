@@ -178,8 +178,13 @@ pub enum ControlRequest {
     },
     /// Interactive shell. The lifetime socket tells the runtime the command
     /// left even while setup is pending or the data socket is backed up.
+    // Older runtimes must reject new requests instead of discarding the
+    // privilege choice and sending a legacy shell request.
+    #[serde(rename = "ShellWithPrivilege", alias = "Shell")]
     Shell {
         peer: String,
+        #[serde(default)]
+        elevated: bool,
         cols: u16,
         rows: u16,
         lifetime_port: u16,
@@ -742,6 +747,7 @@ async fn serve_control<M: Mailbox + Send + Sync + 'static>(
     match request {
         ControlRequest::Shell {
             peer,
+            elevated,
             cols,
             rows,
             lifetime_port,
@@ -756,8 +762,11 @@ async fn serve_control<M: Mailbox + Send + Sync + 'static>(
                 &shared,
                 socket,
                 &peer,
-                Service::Shell,
-                Some((cols, rows)),
+                PrivateRequest {
+                    service: Service::Shell,
+                    terminal: Some((cols, rows)),
+                    elevated,
+                },
                 lifetime,
             )
             .await
@@ -781,7 +790,18 @@ async fn serve_control<M: Mailbox + Send + Sync + 'static>(
                 audit("failed", Some("lifetime_channel_failed"));
             }
             let lifetime = lifetime?;
-            outbound(&shared, socket, &peer, service, None, lifetime).await
+            outbound(
+                &shared,
+                socket,
+                &peer,
+                PrivateRequest {
+                    service,
+                    terminal: None,
+                    elevated: false,
+                },
+                lifetime,
+            )
+            .await
         }
         ControlRequest::Expose {
             peer,
@@ -986,8 +1006,7 @@ async fn outbound<M: Mailbox + Send + Sync + 'static>(
     shared: &Shared<M>,
     mut socket: TcpStream,
     selector: &str,
-    service: Service,
-    terminal: Option<(u16, u16)>,
+    req: PrivateRequest,
     mut lifetime: TcpStream,
 ) -> Result<()> {
     // Resolves (and stays resolved when polled again) once the command's
@@ -1008,6 +1027,7 @@ async fn outbound<M: Mailbox + Send + Sync + 'static>(
         std::task::Poll::Ready(())
     });
     let log = shared.node.log();
+    let service = req.service;
     let track = log.outbound(service);
     // Each failure carries its fixed log reason and the text for the command.
     let setup = async {
@@ -1027,7 +1047,6 @@ async fn outbound<M: Mailbox + Send + Sync + 'static>(
             let e = "the peer's address names a different endpoint".to_string();
             return Err(("setup_failed", e));
         }
-        let req = PrivateRequest { service, terminal };
         let opened = shared.node.open_service(&shared.endpoint, addr, req).await;
         // The exchange may have learned a decision or paired.
         audit::observe(&shared.node, false);
@@ -1225,11 +1244,12 @@ pub async fn command(dir: &Path, request: ControlRequest) -> Result<ControlReply
 
 /// Interactive shell on a peer through the private runtime. Output frames
 /// longer than the shell format allows end the session.
-pub async fn shell(dir: &Path, peer: String) -> Result<i32> {
+pub async fn shell(dir: &Path, peer: String, elevated: bool) -> Result<i32> {
     let (cols, rows) = terminal::size()?;
     let lifetime = local::Lifetime::bind().await?;
     let req = ControlRequest::Shell {
         peer,
+        elevated,
         cols,
         rows,
         lifetime_port: lifetime.port,
