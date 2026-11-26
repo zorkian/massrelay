@@ -2742,6 +2742,7 @@ mod pairing {
             Peers::new(&bob.dev, &ob).unwrap(),
         );
         pb.approve("alice", &alice.ep, false).unwrap();
+        assert!(pb.grant(&alice.ep, tcp(22)).unwrap());
         pa.decline(&bob.ep).unwrap();
         let (la, lb) = link(&alice, &bob);
         let (x, y) = exchange(&pa, &la, &pb, &lb);
@@ -2749,10 +2750,47 @@ mod pairing {
             (refused(x), refused(y)),
             (Refusal::NotApproved, Refusal::RemoteDeclined)
         );
-        assert!(
-            pb.grant(&alice.ep, tcp(22)).is_err(),
-            "no grant without a pairing"
-        );
+        assert!(pb.state().unwrap().pending_grants.is_empty());
+        let peer = pa
+            .state()
+            .unwrap()
+            .peers
+            .into_iter()
+            .find(|p| p.endpoint == bob.ep)
+            .unwrap();
+        pa.approve(&peer.alias, &bob.ep, false).unwrap();
+        let (_aa, ab) = pair(&pa, &alice, &pb, &bob);
+        assert_eq!(refused(pb.open(&ab, tcp(22))), Refusal::ServiceNotGranted);
+    }
+
+    #[test]
+    fn a_grant_waiting_for_pairing_survives_restart_and_is_generation_bound() {
+        let (n, alice, bob, _carol) = three();
+        let (oa, ob) = (owner(&alice), owner(&bob));
+        let pa = Peers::new(&alice.dev, &oa).unwrap();
+        {
+            let pb = Peers::new(&bob.dev, &ob).unwrap();
+            assert!(pb.grant(&alice.ep, tcp(22)).unwrap());
+        }
+        drop(ob);
+        let bob_device = bob.reopen(&n);
+        let ob = owner(&bob);
+        let pb = Peers::new(&bob_device, &ob).unwrap();
+        approve_both(&pa, &alice, &pb, &bob);
+        let exposure = pb
+            .expose(&alice.ep, tcp(23), Some("localhost:42".into()))
+            .unwrap();
+        let (_aa, ab) = pair(&pa, &alice, &pb, &bob);
+        let temporary = pb.open(&ab, tcp(23)).unwrap();
+        assert_eq!(temporary.target.as_deref(), Some("localhost:42"));
+        drop(exposure);
+        assert!(temporary.cancelled().is_some());
+        assert_eq!(refused(pb.open(&ab, tcp(23))), Refusal::ServiceNotGranted);
+        pb.open(&ab, tcp(22)).unwrap();
+        assert!(pb.state().unwrap().pending_grants.is_empty());
+        pb.approve("peer-a", &alice.ep, true).unwrap();
+        let (_aa, ab) = pair(&pa, &alice, &pb, &bob);
+        assert_eq!(refused(pb.open(&ab, tcp(22))), Refusal::ServiceNotGranted);
     }
 
     #[test]
@@ -3227,10 +3265,6 @@ mod pairing {
         );
         pb.clear_exclusion(&alice.ep, Service::Shell).unwrap();
         pb.open(&ab, Service::Shell).unwrap();
-        // The legacy defaults keep their behaviour.
-        let mut legacy = crate::grants::ServiceDefaults::default();
-        let id = iroh::EndpointId::from_bytes(&alice.ep).unwrap();
-        assert!(!legacy.exclude(id, Service::Shell));
     }
 
     #[test]
@@ -3996,6 +4030,45 @@ mod service {
         assert_eq!(node.roster().unwrap().len(), 2);
     }
 
+    #[test]
+    fn membership_retries_identical_bytes_and_restages_a_losing_removal() {
+        let n = net();
+        let alice = create(&n, "alice", Clock::System);
+        let bob = join(&n, &alice, "bob", Clock::System);
+        let carol = join(&n, &alice, "carol", Clock::System);
+        let a = Node::new(alice.reopen(&n), Owner::acquire(&alice.path).unwrap(), None).unwrap();
+        let pending = sent_request(&n, &alice.dev.issue_invite().unwrap(), "dana");
+        alice.dev.poll_join_requests().unwrap();
+        let slot = alice.dev.stage_add(&pending.invite_id).unwrap();
+        let staged = alice.state().journal.unwrap().slot_bytes;
+        n.mailbox.script(
+            &slot,
+            Scripted {
+                store_first: false,
+                result: Err(MailboxError::NotStored("transient".into())),
+            },
+        );
+        assert!(matches!(a.sync_membership().settle, Ok(Settle::Pending)));
+        assert_eq!(alice.state().journal.unwrap().slot_bytes, staged);
+        assert!(matches!(a.sync_membership().settle, Ok(Settle::Accepted)));
+        pending.m.dev.complete_join().unwrap();
+
+        assert!(a.cutoff(&bob.ep).unwrap().removal.is_ok());
+        carol.dev.catch_up();
+        let invite = carol.dev.issue_invite().unwrap();
+        let next = sent_request(&n, &invite, "ellen");
+        carol.dev.poll_join_requests().unwrap();
+        carol.dev.stage_add(&next.invite_id).unwrap();
+        carol.dev.publish().unwrap();
+        assert!(matches!(
+            a.sync_membership().settle,
+            Ok(Settle::Lost { .. })
+        ));
+        assert!(alice.state().local_cutoffs.contains(&bob.ep));
+        assert!(matches!(a.sync_membership().settle, Ok(Settle::Accepted)));
+        assert!(!a.roster().unwrap().contains(&bob.ep));
+    }
+
     /// Approve both ways, pair once (first request is refused for lack of a
     /// grant), then grant `services` on the destination.
     async fn authorize(src: &Peer, dst: &Peer, services: &[Service]) {
@@ -4069,6 +4142,139 @@ mod service {
             ConnectionError::ApplicationClosed(c) => assert_eq!(c.reason.as_ref(), reason),
             other => panic!("closed with {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "runs disposable loopback endpoints and a TCP target"]
+    async fn direct_dial_uses_a_saved_route_after_restart() {
+        let network = net();
+        let alice = create(&network, "alice", Clock::System);
+        let bob = join(&network, &alice, "bob", Clock::System);
+        let (port, _) = tcp_echo().await;
+        let service = tcp(port);
+        let a = start(&network, &alice, false).await;
+        let b = start(&network, &bob, true).await;
+        authorize(&a, &b, &[service]).await;
+        let mut stream = open(&a, &b, service).await;
+        // Production client and server poll the route watcher while serving.
+        tokio::select! {
+            biased;
+            _ = a.node.watch_routes(&stream.conn) => unreachable!(),
+            _ = async {
+                wire::frame(&mut stream.tx, b"\x01cached route").await.unwrap();
+                assert_eq!(wire::read_frame(&mut stream.rx).await.unwrap(), b"\x01cached route");
+            } => {},
+        }
+        drop(stream);
+        a.endpoint.close().await;
+        drop(a);
+        let restarted = start(&network, &alice, false).await;
+        let request = PrivateRequest {
+            service,
+            terminal: None,
+        };
+        let stream = tokio::time::timeout(
+            T,
+            restarted.node.open_service(
+                &restarted.endpoint,
+                EndpointAddr::new(b.endpoint.id()),
+                request,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(stream.reply, ServiceReply::Ready));
+        restarted.endpoint.close().await;
+        b.endpoint.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "runs a loopback relay and TCP target"]
+    async fn encrypted_port_forward_works_with_only_a_relay_path() -> anyhow::Result<()> {
+        use crate::private::pairing::PairError;
+        use iroh::RelayUrl;
+        use iroh_relay::server::{RelayConfig, Server, ServerConfig};
+
+        let pair_error = |error: PairError| anyhow::anyhow!("{error:?}");
+        let network = net();
+        let alice = create(&network, "alice", Clock::System);
+        let bob = join(&network, &alice, "bob", Clock::System);
+        let source = Node::new(
+            alice.reopen(&network),
+            Owner::acquire(&alice.path).map_err(pair_error)?,
+            None,
+        )
+        .map_err(pair_error)?;
+        let destination = Node::new(
+            bob.reopen(&network),
+            Owner::acquire(&bob.path).map_err(pair_error)?,
+            None,
+        )
+        .map_err(pair_error)?;
+        source.approve("bob", &bob.ep, false).map_err(pair_error)?;
+        destination
+            .approve("alice", &alice.ep, false)
+            .map_err(pair_error)?;
+        let (port, mut events) = tcp_echo().await;
+        let service = tcp(port);
+
+        let mut config = ServerConfig::default();
+        config.relay = Some(RelayConfig::new(([127, 0, 0, 1], 0)));
+        let relay = Server::spawn(config).await?;
+        let url: RelayUrl = format!("http://{}", relay.http_addr().unwrap()).parse()?;
+        let bind = |key| {
+            Endpoint::builder(presets::Minimal)
+                .clear_ip_transports()
+                .secret_key(key)
+                .relay_mode(RelayMode::custom([url.clone()]))
+                .alpns(vec![SERVICE_ALPN.to_vec()])
+                .bind()
+        };
+        let (a, b) = tokio::try_join!(
+            bind(SecretKey::from_bytes(&alice.secret.to_bytes())),
+            bind(SecretKey::from_bytes(&bob.secret.to_bytes())),
+        )?;
+        assert!(a.bound_sockets().is_empty() && b.bound_sockets().is_empty());
+        let served = tokio::spawn(destination.clone().accept_loop(b.clone()));
+
+        tokio::time::timeout(T, async {
+            b.online().await;
+            let addr = EndpointAddr::new(b.id()).with_relay_url(url);
+            let request = PrivateRequest {
+                service,
+                terminal: None,
+            };
+            let first = source
+                .open_service(&a, addr.clone(), request)
+                .await
+                .map_err(pair_error)?;
+            assert!(matches!(first.reply, ServiceReply::Refused { .. }));
+            drop(first);
+            assert!(events.try_recv().is_err());
+
+            destination.grant(&alice.ep, service).map_err(pair_error)?;
+            let mut stream = source
+                .open_service(&a, addr, request)
+                .await
+                .map_err(pair_error)?;
+            assert!(matches!(stream.reply, ServiceReply::Ready));
+            wire::frame(&mut stream.tx, b"\x01opaque to the relay").await?;
+            assert_eq!(
+                wire::read_frame(&mut stream.rx).await?,
+                b"\x01opaque to the relay"
+            );
+            assert_eq!(events.recv().await, Some("accepted"));
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+
+        a.close().await;
+        b.close().await;
+        served.await?;
+        relay.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4777,16 +4983,12 @@ mod runtime {
         let rb = run(&bob, &book, n.mailbox.clone(), None).await;
         assert!(bob.path.join(CONTROL.marker).exists());
         assert!(!bob.path.join("runtime.json").exists());
-        // Legacy commands never reach the private runtime.
-        assert!(
-            crate::local::command(&bob.path, crate::wire::LocalRequest::Peers)
-                .await
-                .is_err()
-        );
         // Legacy roles cannot authenticate on the private marker.
         let legacy_roles = crate::local::Channel {
             marker: CONTROL.marker,
-            ..crate::local::LEGACY
+            daemon_role: b"massrelay daemon v1",
+            client_role: b"massrelay client v1",
+            ..CONTROL
         };
         assert!(
             crate::local::connect_on(&bob.path, &legacy_roles)
@@ -5385,5 +5587,639 @@ mod runtime {
 
         assert!(ra.stop().await.owner_released);
         assert!(rb.stop().await.owner_released);
+    }
+
+    /// Hold an exposure through control: (control socket, reply, lifetime).
+    async fn expose_to(
+        m: &Member,
+        peer: &str,
+        service: Service,
+        target: Option<String>,
+    ) -> (
+        tokio::net::TcpStream,
+        ControlReply,
+        Option<tokio::net::TcpStream>,
+    ) {
+        let life = crate::local::Lifetime::bind().await.unwrap();
+        let req = ControlRequest::Expose {
+            peer: peer.into(),
+            service,
+            target,
+            lifetime_port: life.port,
+            lifetime_key: life.key,
+        };
+        let (sock, r) = tokio::time::timeout(T, rt::request(&m.path, req))
+            .await
+            .unwrap()
+            .unwrap();
+        let keep = tokio::time::timeout(Duration::from_secs(2), life.accept())
+            .await
+            .ok()
+            .and_then(Result::ok);
+        (sock, r, keep)
+    }
+
+    async fn final_reply(sock: &mut tokio::net::TcpStream) -> ControlReply {
+        tokio::time::timeout(T, wire::recv(sock))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn status(m: &Member) -> rt::StatusView {
+        let ControlReply::Status(v) = cmd(m, ControlRequest::Status).await else {
+            panic!("status");
+        };
+        v
+    }
+
+    async fn connect_to(
+        m: &Member,
+        peer: &str,
+        service: Service,
+    ) -> (tokio::net::TcpStream, ControlReply, tokio::net::TcpStream) {
+        let life = crate::local::Lifetime::bind().await.unwrap();
+        let ((sock, r), keep) = tokio::try_join!(
+            rt::request(&m.path, connect(peer, service, &life)),
+            life.accept()
+        )
+        .unwrap();
+        (sock, r, keep)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "opens loopback UDP/TCP sockets"]
+    async fn an_exposure_lasts_while_its_command_holds_it_and_ends_only_its_sessions() {
+        let n = net();
+        let alice = create(&n, "alice", Clock::System);
+        let bob = join(&n, &alice, "bob", Clock::System);
+        let book = Book::default();
+        let ra = run(&alice, &book, n.mailbox.clone(), None).await;
+        let rb = run(&bob, &book, n.mailbox.clone(), None).await;
+        cmd(&alice, approve(&bob, "bob")).await;
+        cmd(&bob, approve(&alice, "alice")).await;
+        // Shells and malformed targets are never exposed.
+        let (_, r, _) = expose_to(&bob, "alice", Service::Shell, None).await;
+        assert!(
+            matches!(&r, ControlReply::Error(e) if e.contains("port")),
+            "{r:?}"
+        );
+        let (_, r, _) = expose_to(&bob, "alice", tcp(9), Some("nowhere".into())).await;
+        assert!(
+            matches!(&r, ControlReply::Error(e) if e.contains("HOST:PORT")),
+            "{r:?}"
+        );
+
+        // A port nothing listens on, forwarded to an owner-chosen target.
+        let (target_port, mut tev) = half_close_target().await;
+        let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = unused.local_addr().unwrap().port();
+        let exposed = tcp(port);
+        drop(unused);
+        let target = format!("127.0.0.1:{target_port}");
+        let (mut held, r, keep) = expose_to(&bob, "alice", exposed, Some(target.clone())).await;
+        assert_eq!(
+            r,
+            ControlReply::Exposed {
+                key: key(&alice),
+                alias: "alice".into()
+            }
+        );
+        let keep = keep.expect("lifetime");
+        let v = status(&bob).await;
+        assert_eq!(
+            v.exposures,
+            vec![rt::ExposureView {
+                key: key(&alice),
+                service: exposed,
+                target: Some(target.clone()),
+            }]
+        );
+        assert!(v.grants.is_empty(), "exposures are not persistent grants");
+        let offline = offline_status(&bob.reopen(&n)).unwrap();
+        assert!(offline.exposures.is_empty(), "never persisted");
+
+        // One exposure per peer and service, and never beside a grant.
+        let (_, r, _) = expose_to(&bob, "alice", exposed, None).await;
+        assert!(
+            matches!(&r, ControlReply::Error(e) if e.contains("already exposed")),
+            "{r:?}"
+        );
+        let enable = |service| ControlRequest::Enable {
+            peer: "alice".into(),
+            service,
+        };
+        let r = cmd(&bob, enable(exposed)).await;
+        assert!(
+            matches!(&r, ControlReply::Error(e) if e.contains("exposed")),
+            "{r:?}"
+        );
+
+        // The first connection completes pairing and reaches the owner's target.
+        let (mut sock, r, life) = connect_to(&alice, "bob", exposed).await;
+        assert_eq!(r, ControlReply::Connected);
+        wire::frame(&mut sock, b"\x01hello").await.unwrap();
+        wire::frame(&mut sock, &[crate::tunnel::EOF]).await.unwrap();
+        assert_eq!(drain(&mut sock).await, (b"bye:hello".to_vec(), None));
+        assert_eq!(tev.recv().await, Some("eof"));
+        drop((sock, life));
+
+        // A live session under the exposure, and one under a persistent grant.
+        let (other_port, mut oev) = half_close_target().await;
+        assert_eq!(
+            cmd(&bob, enable(tcp(other_port))).await,
+            ControlReply::Changed(true)
+        );
+        let (mut under, r, under_life) = connect_to(&alice, "bob", exposed).await;
+        assert_eq!(r, ControlReply::Connected);
+        let (mut kept, r, kept_life) = connect_to(&alice, "bob", tcp(other_port)).await;
+        assert_eq!(r, ControlReply::Connected);
+        wire::frame(&mut under, b"\x01x").await.unwrap();
+        wire::frame(&mut kept, b"\x01still ").await.unwrap();
+
+        // The holding command leaves: exactly that exposure is withdrawn.
+        drop(keep);
+        assert_eq!(final_reply(&mut held).await, ControlReply::Done);
+        let (_, failed) = drain(&mut under).await;
+        assert_eq!(
+            failed.as_deref(),
+            Some("the destination ended this authorization")
+        );
+        drop((under, under_life));
+        wire::frame(&mut kept, b"\x01here").await.unwrap();
+        wire::frame(&mut kept, &[crate::tunnel::EOF]).await.unwrap();
+        assert_eq!(drain(&mut kept).await, (b"bye:still here".to_vec(), None));
+        assert_eq!(oev.recv().await, Some("eof"));
+        drop((kept, kept_life));
+        assert!(status(&bob).await.exposures.is_empty());
+        let (_, r, _) = connect_to(&alice, "bob", exposed).await;
+        assert!(matches!(&r, ControlReply::Error(_)), "{r:?}");
+
+        // A disable of that service for that peer withdraws a live exposure.
+        let udp = Service::Udp(NonZeroU16::new(port).unwrap());
+        let (mut held, r, _keep) = expose_to(&bob, "alice", udp, Some(target.clone())).await;
+        assert!(matches!(r, ControlReply::Exposed { .. }), "{r:?}");
+        let disable = ControlRequest::Disable {
+            peer: "alice".into(),
+            service: udp,
+        };
+        assert_eq!(cmd(&bob, disable).await, ControlReply::Changed(true));
+        let r = final_reply(&mut held).await;
+        assert!(
+            matches!(&r, ControlReply::Error(e) if e.contains("grant removed")),
+            "{r:?}"
+        );
+        assert!(status(&bob).await.exposures.is_empty());
+
+        // So does a decline (the pairing ends), and so does stop.
+        let (mut held, r, _keep) = expose_to(&bob, "alice", exposed, None).await;
+        assert!(matches!(r, ControlReply::Exposed { .. }), "{r:?}");
+        let decline = ControlRequest::Decline {
+            peer: "alice".into(),
+        };
+        assert_eq!(cmd(&bob, decline).await, ControlReply::Done);
+        let r = final_reply(&mut held).await;
+        assert!(
+            matches!(&r, ControlReply::Error(e) if e.contains("declined")),
+            "{r:?}"
+        );
+        assert!(status(&bob).await.exposures.is_empty());
+
+        assert!(ra.stop().await.owner_released);
+        assert!(rb.stop().await.owner_released);
+    }
+    fn events(m: &Member) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(m.path.join(crate::private::audit::EVENT_FILE))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    fn find<'a>(
+        log: &'a [serde_json::Value],
+        fields: &[(&str, &str)],
+    ) -> Option<&'a serde_json::Value> {
+        log.iter()
+            .find(|v| fields.iter().all(|(k, want)| v[*k].as_str() == Some(*want)))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "opens loopback UDP/TCP sockets"]
+    async fn device_events_are_logged_without_secrets() {
+        let n = net();
+        let alice = create(&n, "alice", Clock::System);
+        let bob = join(&n, &alice, "bob", Clock::System);
+        let book = Book::default();
+        let ra = run(&alice, &book, n.mailbox.clone(), None).await;
+        let rb = run(&bob, &book, n.mailbox.clone(), None).await;
+        let file = alice.path.join(crate::private::audit::EVENT_FILE);
+        assert_eq!(ra.log_file(), Some(file.as_path()));
+        let ControlReply::Invite(invite) = cmd(&alice, ControlRequest::Invite).await else {
+            panic!("invite");
+        };
+        cmd(&alice, approve(&bob, "bob")).await;
+        cmd(&bob, approve(&alice, "alice")).await;
+        // The first exchange pairs; shell is not enabled, so it is refused on
+        // both sides.
+        let (_, r, _) = shell_to(&alice, "bob").await;
+        assert!(matches!(r, ControlReply::Error(_)), "{r:?}");
+        let (port, _tev) = half_close_target().await;
+        let enable = ControlRequest::Enable {
+            peer: "alice".into(),
+            service: tcp(port),
+        };
+        assert_eq!(cmd(&bob, enable).await, ControlReply::Changed(true));
+        let life = crate::local::Lifetime::bind().await.unwrap();
+        let ((mut sock, r), keep) = tokio::try_join!(
+            rt::request(&alice.path, connect("bob", tcp(port), &life)),
+            life.accept()
+        )
+        .unwrap();
+        assert_eq!(r, ControlReply::Connected);
+        wire::frame(&mut sock, b"\x01payload-bytes").await.unwrap();
+        wire::frame(&mut sock, &[crate::tunnel::EOF]).await.unwrap();
+        assert_eq!(drain(&mut sock).await.0, b"bye:payload-bytes".to_vec());
+        drop((sock, keep));
+        assert!(ra.stop().await.owner_released);
+        assert!(rb.stop().await.owner_released);
+
+        let (a, b) = (events(&alice), events(&bob));
+        let tcp = format!("tcp:{port}");
+        let (alice_id, bob_id) = (
+            EndpointId::from_bytes(&alice.ep).unwrap().to_string(),
+            EndpointId::from_bytes(&bob.ep).unwrap().to_string(),
+        );
+        for log in [&a, &b] {
+            assert_eq!(log.first().unwrap()["event"], "device_started");
+            assert_eq!(log.last().unwrap()["event"], "device_stopped");
+        }
+        // Control commands, by operation and peer only.
+        let issued = [("event", "local_control"), ("operation", "issue_invite")];
+        assert!(find(&a, &[issued[0], issued[1], ("outcome", "allowed")]).is_some());
+        assert!(find(&a, &[("operation", "approve"), ("target_id", &bob_id)]).is_some());
+        // State changes, named by the pinned alias.
+        assert!(find(&a, &[("event", "approval_granted"), ("peer_name", "bob")]).is_some());
+        assert!(
+            find(
+                &a,
+                &[("event", "pairing_established"), ("peer_id", &bob_id)]
+            )
+            .is_some()
+        );
+        let enabled = [("event", "service_enabled"), ("service", &tcp)];
+        assert!(find(&b, &[enabled[0], enabled[1], ("peer_name", "alice")]).is_some());
+        // Sessions in both directions.
+        let out = [("direction", "outbound"), ("service", &tcp)];
+        assert!(
+            find(
+                &a,
+                &[out[0], out[1], ("event", "connected"), ("peer_name", "bob")]
+            )
+            .is_some()
+        );
+        assert!(find(&a, &[out[0], out[1], ("event", "disconnected")]).is_some());
+        let inb = [("direction", "inbound"), ("service", &tcp)];
+        assert!(
+            find(
+                &b,
+                &[
+                    inb[0],
+                    inb[1],
+                    ("event", "connected"),
+                    ("peer_id", &alice_id)
+                ]
+            )
+            .is_some()
+        );
+        let done = [("event", "disconnected"), ("reason", "stream_closed")];
+        assert!(
+            find(&b, &[inb[0], inb[1], done[0], done[1]]).is_some(),
+            "{b:#?}"
+        );
+        let refused = [("event", "connection_failed"), ("service", "shell")];
+        let refused = [refused[0], refused[1], ("reason", "service_not_enabled")];
+        assert!(
+            find(
+                &a,
+                &[
+                    refused[0],
+                    refused[1],
+                    refused[2],
+                    ("direction", "outbound")
+                ]
+            )
+            .is_some()
+        );
+        assert!(
+            find(
+                &b,
+                &[refused[0], refused[1], refused[2], ("direction", "inbound")]
+            )
+            .is_some()
+        );
+        // Nothing secret or carried reaches either log.
+        for m in [&alice, &bob] {
+            let raw =
+                std::fs::read_to_string(m.path.join(crate::private::audit::EVENT_FILE)).unwrap();
+            assert!(!raw.contains(&invite), "invite token logged");
+            assert!(!raw.contains(&hex(&m.secret.to_bytes())));
+            assert!(!raw.contains("payload-bytes"));
+            assert!(!raw.contains("approval\":"));
+        }
+    }
+}
+
+// ------------------------------------------------------- device display names
+
+mod device_names {
+    use super::super::binding::{BindingError, MAX_DEVICE_NAME, check_device_name};
+    use super::*;
+
+    fn create_named(n: &Net, dir_name: &str, name: Option<&str>) -> Member {
+        let secret = EndpointSecret::generate();
+        let path = dir(n, dir_name);
+        let clock = Clock::manual(T0);
+        let dev = Device::create_network_named(
+            &path,
+            &secret,
+            n.relay_key,
+            n.mailbox.incarnation.clone(),
+            n.mailbox.clone(),
+            clock.clone(),
+            name,
+        )
+        .unwrap();
+        Member {
+            dev,
+            ep: secret.public(),
+            secret,
+            clock,
+            path,
+        }
+    }
+
+    fn join_named(n: &Net, issuer: &Member, dir_name: &str, name: Option<&str>) -> Member {
+        let token = issuer.dev.issue_invite().unwrap();
+        let secret = EndpointSecret::generate();
+        let path = dir(n, dir_name);
+        let clock = issuer.clock.clone();
+        let (dev, request) = Device::begin_join_named(
+            &path,
+            &secret,
+            &token,
+            n.mailbox.clone(),
+            clock.clone(),
+            name,
+        )
+        .unwrap();
+        let p = Pending {
+            m: Member {
+                dev,
+                ep: secret.public(),
+                secret,
+                clock,
+                path,
+            },
+            invite_id: InviteToken::decode(&token).unwrap().invite_id,
+            token,
+            request,
+        };
+        assert!(matches!(
+            issuer
+                .dev
+                .receive_join_request(&p.invite_id, &p.request)
+                .unwrap(),
+            ReserveOutcome::Reserved { .. }
+        ));
+        admit(issuer, &p);
+        p.m
+    }
+
+    fn named(r: &[RosterMember], ep: &EndpointKey) -> Option<String> {
+        r.iter().find(|m| &m.endpoint == ep).unwrap().name.clone()
+    }
+
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    fn relay_bytes_contain(root: &Path, needle: &[u8]) -> bool {
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(p) = stack.pop() {
+            if p.is_dir() {
+                stack.extend(std::fs::read_dir(&p).unwrap().map(|e| e.unwrap().path()));
+            } else if contains(&std::fs::read(&p).unwrap(), needle) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Names set at create and join reach every member through the
+    /// authenticated MLS state, a nameless member stays nameless, and the
+    /// relay's stored bytes never contain a name.
+    #[test]
+    fn names_reach_every_member_and_never_the_relay() {
+        let n = net();
+        let a = create_named(&n, "a", Some("zq-alpha-host"));
+        let b = join_named(&n, &a, "b", Some("zq-bravo-host"));
+        let c = join_named(&n, &a, "c", None);
+        sync(&[&a, &b, &c]);
+        agree(&[&a, &b, &c]);
+
+        let ra = a.dev.named_roster().unwrap();
+        assert_eq!(ra.len(), 3);
+        for m in [&b, &c] {
+            assert_eq!(m.dev.named_roster().unwrap(), ra, "named rosters differ");
+        }
+        assert_eq!(named(&ra, &a.ep).as_deref(), Some("zq-alpha-host"));
+        assert_eq!(named(&ra, &b.ep).as_deref(), Some("zq-bravo-host"));
+        assert_eq!(named(&ra, &c.ep), None);
+        // The key-only roster is unchanged by names.
+        assert_eq!(
+            a.dev.roster().unwrap(),
+            ra.iter().map(|m| m.endpoint).collect::<Vec<_>>()
+        );
+
+        let relay = n.root.join("relay");
+        assert!(
+            relay_bytes_contain(&relay, &n.relay_key),
+            "scan sanity: raw relay bytes are visible"
+        );
+        assert!(
+            !relay_bytes_contain(&relay, &b.ep),
+            "relay store contains an endpoint"
+        );
+        for name in ["zq-alpha-host", "zq-bravo-host"] {
+            assert!(
+                !relay_bytes_contain(&relay, name.as_bytes()),
+                "relay store contains {name}"
+            );
+        }
+        // A reopened device reads the same names from its own state.
+        assert_eq!(b.reopen(&n).named_roster().unwrap(), ra);
+    }
+
+    /// An invalid name is refused before any profile state is written.
+    #[test]
+    fn named_constructors_refuse_invalid_names_without_state() {
+        let n = net();
+        let secret = EndpointSecret::generate();
+        let path = dir(&n, "bad");
+        let r = Device::create_network_named(
+            &path,
+            &secret,
+            n.relay_key,
+            n.mailbox.incarnation.clone(),
+            n.mailbox.clone(),
+            Clock::manual(T0),
+            Some("has space"),
+        );
+        assert!(r.is_err());
+        assert!(!path.exists());
+
+        let a = create(&n, "a", Clock::manual(T0));
+        let token = a.dev.issue_invite().unwrap();
+        let r = Device::begin_join_named(
+            &path,
+            &secret,
+            &token,
+            n.mailbox.clone(),
+            Clock::manual(T0),
+            Some(""),
+        );
+        assert!(r.is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn device_name_rule() {
+        for ok in [
+            "laptop",
+            "a",
+            "web-01",
+            "Build_box",
+            &"x".repeat(MAX_DEVICE_NAME),
+        ] {
+            assert_eq!(check_device_name(ok), Ok(()), "{ok}");
+        }
+        let iroh_form = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
+        let hex_form = super::super::codec::hex(&[7u8; 32]);
+        for bad in [
+            "",
+            "two words",
+            "tab\t",
+            "émile",
+            "dot.local",
+            &"x".repeat(MAX_DEVICE_NAME + 1),
+            &iroh_form,
+            &hex_form,
+        ] {
+            assert!(check_device_name(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// A nameless binding keeps the version 1 encoding exactly; a named one
+    /// is version 2, signs its name and checks it on decode.
+    #[test]
+    fn bindings_sign_and_check_the_name() {
+        let secret = EndpointSecret::generate();
+        let tag = [3u8; 32];
+        let mls_key = [9u8; 32];
+        let legacy = CredentialBinding::create(&secret, &tag, &mls_key);
+        assert_eq!(legacy.name, None);
+        let bytes = legacy.encode();
+        assert_eq!(bytes[0], 1);
+        assert_eq!(CredentialBinding::decode(&bytes).unwrap(), legacy);
+        let (ep, name) =
+            CredentialBinding::verify_credential_named(&legacy.credential(), &mls_key, &tag)
+                .unwrap();
+        assert_eq!((ep, name), (secret.public(), None));
+
+        let b = CredentialBinding::create_named(&secret, &tag, &mls_key, Some("desk")).unwrap();
+        assert_eq!(b.encode()[0], 2);
+        assert_eq!(CredentialBinding::decode(&b.encode()).unwrap(), b);
+        assert_eq!(
+            CredentialBinding::verify_credential_named(&b.credential(), &mls_key, &tag).unwrap(),
+            (secret.public(), Some("desk".into()))
+        );
+        assert_eq!(
+            CredentialBinding::verify_credential(&b.credential(), &mls_key, &tag).unwrap(),
+            secret.public()
+        );
+
+        // Another valid name under the same signature: rejected.
+        let mut renamed = b.clone();
+        renamed.name = Some("dusk".into());
+        assert!(matches!(
+            CredentialBinding::verify_credential(&renamed.credential(), &mls_key, &tag),
+            Err(BindingError::Signature(_))
+        ));
+        // Dropping the name (a version 1 encoding of a named signature): rejected.
+        let mut stripped = b.clone();
+        stripped.name = None;
+        assert!(matches!(
+            CredentialBinding::verify_credential(&stripped.credential(), &mls_key, &tag),
+            Err(BindingError::Signature(_))
+        ));
+        // A name breaking the rule never decodes, whoever signed it.
+        let mut bad = b.clone();
+        bad.name = Some("not ok".into());
+        assert!(matches!(
+            CredentialBinding::decode(&bad.encode()),
+            Err(BindingError::Name(_))
+        ));
+        assert!(matches!(
+            CredentialBinding::create_named(&secret, &tag, &mls_key, Some("not ok")),
+            Err(BindingError::Name(_))
+        ));
+    }
+
+    /// Exact key, then local alias, then a unique roster name. Duplicate
+    /// names (case-insensitively) never pick a peer; key or alias does.
+    #[test]
+    fn selectors_prefer_pinned_and_refuse_duplicate_names() {
+        let (k1, k2, k3) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let roster = vec![
+            RosterMember {
+                endpoint: k1,
+                name: Some("laptop".into()),
+            },
+            RosterMember {
+                endpoint: k2,
+                name: Some("Laptop".into()),
+            },
+            RosterMember {
+                endpoint: k3,
+                name: Some("desk".into()),
+            },
+        ];
+        let aliases = vec![("work".to_string(), k2), ("desk".to_string(), k1)];
+
+        assert_eq!(
+            select_peer("desk", Some(k3), &aliases, &roster),
+            Ok(PeerMatch::Key(k3))
+        );
+        // A local alias outranks a roster member that names itself the same.
+        let m = select_peer("desk", None, &aliases, &roster).unwrap();
+        assert_eq!(m, PeerMatch::Alias(k1));
+        assert!(m.pinned());
+        assert_eq!(
+            select_peer("laptop", None, &aliases, &roster),
+            Err(SelectError::AmbiguousName(vec![k1, k2]))
+        );
+        assert_eq!(
+            select_peer("work", None, &aliases, &roster),
+            Ok(PeerMatch::Alias(k2))
+        );
+        assert_eq!(
+            select_peer("nobody", None, &aliases, &roster),
+            Err(SelectError::NoMatch)
+        );
+        let m = select_peer("DESK", None, &[], &roster).unwrap();
+        assert_eq!(m, PeerMatch::Name(k3));
+        assert!(!m.pinned());
+        assert_eq!(m.endpoint(), k3);
     }
 }

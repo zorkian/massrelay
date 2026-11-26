@@ -1,8 +1,7 @@
-//! Experimental, unpublished private relay instance.
+//! Encrypted mailbox relay and operator commands.
 //!
-//! A private relay runs as its own instance in its own state directory, separate from any legacy
-//! relay. It serves an Iroh relay transport that admits every endpoint without consulting
-//! membership, and the experimental [`mailbox`] protocol over its pinned endpoint key. It keeps
+//! The Iroh transport forwards traffic for endpoints without consulting membership.
+//! The [`mailbox`] protocol uses a pinned endpoint key and an operator access grant. The relay keeps
 //! no roster, member table, invite or pairing state. Its operator contract, from access grants
 //! to backup, restore and rotation, is `docs/private-relay-operations.md`.
 //!
@@ -21,8 +20,7 @@
 //! [`run`] only reopens: it refuses a legacy profile, a profile without its mailbox, a mailbox
 //! without its profile, an unknown profile format, a key that does not match the saved identity,
 //! a mailbox whose incarnation differs from the profile's, missing access grants, and a sealed
-//! store. Nothing is repaired, reset or deleted. The legacy relay refuses a directory holding a
-//! private profile in the same way.
+//! store. Startup leaves such a directory untouched.
 //!
 //! # Admission
 //!
@@ -64,13 +62,15 @@ use crate::{
     connection_log::ConnectionLog,
     mailbox::{self, AccessKey, Bytes, Locator, refuse_userinfo},
     mailbox_server::{Mailbox, serve_connection},
-    relay::{LEGACY_PROFILE_FILE, PRIVATE_PROFILE_FILE, PRIVATE_STORE_DIR as STORE_DIR},
     slot_store::{DB_FILE, Incarnation, SlotStore, SlotStoreError, Summary},
     slot_wire::hex,
     storage,
     wire::{self, ServerAddr},
 };
 
+const LEGACY_PROFILE_FILE: &str = "relay.json";
+const PRIVATE_PROFILE_FILE: &str = "private-relay.json";
+const STORE_DIR: &str = "mailbox";
 const PROFILE_FORMAT: &str = "massrelay-private-relay/experimental-0";
 const EVENT_FILE: &str = "private-relay-events.jsonl";
 const ACCESS_FILE: &str = "private-relay-access.json";
@@ -134,7 +134,7 @@ impl Grants {
         ensure!(
             dir.join(ACCESS_FILE).try_exists()?,
             "the private relay in {} has no access grants file; issue a grant with \
-             'massrelay private-relay-access issue' while it is stopped",
+             'massrelay relay-grants issue' while it is stopped",
             dir.display()
         );
         let grants: Self = storage::load(dir, ACCESS_FILE)?;
@@ -202,7 +202,7 @@ fn refuse_legacy(dir: &Path) -> Result<()> {
 pub fn init(dir: &Path, udp: SocketAddr, relay: RelayUrl) -> Result<()> {
     let (profile, access) = create(dir, udp, relay)?;
     eprintln!(
-        "EXPERIMENTAL private relay initialized. The locator below carries its first access \
+        "Relay initialized. The locator below carries its first access \
          grant: give it only to people whose networks may store objects here."
     );
     println!("{}", profile.locator(access).encode()?);
@@ -295,7 +295,7 @@ fn open(dir: &Path, sealed_ok: bool) -> Result<(Profile, SlotStore)> {
         (true, false) => bail!(
             "the private relay in {} has lost its mailbox; it will not start with an unknown \
              store. Restore a backup into a new directory, or run 'massrelay \
-             private-relay-store rotate' to start a new incarnation here",
+             relay-store rotate' to start a new incarnation here",
             dir.display()
         ),
     }
@@ -304,7 +304,7 @@ fn open(dir: &Path, sealed_ok: bool) -> Result<(Profile, SlotStore)> {
         bail!(
             "the store in {} was sealed by a final backup (snapshot {}); this relay will not \
              serve its incarnation again. Restore that backup with --keep-incarnation on one \
-             host, or run 'massrelay private-relay-store rotate' to start a new incarnation here",
+             host, or run 'massrelay relay-store rotate' to start a new incarnation here",
             dir.display(),
             hex(&sealed.snapshot.0)
         );
@@ -319,7 +319,7 @@ fn open(dir: &Path, sealed_ok: bool) -> Result<(Profile, SlotStore)> {
         ),
         opened => opened.map_err(|error| match error {
             SlotStoreError::Damaged { .. } => anyhow::anyhow!(
-                "{error}. Nothing was repaired. Run 'massrelay private-relay-store check' for \
+                "{error}. Nothing was repaired. Run 'massrelay relay-store check' for \
                  details; recovery is a complete backup or a new incarnation \
                  (docs/private-relay-operations.md)"
             ),
@@ -344,7 +344,7 @@ pub async fn run(dir: PathBuf, udp_bind: SocketAddr, relay_bind: SocketAddr) -> 
     let admitted = grants.len();
     let mailbox = Arc::new(Mailbox::new(store, *profile.server.id.as_bytes(), grants));
 
-    // The relay transport admits every endpoint: private mode consults no membership.
+    // The transport forwards packets without consulting membership.
     let mut config = ServerConfig::default();
     config.relay = Some(RelayConfig::new(relay_bind));
     let mut server = Server::spawn(config).await?;
@@ -362,7 +362,7 @@ pub async fn run(dir: PathBuf, udp_bind: SocketAddr, relay_bind: SocketAddr) -> 
         profile.server.id,
         hex(&profile.incarnation.0)
     );
-    eprintln!("MassRelay private relay listening on {udp_bind} UDP and {relay_bind} TCP");
+    eprintln!("MassRelay relay listening on {udp_bind} UDP and {relay_bind} TCP");
     log.state("private_relay_started", None, None);
 
     let shutdown = crate::shutdown();
@@ -418,8 +418,18 @@ pub async fn run(dir: PathBuf, udp_bind: SocketAddr, relay_bind: SocketAddr) -> 
 
 // ------------------------------------------------------------------ access
 
-/// Issue a new access grant and print a locator carrying its secret. The relay admits it from
-/// its next start. Creates the grants file for a relay that has none.
+/// Read the relay identity without loading the store or printing an access secret.
+pub fn info(dir: &Path) -> Result<()> {
+    refuse_legacy(dir)?;
+    let profile = load_profile(dir)?;
+    println!("Endpoint: {}", profile.server.id);
+    println!("UDP: {}", profile.server.udp);
+    println!("Relay URL: {}", profile.server.relay);
+    println!("Incarnation: {}", hex(&profile.incarnation.0));
+    Ok(())
+}
+
+/// Issue a new access grant and print its locator. It is admitted from the next relay start.
 pub fn access_issue(dir: &Path, label: &str) -> Result<()> {
     let access = issue_grant(dir, label)?;
     let profile = load_profile(dir)?;
@@ -929,7 +939,7 @@ fn restore_staged(
     );
     println!(
         "No objects were restored. Clients pinned to incarnation {} refuse this store; their \
-         networks must be created again. Issue locators with 'massrelay private-relay-access \
+         networks must be created again. Issue locators with 'massrelay relay-grants \
          issue'.",
         hex(&manifest.incarnation.0)
     );
@@ -982,7 +992,7 @@ pub fn store_rotate(dir: &Path) -> Result<()> {
     println!(
         "Clients pinned to the previous incarnation refuse this store; their networks must be \
          created again. Access grants are unchanged; issue locators with 'massrelay \
-         private-relay-access issue'."
+         relay-grants issue'."
     );
     Ok(())
 }
@@ -1033,20 +1043,14 @@ mod tests {
     }
 
     #[test]
-    fn private_and_legacy_relays_never_share_a_directory() {
+    fn relay_refuses_to_reuse_legacy_state_directory() {
         let (udp, url) = addresses();
         let legacy = tempfile::tempdir().unwrap();
-        crate::relay::init(legacy.path(), udp, url.clone()).unwrap();
+        std::fs::write(legacy.path().join(LEGACY_PROFILE_FILE), b"{}").unwrap();
         assert!(err(create(legacy.path(), udp, url.clone())).contains("legacy relay"));
         assert!(err(open(legacy.path(), false)).contains("legacy relay"));
         assert!(!legacy.path().join(PRIVATE_PROFILE_FILE).exists());
         assert!(!legacy.path().join(STORE_DIR).exists());
-
-        let private = tempfile::tempdir().unwrap();
-        create(private.path(), udp, url.clone()).unwrap();
-        assert!(err(crate::relay::init(private.path(), udp, url)).contains("private relay"));
-        assert!(!private.path().join(LEGACY_PROFILE_FILE).exists());
-        open(private.path(), false).unwrap();
     }
 
     #[test]

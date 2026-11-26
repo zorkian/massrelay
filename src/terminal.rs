@@ -1,40 +1,25 @@
 use std::{
-    io::{self, IsTerminal, Read, Write},
-    path::Path,
+    io::{self, IsTerminal, Read},
     thread,
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
-    sync::{mpsc, oneshot},
+    sync::mpsc,
 };
 
-use crate::wire::{self, ServiceReply};
+use crate::wire;
 
 pub(crate) const DATA: u8 = 1;
 pub(crate) const RESIZE: u8 = 2;
 pub(crate) const EXIT: u8 = 3;
 pub(crate) const CHUNK: usize = 8192;
 /// The largest shell input frame a MassRelay client sends (data or resize).
-#[cfg_attr(not(feature = "private-membership"), allow(dead_code))]
 pub const MAX_INPUT_FRAME: usize = CHUNK;
 /// The largest output frame a shell server sends (output chunk or exit).
-#[cfg_attr(not(feature = "private-membership"), allow(dead_code))]
 pub const MAX_OUTPUT_FRAME: usize = CHUNK;
-
-fn dimensions(cols: u16, rows: u16) -> PtySize {
-    #[cfg(windows)]
-    let (cols, rows) = (cols.min(i16::MAX as u16), rows.min(i16::MAX as u16));
-    PtySize {
-        cols: cols.max(1),
-        rows: rows.max(1),
-        pixel_width: 0,
-        pixel_height: 0,
-    }
-}
 
 pub fn size() -> Result<(u16, u16)> {
     ensure!(
@@ -134,15 +119,6 @@ impl Drop for WindowsConsole {
     }
 }
 
-pub async fn attach(
-    rx: impl AsyncRead + Unpin,
-    tx: impl AsyncWrite + Unpin,
-    initial_size: (u16, u16),
-) -> Result<i32> {
-    attach_max(rx, tx, initial_size, usize::MAX).await
-}
-
-/// `attach`, refusing shell output frames longer than `max_frame`.
 pub async fn attach_max(
     mut rx: impl AsyncRead + Unpin,
     mut tx: impl AsyncWrite + Unpin,
@@ -254,162 +230,4 @@ fn complete_utf8_prefix(bytes: &[u8]) -> usize {
         }
     }
     bytes.len()
-}
-
-enum Input {
-    Data(Vec<u8>),
-    Resize(PtySize),
-}
-
-struct Process(Box<dyn Child + Send + Sync>);
-
-impl Drop for Process {
-    fn drop(&mut self) {
-        if !matches!(self.0.try_wait(), Ok(Some(_))) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-}
-
-pub struct Terminal {
-    input: mpsc::Sender<Input>,
-    output: mpsc::Receiver<Vec<u8>>,
-    exited: oneshot::Receiver<io::Result<portable_pty::ExitStatus>>,
-    _stop: std::sync::mpsc::Sender<()>,
-}
-
-pub fn start(cols: u16, rows: u16, shell: Option<&Path>) -> Result<Terminal> {
-    let pair = native_pty_system().openpty(dimensions(cols, rows))?;
-    let master = pair.master;
-    let mut reader = master.try_clone_reader()?;
-    let mut writer = master.take_writer()?;
-    let mut command = shell.map_or_else(CommandBuilder::new_default_prog, CommandBuilder::new);
-    command.env("TERM", "xterm-256color");
-    let mut process = Process(pair.slave.spawn_command(command)?);
-    drop(pair.slave);
-    let (input, mut input_rx) = mpsc::channel::<Input>(8);
-    let (output_tx, output) = mpsc::channel(16);
-    let (exit_tx, exited) = oneshot::channel();
-    let (_stop, stop) = std::sync::mpsc::channel::<()>();
-
-    thread::Builder::new()
-        .name("massrelay-pty-wait".into())
-        .spawn(move || {
-            loop {
-                match process.0.try_wait() {
-                    Ok(None) => {
-                        if !matches!(
-                            stop.recv_timeout(Duration::from_millis(30)),
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                        ) {
-                            break;
-                        }
-                    }
-                    Ok(Some(status)) => {
-                        let _ = exit_tx.send(Ok(status));
-                        break;
-                    }
-                    Err(error) => {
-                        let _ = exit_tx.send(Err(error));
-                        break;
-                    }
-                }
-            }
-        })?;
-    thread::Builder::new()
-        .name("massrelay-pty-write".into())
-        .spawn(move || {
-            while let Some(input) = input_rx.blocking_recv() {
-                let result = match input {
-                    Input::Data(bytes) => writer.write_all(&bytes).map_err(anyhow::Error::from),
-                    Input::Resize(size) => master.resize(size),
-                };
-                if result.is_err() {
-                    break;
-                }
-            }
-        })?;
-    thread::Builder::new()
-        .name("massrelay-pty-read".into())
-        .spawn(move || {
-            let mut buf = [0; CHUNK];
-            buf[0] = DATA;
-            loop {
-                match reader.read(&mut buf[1..]) {
-                    Ok(0) => break,
-                    Ok(size) => {
-                        if output_tx.blocking_send(buf[..size + 1].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                }
-            }
-        })?;
-
-    Ok(Terminal {
-        input,
-        output,
-        exited,
-        _stop,
-    })
-}
-
-impl Terminal {
-    pub async fn serve(
-        mut self,
-        rx: &mut (impl AsyncRead + Unpin),
-        tx: &mut (impl AsyncWrite + Unpin),
-        connected: impl FnOnce(),
-    ) -> Result<i32> {
-        wire::send(tx, ServiceReply::Ready).await?;
-        connected();
-        let read_inputs = async {
-            loop {
-                let data = wire::read_frame(rx).await?;
-                let input = match data.as_slice() {
-                    [RESIZE, c0, c1, r0, r1] => Input::Resize(dimensions(
-                        u16::from_be_bytes([*c0, *c1]),
-                        u16::from_be_bytes([*r0, *r1]),
-                    )),
-                    [DATA, bytes @ ..] => Input::Data(bytes.to_vec()),
-                    _ => bail!("invalid shell input frame"),
-                };
-                self.input
-                    .send(input)
-                    .await
-                    .context("remote terminal input closed")?;
-            }
-        };
-
-        let write_outputs = async {
-            let status = loop {
-                tokio::select! {
-                    result = &mut self.exited => break result??,
-                    data = self.output.recv() => match data {
-                        Some(data) => wire::frame(tx, &data).await?,
-                        None => break self.exited.await??,
-                    },
-                }
-            };
-            // ConPTY or a descendant may keep the output handle open after the shell exits.
-            // Time out waiting for a chunk, never in the middle of writing a frame.
-            let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-            while let Ok(Some(data)) = tokio::time::timeout_at(deadline, self.output.recv()).await {
-                wire::frame(tx, &data).await?;
-            }
-            Ok::<_, anyhow::Error>(status)
-        };
-
-        let status = tokio::select! {
-            result = write_outputs => result?,
-            result = read_inputs => return result,
-        };
-        let code = i32::try_from(status.exit_code()).unwrap_or(1);
-        let [a, b, c, d] = code.to_be_bytes();
-        wire::frame(tx, &[EXIT, a, b, c, d]).await?;
-        Ok(code)
-    }
 }

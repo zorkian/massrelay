@@ -1,21 +1,17 @@
-//! Private network commands and their isolated device profiles.
+//! Top-level device commands, using the encrypted membership store.
 //!
-//! A private profile lives in its own directory, `<state dir>/private-experimental-0/`, beside
-//! (never inside or instead of) a legacy profile. Its marker, `private-device.json`, names an
-//! experimental format and holds this device's endpoint key and the private relay locator it
-//! pinned; the membership store, pairing state, runtime owner lock and local control marker sit
-//! next to it. No legacy profile, credential, default relay or command mode is read, changed or
-//! used as a fallback, and none of these formats is frozen.
+//! The profile directory holds the endpoint key, pinned relay locator,
+//! membership state, and local runtime marker. Mailbox exchanges use
+//! separate random transport identities.
 //!
-//! - `create` pins a private relay from its locator after checking, over the relay's
+//! - `create` pins a relay from its locator after checking, over the relay's
 //!   authenticated identity, that it serves the locator's storage incarnation and admits the
 //!   locator's operator access credential.
 //! - `relay-access` replaces that credential with the one in a newer locator for the exact same
 //!   relay, addresses and incarnation, after the relay admits it; nothing else changes. The
 //!   relay operator issues credentials and revokes them (`docs/private-relay-operations.md`).
 //! - `invite` asks the running runtime for a one-use invite and prints one envelope carrying
-//!   the relay locator and the invite bytes. The envelope is a bearer secret: it is printed only
-//!   to standard output and never logged.
+//!   the relay locator and the invite bytes. The envelope is a bearer secret. It is never logged.
 //! - `join` reads that envelope (argument or standard input), refuses it unless the locator's
 //!   relay key and incarnation equal the ones inside the invite and the relay authenticates that
 //!   incarnation, persists the exact request, appends it, and waits for the issuer's reply. Run
@@ -29,15 +25,11 @@
 //! The device's endpoint identity serves peers only; every mailbox exchange uses a separate
 //! random transport identity.
 //!
-//! # Not offered (parity gaps)
-//!
-//! Background services (`install`, `start`, `restart`, `stop`), temporary exposures (`expose`),
-//! destination-chosen targets, clipboard copy, the interactive peer picker, roster names as
-//! selectors and the connection log are legacy features with no private equivalent yet.
-
 use std::io::{self, IsTerminal, Write as _};
 use std::net::SocketAddr;
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
+use std::process::{Command as Process, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,14 +42,17 @@ use serde::{Deserialize, Serialize};
 use crate::mailbox::{self, Bytes, Client, Locator};
 use crate::wire::{self, Service};
 
-use super::binding::EndpointSecret;
+use super::binding::{EndpointSecret, check_device_name};
 use super::codec::{Hash, hex, unhex};
 use super::envelope::{InviteToken, SlotId};
 use super::mailbox::{
     AckOutcome, CreateOutcome, Mailbox, MailboxError, Pin, QueueAppend, QueueItem, ReadOutcome,
     SlotWrite, Started,
 };
-use super::membership::{Clock, Device, Error as MembershipError, JoinError};
+use super::membership::{
+    Clock, Device, Error as MembershipError, JoinError, PeerMatch, RosterMember, SelectError,
+    select_peer,
+};
 use super::pairing::{Owner, PairError};
 use super::relay_mailbox::RelayMailbox;
 use super::runtime::{self, CONTROL, Config, ControlReply, ControlRequest, PeerView, Runtime};
@@ -78,16 +73,31 @@ const JOIN_POLL: Duration = Duration::from_secs(2);
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Create a private network pinned to a private relay locator.
+    /// Create a network and print its first one-use invite.
     Create {
-        /// Private relay locator. Omit to read it from standard input.
-        #[arg(long, value_name = "LOCATOR")]
+        /// Relay locator. Omit to read it from standard input.
+        #[arg(
+            long,
+            value_name = "LOCATOR",
+            env = "MASSRELAY_RELAY",
+            hide_env_values = true
+        )]
         relay: Option<String>,
+        /// Device name. Defaults to this machine’s hostname.
+        #[arg(long)]
+        name: Option<String>,
+        /// Copy the invite to the clipboard.
+        #[arg(long)]
+        copy: bool,
         #[arg(long, default_value = "0.0.0.0:0")]
         bind: SocketAddr,
     },
-    /// Print a one-use private invite (valid ten minutes) from the running runtime.
-    Invite,
+    /// Create a one-use invite valid for ten minutes.
+    Invite {
+        /// Copy the invite to the clipboard.
+        #[arg(long)]
+        copy: bool,
+    },
     /// Replace the relay access credential with the one in a new locator for the same relay.
     RelayAccess {
         /// Current locator for the pinned relay. Omit to read it from standard input.
@@ -96,36 +106,46 @@ pub enum Command {
         #[arg(long, default_value = "0.0.0.0:0")]
         bind: SocketAddr,
     },
-    /// Join with a private invite, or resume a pending join.
+    /// Join with an invite, or resume a pending join.
     Join {
         /// The invite envelope (mrprivinv0_...). Omit to read it from stdin or to resume.
         #[arg(value_name = "INVITE")]
         invite: Option<String>,
+        /// Device name. Defaults to this machine’s hostname.
+        #[arg(long)]
+        name: Option<String>,
         #[arg(long, default_value = "0.0.0.0:0")]
         bind: SocketAddr,
     },
-    /// Run the private runtime in the foreground.
+    /// Run this device in the foreground.
     Run {
         /// Use this shell executable instead of the account's default.
         #[arg(long)]
         shell: Option<PathBuf>,
+        /// Append connection events here.
+        #[arg(long)]
+        log_file: Option<PathBuf>,
         #[arg(long, default_value = "0.0.0.0:0")]
         bind: SocketAddr,
         /// Seconds between membership passes.
         #[arg(long, value_name = "SECONDS", default_value_t = 30)]
         sync_every: u64,
     },
-    /// Show this private profile and its runtime.
+    /// Show this device’s enrollment and runtime.
     Status,
     /// List members and pairing decisions, by endpoint key and local alias.
-    Peers,
+    Peers {
+        /// Show full endpoint IDs in the terminal.
+        #[arg(long)]
+        full: bool,
+    },
     /// Approve a member's exact endpoint key under a local alias.
     Approve {
-        /// Endpoint key (64 hex digits or Iroh form), or an alias already pinned.
+        /// Verified endpoint ID, local alias, or a display name to confirm.
         peer: String,
-        /// Alias this device pins to the key. Never taken from the roster.
+        /// Local alias to pin to the verified key.
         #[arg(long = "as", value_name = "ALIAS")]
-        alias: String,
+        alias: Option<String>,
         /// Replace an earlier decision for this key with a fresh approval.
         #[arg(long)]
         reapprove: bool,
@@ -146,11 +166,29 @@ pub enum Command {
         service: Service,
         peer: Option<String>,
     },
+    /// List persistent grants, temporary exposures, defaults, and exclusions.
+    List {
+        /// Show full endpoint IDs.
+        #[arg(long)]
+        full: bool,
+    },
+    /// Offer a port to one peer for as long as this command runs.
+    Expose {
+        #[arg(long, conflicts_with = "udp", required_unless_present = "udp")]
+        tcp: Option<NonZeroU16>,
+        #[arg(long, conflicts_with = "tcp", required_unless_present = "tcp")]
+        udp: Option<NonZeroU16>,
+        #[arg(long)]
+        to: String,
+        /// Forward to this HOST:PORT instead of loopback on the exposed port.
+        #[arg(value_name = "HOST:PORT", value_parser = exposure_target)]
+        target: Option<String>,
+    },
     /// Open an interactive shell on a paired peer.
     Shell { peer: String },
     /// Connect to a peer's shell or forwarded port.
     Connect {
-        peer: String,
+        peer: Option<String>,
         /// shell, tcp:PORT, or udp:PORT. Defaults to shell.
         service: Option<Service>,
         /// Local UDP port to listen on. Defaults to the service's port.
@@ -162,24 +200,54 @@ pub enum Command {
 pub async fn execute(state_dir: &Path, command: Command) -> Result<i32> {
     let dir = state_dir.join(DIR_NAME);
     match command {
-        Command::Create { relay, bind } => create(&dir, &relay_locator_input(relay)?, bind).await?,
-        Command::Invite => invite(&dir).await?,
+        Command::Create {
+            relay,
+            bind,
+            copy,
+            name,
+        } => {
+            let (locator, token) = create(&dir, &relay_locator_input(relay)?, bind, name).await?;
+            deliver_invite(&encode_invite(locator, &token)?, copy)?;
+        }
+        Command::Invite { copy } => invite(&dir, copy).await?,
         Command::RelayAccess { locator, bind } => {
             relay_access(&dir, &relay_locator_input(locator)?, bind).await?;
         }
-        Command::Join { invite, bind } => join(&dir, invite, bind).await?,
+        Command::Join { invite, name, bind } => {
+            let (invite, name) = match (invite, name) {
+                (Some(label), None)
+                    if check_device_name(&label).is_ok() && !label.starts_with(INVITE_PREFIX) =>
+                {
+                    (None, Some(label))
+                }
+                (invite, name) => (invite, name),
+            };
+            join(&dir, invite, bind, name).await?;
+        }
         Command::Run {
             shell,
+            log_file,
             bind,
             sync_every,
-        } => run(&dir, shell, bind, sync_every).await?,
+        } => {
+            run(
+                &dir,
+                shell,
+                log_file.unwrap_or_else(|| state_dir.join("connections.jsonl")),
+                bind,
+                sync_every,
+            )
+            .await?
+        }
         Command::Status => status(&dir).await?,
-        Command::Peers => peers(&dir).await?,
+        Command::Peers { full } => peers(&dir, full).await?,
         Command::Approve {
             peer,
             alias,
             reapprove,
         } => {
+            let (peer, suggested_alias) = approve_peer(&dir, &peer).await?;
+            let alias = alias.unwrap_or(suggested_alias);
             let request = ControlRequest::Approve {
                 peer,
                 alias: alias.clone(),
@@ -193,10 +261,12 @@ pub async fn execute(state_dir: &Path, command: Command) -> Result<i32> {
             eprintln!("Pairing completes on the next connection with that device.");
         }
         Command::Decline { peer } => {
+            let peer = peer_key(&dir, &peer).await?;
             control(&dir, ControlRequest::Decline { peer }).await?;
             println!("Declined locally.");
         }
         Command::Revoke { peer } => {
+            let peer = peer_key(&dir, &peer).await?;
             let ControlReply::CutOff {
                 pairing_error,
                 removal_error,
@@ -215,18 +285,41 @@ pub async fn execute(state_dir: &Path, command: Command) -> Result<i32> {
         }
         Command::Enable { service, peer } => change(&dir, service, peer, true).await?,
         Command::Disable { service, peer } => change(&dir, service, peer, false).await?,
-        Command::Shell { peer } => return runtime::shell(&dir, peer).await,
+        Command::List { full } => list(&dir, full).await?,
+        Command::Expose {
+            tcp,
+            udp,
+            to,
+            target,
+        } => {
+            let service = match (tcp, udp) {
+                (Some(port), None) => Service::Tcp(port),
+                (None, Some(port)) => Service::Udp(port),
+                _ => bail!("choose one of --tcp or --udp"),
+            };
+            runtime::expose(&dir, service, peer_key(&dir, &to).await?, target).await?;
+        }
+        Command::Shell { peer } => return runtime::shell(&dir, peer_key(&dir, &peer).await?).await,
         Command::Connect {
             peer,
             service,
             listen,
-        } => match service.unwrap_or(Service::Shell) {
-            Service::Shell => {
-                ensure!(listen.is_none(), "--listen applies to udp services");
-                return runtime::shell(&dir, peer).await;
+        } => {
+            let peer = match peer {
+                Some(peer) => peer_key(&dir, &peer).await?,
+                None => match pick_peer(&dir).await? {
+                    Some(peer) => peer,
+                    None => return Ok(0),
+                },
+            };
+            match service.unwrap_or(Service::Shell) {
+                Service::Shell => {
+                    ensure!(listen.is_none(), "--listen applies to udp services");
+                    return runtime::shell(&dir, peer).await;
+                }
+                service => runtime::connect(&dir, peer, service, listen).await?,
             }
-            service => runtime::connect(&dir, peer, service, listen).await?,
-        },
+        }
     }
     Ok(0)
 }
@@ -239,6 +332,8 @@ struct Profile {
     /// This device's endpoint secret key.
     key: Bytes<32>,
     locator: Locator,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    udp_port: Option<u16>,
 }
 
 impl Profile {
@@ -258,6 +353,25 @@ impl Profile {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn check_enrolled(state_dir: &Path) -> Result<()> {
+    let dir = state_dir.join(DIR_NAME);
+    load(&dir)?;
+    let state = Device::open(&dir, Offline, Clock::System)
+        .and_then(|device| device.state())
+        .map_err(membership)?;
+    ensure!(
+        state.net.is_some() && state.terminal.is_none(),
+        "join a network before installing the device service"
+    );
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn claim_owner(state_dir: &Path) -> Result<Owner> {
+    Owner::acquire(&state_dir.join(DIR_NAME)).map_err(|error| anyhow!("{error:?}"))
+}
+
 pub fn profile_exists(state_dir: &Path) -> bool {
     state_dir.join(DIR_NAME).join(PROFILE_FILE).is_file()
 }
@@ -265,13 +379,13 @@ pub fn profile_exists(state_dir: &Path) -> bool {
 fn load(dir: &Path) -> Result<Profile> {
     ensure!(
         dir.join(PROFILE_FILE).try_exists()?,
-        "no private profile in {}; run 'massrelay private create' or 'massrelay private join'",
+        "no device profile in {}; run 'massrelay create' or 'massrelay join'",
         dir.display()
     );
     let profile: Profile = crate::storage::load(dir, PROFILE_FILE)?;
     ensure!(
         profile.format == PROFILE_FORMAT,
-        "unsupported private profile format {:?}",
+        "unsupported device profile format {:?}",
         profile.format
     );
     Ok(profile)
@@ -292,7 +406,7 @@ fn claim(dir: &Path) -> Result<Owner> {
         .with_context(|| format!("create {}", dir.display()))?;
     Owner::acquire(dir).map_err(|e| match e {
         PairError::OwnedElsewhere => {
-            anyhow!("the private runtime or another command is using this profile")
+            anyhow!("the runtime or another command is using this profile")
         }
         e => anyhow!("{e:?}"),
     })
@@ -305,7 +419,7 @@ fn setup_profile(dir: &Path, locator: &Locator) -> Result<(Profile, bool)> {
         let saved = load(dir)?;
         ensure!(
             saved.locator.encode()? == locator.encode()?,
-            "{} already holds a private profile for another relay; it was not changed",
+            "{} already holds a device profile for another relay; it was not changed",
             dir.display()
         );
         return Ok((saved, false));
@@ -315,6 +429,7 @@ fn setup_profile(dir: &Path, locator: &Locator) -> Result<(Profile, bool)> {
             format: PROFILE_FORMAT.into(),
             key: Bytes(wire::random()?),
             locator: locator.clone(),
+            udp_port: None,
         },
         true,
     ))
@@ -336,12 +451,12 @@ async fn check_relay(locator: &Locator, bind: SocketAddr) -> Result<()> {
             .await
             .map_err(|error| match error.downcast::<mailbox::NotAdmitted>() {
                 Ok(refused) => anyhow!("{refused}; nothing was changed"),
-                Err(error) => error.context("could not reach the private relay"),
+                Err(error) => error.context("could not reach the relay"),
             })?;
         let served = client.incarnation().await?;
         ensure!(
             served == locator.incarnation(),
-            "the private relay now serves another storage incarnation than its locator; \
+            "the relay now serves another storage incarnation than its locator; \
              nothing was changed"
         );
         Ok(())
@@ -363,31 +478,79 @@ fn membership(e: MembershipError) -> anyhow::Error {
 
 // ------------------------------------------------------------------- create
 
+fn default_name(id: EndpointId) -> String {
+    ["HOSTNAME", "COMPUTERNAME"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .chain(
+            std::iter::once_with(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok())
+                .flatten(),
+        )
+        .chain(std::iter::once_with(hostname_command).flatten())
+        .find_map(|host| host_label(&host))
+        .unwrap_or_else(|| format!("device-{}", id.fmt_short()))
+}
+
+fn hostname_command() -> Option<String> {
+    let output = std::process::Command::new("hostname").output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The first label of a hostname, restricted to characters allowed in device names.
+fn host_label(host: &str) -> Option<String> {
+    let label: String = host
+        .trim()
+        .split('.')
+        .next()?
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let label = label.trim_matches('-');
+    let label = &label[..label.len().min(63)];
+    (!label.eq_ignore_ascii_case("localhost") && check_device_name(label).is_ok())
+        .then(|| label.to_owned())
+}
+
 fn relay_locator_input(argument: Option<String>) -> Result<String> {
     if let Some(argument) = argument {
         return Ok(argument);
     }
     if io::stdin().is_terminal() {
-        eprintln!("Paste the private relay locator:");
+        eprintln!("Paste the relay locator:");
     }
     let mut locator = String::new();
     io::stdin().read_line(&mut locator)?;
-    ensure!(
-        !locator.trim().is_empty(),
-        "a private relay locator is required"
-    );
+    ensure!(!locator.trim().is_empty(), "a relay locator is required");
     Ok(locator)
 }
 
-async fn create(dir: &Path, relay: &str, bind: SocketAddr) -> Result<()> {
+async fn create(
+    dir: &Path,
+    relay: &str,
+    bind: SocketAddr,
+    name: Option<String>,
+) -> Result<(Locator, Vec<u8>)> {
+    if let Some(name) = &name {
+        check_device_name(name).map_err(|error| anyhow!("{error}"))?;
+    }
     let locator = Locator::decode(relay)?;
     let owner = claim(dir)?;
     ensure!(
         !store::initialized(dir),
-        "{} already holds a private profile; it was not changed",
+        "{} already holds a device profile; it was not changed",
         dir.display()
     );
     let (profile, fresh) = setup_profile(dir, &locator)?;
+    let name = name.unwrap_or_else(|| default_name(profile.secret().public()));
     check_relay(&locator, bind).await?;
     if fresh {
         // Saved before the store, so an interrupted create resumes with the same identity.
@@ -396,23 +559,23 @@ async fn create(dir: &Path, relay: &str, bind: SocketAddr) -> Result<()> {
     let (path, key) = (dir.to_path_buf(), profile.key.0);
     let relay_key = *locator.server.id.as_bytes();
     let incarnation = locator.incarnation.0.to_vec();
-    blocking(move || {
-        Device::create_network(
+    let token = blocking(move || {
+        Device::create_network_named(
             &path,
             &EndpointSecret::from_bytes(&key),
             relay_key,
             incarnation,
             Offline,
             Clock::System,
+            Some(&name),
         )
-        .map(drop)
+        .and_then(|device| device.issue_invite())
     })
     .await?
     .map_err(membership)?;
     drop(owner);
-    eprintln!("Created a private network. Run 'massrelay private run' next.");
-    println!("{}", hex(profile.secret().public().as_bytes()));
-    Ok(())
+    eprintln!("Created the network. Run 'massrelay run' to accept the invite.");
+    Ok((locator, token))
 }
 
 // ------------------------------------------------------------- relay access
@@ -440,7 +603,7 @@ async fn relay_access(dir: &Path, text: &str, bind: SocketAddr) -> Result<()> {
     profile.locator = locator;
     crate::storage::save(dir, PROFILE_FILE, &profile)?;
     drop(owner);
-    eprintln!("Relay access credential replaced. Start 'massrelay private run' again to use it.");
+    eprintln!("Relay access credential replaced. Start 'massrelay run' again to use it.");
     Ok(())
 }
 
@@ -468,22 +631,19 @@ impl InviteEnvelope {
         let encoded = text
             .trim()
             .strip_prefix(INVITE_PREFIX)
-            .context("expected a private invite starting with mrprivinv0_")?;
-        let envelope: Self = serde_json::from_slice(
-            &URL_SAFE_NO_PAD
-                .decode(encoded)
-                .context("invalid private invite")?,
-        )
-        .context("invalid private invite")?;
+            .context("expected an invite starting with mrprivinv0_")?;
+        let envelope: Self =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded).context("invalid invite")?)
+                .context("invalid invite")?;
         ensure!(
             envelope.format == INVITE_FORMAT,
-            "unsupported private invite format {:?}",
+            "unsupported invite format {:?}",
             envelope.format
         );
         mailbox::refuse_userinfo(&envelope.locator.server.relay)?;
         let bytes = URL_SAFE_NO_PAD
             .decode(&envelope.invite)
-            .context("invalid private invite")?;
+            .context("invalid invite")?;
         matches(&envelope.locator, &bytes)?;
         Ok((envelope.locator, bytes))
     }
@@ -491,8 +651,7 @@ impl InviteEnvelope {
 
 /// The invite inside must name the locator's relay key and storage incarnation.
 fn matches(locator: &Locator, invite: &[u8]) -> Result<()> {
-    let token =
-        InviteToken::decode(invite).map_err(|e| anyhow!("invalid private invite: {e:?}"))?;
+    let token = InviteToken::decode(invite).map_err(|e| anyhow!("invalid invite: {e:?}"))?;
     ensure!(
         token.relay_key == *locator.server.id.as_bytes(),
         "the invite names another relay than its locator; nothing was sent"
@@ -504,32 +663,87 @@ fn matches(locator: &Locator, invite: &[u8]) -> Result<()> {
     Ok(())
 }
 
-async fn invite(dir: &Path) -> Result<()> {
+fn encode_invite(locator: Locator, bytes: &[u8]) -> Result<String> {
+    matches(&locator, bytes)?;
+    InviteEnvelope {
+        format: INVITE_FORMAT.into(),
+        locator,
+        invite: URL_SAFE_NO_PAD.encode(bytes),
+    }
+    .encode()
+}
+
+async fn invite(dir: &Path, copy: bool) -> Result<()> {
     let profile = load(dir)?;
     let ControlReply::Invite(token) = control(dir, ControlRequest::Invite).await? else {
         bail!("unexpected invite reply");
     };
     let bytes = unhex(&token).context("invalid invite from the runtime")?;
-    matches(&profile.locator, &bytes)?;
-    let envelope = InviteEnvelope {
-        format: INVITE_FORMAT.into(),
-        locator: profile.locator,
-        invite: URL_SAFE_NO_PAD.encode(bytes),
+    deliver_invite(&encode_invite(profile.locator, &bytes)?, copy)
+}
+
+fn deliver_invite(invite: &str, copy: bool) -> Result<()> {
+    if copy {
+        let mut command = clipboard_command()?;
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context(
+                "open the clipboard helper; use the command without --copy to print the invite",
+            )?;
+        let written = child
+            .stdin
+            .take()
+            .expect("piped clipboard input")
+            .write_all(invite.as_bytes());
+        let result = child.wait()?;
+        written.context("write the invite to the clipboard")?;
+        anyhow::ensure!(result.success(), "clipboard helper failed ({result})");
+        eprintln!("Invite copied. Run 'massrelay join' on the other device and paste it there.");
+    } else if io::stdout().is_terminal() {
+        eprintln!("On the other device, run 'massrelay join' and paste the invite below.");
+        println!("{invite}");
+    } else {
+        println!("{invite}");
+        return Ok(());
     }
-    .encode()?;
-    if io::stdout().is_terminal() {
-        eprintln!(
-            "Private invite. On the other device run 'massrelay private join' and \
-             paste it there. It works once and expires in ten minutes; keep it secret."
-        );
-    }
-    println!("{envelope}");
+    eprintln!("The invite works once and expires in ten minutes.");
     Ok(())
+}
+
+fn clipboard_command() -> Result<Process> {
+    #[cfg(target_os = "macos")]
+    return Ok(Process::new("/usr/bin/pbcopy"));
+    #[cfg(windows)]
+    return Ok(Process::new("clip.exe"));
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            return Ok(Process::new("wl-copy"));
+        }
+        if std::env::var_os("DISPLAY").is_some() {
+            let mut command = Process::new("xclip");
+            command.args(["-selection", "clipboard"]);
+            return Ok(command);
+        }
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    bail!("clipboard copy needs a desktop session; run 'massrelay invite' to print the invite");
 }
 
 // --------------------------------------------------------------------- join
 
-async fn join(dir: &Path, argument: Option<String>, bind: SocketAddr) -> Result<()> {
+async fn join(
+    dir: &Path,
+    argument: Option<String>,
+    bind: SocketAddr,
+    name: Option<String>,
+) -> Result<()> {
+    if let Some(name) = &name {
+        check_device_name(name).map_err(|error| anyhow!("{error}"))?;
+    }
     let owner = claim(dir)?;
     let profile = if store::initialized(dir) {
         let path = dir.to_path_buf();
@@ -537,13 +751,13 @@ async fn join(dir: &Path, argument: Option<String>, bind: SocketAddr) -> Result<
             .await?
             .map_err(membership)?;
         let Some(pending) = st.pending_join else {
-            bail!("this private profile is already a member; run 'massrelay private run'");
+            bail!("this device is already a member; run 'massrelay run'");
         };
         if let Some(text) = argument {
             let (_, bytes) = InviteEnvelope::open(&text)?;
             ensure!(
                 bytes == pending.token,
-                "another join is pending on this profile; run 'massrelay private join' without \
+                "another join is pending on this profile; run 'massrelay join' without \
                  an invite to resume it"
             );
         }
@@ -555,6 +769,7 @@ async fn join(dir: &Path, argument: Option<String>, bind: SocketAddr) -> Result<
         };
         let (locator, bytes) = InviteEnvelope::open(&text)?;
         let (profile, fresh) = setup_profile(dir, &locator)?;
+        let name = name.unwrap_or_else(|| default_name(profile.secret().public()));
         check_relay(&locator, bind).await?;
         if fresh {
             crate::storage::save(dir, PROFILE_FILE, &profile)?;
@@ -562,12 +777,13 @@ async fn join(dir: &Path, argument: Option<String>, bind: SocketAddr) -> Result<
         let (path, key) = (dir.to_path_buf(), profile.key.0);
         // Persists the exact request before anything is sent.
         blocking(move || {
-            Device::begin_join(
+            Device::begin_join_named(
                 &path,
                 &EndpointSecret::from_bytes(&key),
                 &bytes,
                 Offline,
                 Clock::System,
+                Some(&name),
             )
             .map(drop)
         })
@@ -590,18 +806,18 @@ async fn join(dir: &Path, argument: Option<String>, bind: SocketAddr) -> Result<
         r = waiting => r?,
         r = crate::shutdown() => {
             r?;
-            bail!("stopped waiting; run 'massrelay private join' to resume this join");
+            bail!("stopped waiting; run 'massrelay join' to resume this join");
         }
     }
     drop(owner);
-    eprintln!("Joined the private network. Run 'massrelay private run' next.");
+    eprintln!("Joined the network. Run 'massrelay run' next.");
     println!("{}", hex(profile.secret().public().as_bytes()));
     Ok(())
 }
 
 fn read_invite() -> Result<String> {
     if io::stdin().is_terminal() {
-        eprint!("Paste the private invite: ");
+        eprint!("Paste the invite: ");
         io::stderr().flush()?;
     }
     let mut line = String::new();
@@ -628,8 +844,8 @@ async fn wait_for_reply(device: Arc<Device<RelayMailbox>>) -> Result<()> {
                 Ok(CreateOutcome::Created | CreateOutcome::ExactRetry) => {
                     sent = true;
                     eprintln!(
-                        "Join request sent. Waiting for the inviting device's private runtime to \
-                         admit this device; Ctrl-C stops waiting and 'massrelay private join' \
+                        "Join request sent. Waiting for the inviting device's runtime to \
+                         admit this device; Ctrl-C stops waiting and 'massrelay join' \
                          resumes."
                     );
                 }
@@ -666,13 +882,19 @@ async fn wait_for_reply(device: Arc<Device<RelayMailbox>>) -> Result<()> {
 
 // ---------------------------------------------------------------------- run
 
-async fn run(dir: &Path, shell: Option<PathBuf>, bind: SocketAddr, sync_every: u64) -> Result<()> {
-    let profile = load(dir)?;
+async fn run(
+    dir: &Path,
+    shell: Option<PathBuf>,
+    log_file: PathBuf,
+    bind: SocketAddr,
+    sync_every: u64,
+) -> Result<()> {
+    let mut profile = load(dir)?;
     ensure!(sync_every > 0, "--sync-every must be at least one second");
     // A duplicate must not use this profile's key to register at the relay.
     let owner = Owner::acquire(dir).map_err(|e| match e {
         PairError::OwnedElsewhere => {
-            anyhow!("a private runtime is already running on this profile")
+            anyhow!("a runtime is already running on this profile")
         }
         e => anyhow!("{e:?}"),
     })?;
@@ -683,24 +905,45 @@ async fn run(dir: &Path, shell: Option<PathBuf>, bind: SocketAddr, sync_every: u
             .map_err(membership)?;
         ensure!(
             st.net.is_some(),
-            "this device has not finished joining; run 'massrelay private join' first"
+            "this device has not finished joining; run 'massrelay join' first"
         );
     }
     let relay = profile.locator.server.relay.clone();
-    let endpoint = crate::bind_endpoint(
-        profile.secret(),
-        bind,
-        Some(relay.clone()),
-        SERVICE_ALPN,
-        true,
-    )
-    .await?;
+    let bind_device = |addr| {
+        crate::bind_endpoint(
+            profile.secret(),
+            addr,
+            Some(relay.clone()),
+            SERVICE_ALPN,
+            true,
+        )
+    };
+    let mut preferred = bind;
+    if bind.port() == 0 {
+        preferred.set_port(profile.udp_port.unwrap_or(0));
+    }
+    let endpoint = match bind_device(preferred).await {
+        Err(error) if preferred != bind => {
+            eprintln!(
+                "massrelay: could not reuse UDP port {}: {error}",
+                preferred.port()
+            );
+            bind_device(bind).await?
+        }
+        result => result?,
+    };
+    let actual = endpoint.bound_sockets().first().map(SocketAddr::port);
+    if profile.udp_port != actual {
+        profile.udp_port = actual;
+        crate::storage::save(dir, PROFILE_FILE, &profile)?;
+    }
     let mailbox = {
         let p = profile.clone();
         blocking(move || p.mailbox(bind)).await??
     };
     let mut config = Config::new(dir);
     config.shell = shell;
+    config.log_file = Some(log_file);
     config.sync_every = Some(Duration::from_secs(sync_every));
     config.addresses = Arc::new(move |key| {
         EndpointId::from_bytes(key)
@@ -710,8 +953,11 @@ async fn run(dir: &Path, shell: Option<PathBuf>, bind: SocketAddr, sync_every: u
     let runtime = Runtime::start_owned(config, mailbox, Clock::System, endpoint.clone(), owner)
         .await
         .map_err(|e| anyhow!("{e:?}"))?;
+    if let Some(log_file) = runtime.log_file() {
+        eprintln!("MassRelay event log at {}", log_file.display());
+    }
     eprintln!(
-        "MassRelay private runtime running as {}",
+        "MassRelay runtime running as {}",
         hex(endpoint.id().as_bytes())
     );
     eprintln!("Press Ctrl-C to stop.");
@@ -771,8 +1017,14 @@ async fn status(dir: &Path) -> Result<()> {
     let st = blocking(move || Device::open(&path, Offline, Clock::System)?.state())
         .await?
         .map_err(membership)?;
-    println!("Profile: private");
-    println!("Endpoint: {}", hex(profile.secret().public().as_bytes()));
+    let endpoint = hex(profile.secret().public().as_bytes());
+    if st.net.is_some() {
+        let roster = named_roster(dir).await?;
+        if let Some(name) = roster_name(&roster, &endpoint) {
+            println!("Name: {}", crate::visible(name));
+        }
+    }
+    println!("Endpoint: {endpoint}");
     println!(
         "Relay: {} incarnation {}",
         profile.locator.server.id,
@@ -781,7 +1033,7 @@ async fn status(dir: &Path) -> Result<()> {
     if let Some(pending) = &st.pending_join {
         match &pending.halted {
             Some(h) => println!("Membership: join halted: {}", crate::visible(h)),
-            None => println!("Membership: join pending; run 'massrelay private join' to resume"),
+            None => println!("Membership: join pending; run 'massrelay join' to resume"),
         }
         return Ok(());
     }
@@ -832,14 +1084,155 @@ async fn status(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn peers(dir: &Path) -> Result<()> {
+async fn named_roster(dir: &Path) -> Result<Vec<RosterMember>> {
+    let path = dir.to_path_buf();
+    blocking(
+        move || match Device::open(&path, Offline, Clock::System)?.named_roster() {
+            Err(MembershipError::NotMember | MembershipError::Terminal) => Ok(Vec::new()),
+            result => result,
+        },
+    )
+    .await?
+    .map_err(membership)
+}
+
+fn parse_endpoint(selector: &str) -> Option<EndpointId> {
+    selector.parse().ok()
+}
+
+async fn selected_peer(dir: &Path, selector: &str) -> Result<(PeerMatch, Option<String>)> {
+    let view = current_view(dir).await?;
+    let aliases: Vec<_> = view
+        .peers
+        .iter()
+        .filter_map(|p| Some((p.alias.clone()?, *parse_endpoint(&p.key)?.as_bytes())))
+        .collect();
+    let roster = named_roster(dir).await?;
+    let selected = select_peer(
+        selector,
+        parse_endpoint(selector).map(|key| *key.as_bytes()),
+        &aliases,
+        &roster,
+    )
+    .map_err(|error| match error {
+        SelectError::NoMatch => anyhow!("no peer pinned or named {selector:?}"),
+        SelectError::AmbiguousName(keys) | SelectError::AmbiguousAlias(keys) => {
+            let keys = keys
+                .iter()
+                .map(|key| hex(key))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow!("{selector:?} names multiple devices; use an endpoint ID: {keys}")
+        }
+    })?;
+    let key = selected.endpoint();
+    let label = aliases
+        .into_iter()
+        .find_map(|(alias, endpoint)| (endpoint == key).then_some(alias))
+        .or_else(|| {
+            roster
+                .into_iter()
+                .find_map(|member| (member.endpoint == key).then_some(member.name).flatten())
+        });
+    Ok((selected, label))
+}
+
+async fn peer_key(dir: &Path, selector: &str) -> Result<String> {
+    if let Some(key) = parse_endpoint(selector) {
+        return Ok(hex(key.as_bytes()));
+    }
+    Ok(hex(&selected_peer(dir, selector).await?.0.endpoint()))
+}
+
+async fn approve_peer(dir: &Path, selector: &str) -> Result<(String, String)> {
+    let (selected, label) = selected_peer(dir, selector).await?;
+    let key = hex(&selected.endpoint());
+    if !selected.pinned() {
+        ensure!(
+            io::stdin().is_terminal(),
+            "approve using the verified endpoint ID {key}"
+        );
+        eprintln!(
+            "Run 'massrelay status' on {} and compare its endpoint ID:",
+            crate::visible(selector)
+        );
+        eprintln!("{key}");
+        eprint!("Approve this device? [y/N] ");
+        io::stderr().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        ensure!(
+            answer.trim().eq_ignore_ascii_case("y"),
+            "approval cancelled"
+        );
+    }
+    Ok((
+        key.clone(),
+        label.unwrap_or_else(|| format!("device-{}", &key[..8])),
+    ))
+}
+
+async fn pick_peer(dir: &Path) -> Result<Option<String>> {
+    ensure!(
+        io::stdin().is_terminal() && io::stdout().is_terminal(),
+        "use 'massrelay connect PEER [SERVICE]'"
+    );
+    let roster = named_roster(dir).await?;
+    let mut peers: Vec<PeerView> = current_view(dir)
+        .await?
+        .peers
+        .into_iter()
+        .filter(|p| p.member && p.local == "approved")
+        .collect();
+    peers.sort_by_cached_key(|p| p.alias.as_deref().unwrap_or(&p.key).to_ascii_lowercase());
+    if peers.is_empty() {
+        eprintln!("No approved devices. Run 'massrelay peers' to check approvals.");
+        return Ok(None);
+    }
+    for (index, peer) in peers.iter().enumerate() {
+        let alias = peer
+            .alias
+            .as_deref()
+            .or_else(|| roster_name(&roster, &peer.key))
+            .unwrap_or(&peer.key);
+        eprintln!("  {}  {}", index + 1, crate::visible(alias));
+    }
+    eprint!("Choose a device number, or press Enter to cancel: ");
+    io::stderr().flush()?;
+    let mut choice = String::new();
+    io::stdin().read_line(&mut choice)?;
+    let choice = choice.trim();
+    if choice.is_empty() {
+        return Ok(None);
+    }
+    let peer = choice
+        .parse::<usize>()
+        .ok()
+        .and_then(|number| number.checked_sub(1))
+        .and_then(|index| peers.get(index))
+        .context("choose a device number from the list")?;
+    Ok(Some(peer.key.clone()))
+}
+
+async fn peers(dir: &Path, full: bool) -> Result<()> {
     load(dir)?;
     let view = current_view(dir).await?;
-    let mut rows =
-        vec![["ENDPOINT", "ALIAS", "MEMBER", "LOCAL", "REMOTE", "PAIRED"].map(String::from)];
-    rows.extend(view.peers.into_iter().map(|p: PeerView| {
+    let roster = named_roster(dir).await?;
+    let terminal = io::stdout().is_terminal();
+    let mut rows = vec![
+        [
+            "ENDPOINT", "NAME", "ALIAS", "MEMBER", "LOCAL", "REMOTE", "PAIRED",
+        ]
+        .map(String::from),
+    ];
+    rows.extend(view.peers.into_iter().map(|mut p: PeerView| {
+        let name = roster_name(&roster, &p.key).unwrap_or("-").to_owned();
+        if terminal && !full {
+            p.key.truncate(8);
+        }
         [
             p.key,
+            name,
             p.alias.map_or_else(|| "-".into(), |a| crate::visible(&a)),
             yes(p.member),
             p.local,
@@ -847,23 +1240,88 @@ async fn peers(dir: &Path) -> Result<()> {
             yes(p.paired),
         ]
     }));
-    crate::print_table(&rows, io::stdout().is_terminal());
+    crate::print_table(&rows, terminal);
     Ok(())
+}
+
+fn roster_name<'a>(roster: &'a [RosterMember], key: &str) -> Option<&'a str> {
+    let endpoint = parse_endpoint(key)?;
+    roster
+        .iter()
+        .find(|member| &member.endpoint == endpoint.as_bytes())?
+        .name
+        .as_deref()
 }
 
 fn yes(b: bool) -> String {
     if b { "yes" } else { "no" }.into()
 }
 
+fn exposure_target(target: &str) -> Result<String, String> {
+    wire::check_target(target).map_err(|error| error.to_string())?;
+    Ok(target.to_owned())
+}
+
+async fn list(dir: &Path, full: bool) -> Result<()> {
+    let view = current_view(dir).await?;
+    let terminal = io::stdout().is_terminal();
+    let mut rows = vec![["SERVICE", "PEER", "ENDPOINT", "MODE", "TARGET"].map(String::from)];
+    let mut append = |service: Service, key: Option<&str>, mode: &str, target: Option<&str>| {
+        let peer = key
+            .and_then(|key| view.peers.iter().find(|peer| peer.key == key))
+            .and_then(|peer| peer.alias.as_deref())
+            .or(key)
+            .unwrap_or("all paired peers");
+        let key = key.unwrap_or("-");
+        let endpoint = if terminal && !full && key.len() > 8 {
+            &key[..8]
+        } else {
+            key
+        };
+        let target = match (target, service, mode) {
+            (Some(target), _, _) => crate::visible(target),
+            (_, Service::Shell, _) | (_, _, "excluded") => "-".into(),
+            (_, Service::Tcp(port), _) => format!("loopback:{port}"),
+            (_, Service::Udp(port), _) => format!("127.0.0.1:{port}"),
+        };
+        rows.push([
+            service.to_string(),
+            crate::visible(peer),
+            endpoint.into(),
+            mode.into(),
+            target,
+        ]);
+    };
+    for (key, service) in &view.grants {
+        append(*service, Some(key), "persistent", None);
+    }
+    for exposure in &view.exposures {
+        append(
+            exposure.service,
+            Some(&exposure.key),
+            "temporary",
+            exposure.target.as_deref(),
+        );
+    }
+    for service in &view.defaults {
+        append(*service, None, "default", None);
+    }
+    for (key, service) in &view.exclusions {
+        append(*service, Some(key), "excluded", None);
+    }
+    crate::print_table(&rows, terminal);
+    Ok(())
+}
+
 async fn change(dir: &Path, service: Service, peer: Option<String>, enable: bool) -> Result<()> {
     let action = if enable { "Enabled" } else { "Disabled" };
     let request = match (&peer, enable) {
         (Some(p), true) => ControlRequest::Enable {
-            peer: p.clone(),
+            peer: peer_key(dir, p).await?,
             service,
         },
         (Some(p), false) => ControlRequest::Disable {
-            peer: p.clone(),
+            peer: peer_key(dir, p).await?,
             service,
         },
         (None, enabled) => ControlRequest::SetDefault { service, enabled },

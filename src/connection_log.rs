@@ -1,6 +1,6 @@
 use std::{
     fs::{File, OpenOptions},
-    io::{self, Write},
+    io::Write,
     path::Path,
     sync::{
         Mutex,
@@ -18,6 +18,8 @@ use crate::wire::{Member, Service};
 pub struct ConnectionLog {
     file: Option<Mutex<File>>,
     counter: AtomicU64,
+    /// Mirror each event to standard error (the supervisor log).
+    mirror: bool,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -103,7 +105,17 @@ impl ConnectionLog {
         Ok(Self {
             file,
             counter: AtomicU64::new(1),
+            mirror: true,
         })
+    }
+
+    /// A log that records nothing, for callers that run without one.
+    pub fn disabled() -> Self {
+        Self {
+            file: None,
+            counter: AtomicU64::new(1),
+            mirror: false,
+        }
     }
 
     pub fn session(
@@ -133,6 +145,17 @@ impl ConnectionLog {
         ));
     }
 
+    /// A state event about a peer known by endpoint ID and, optionally, a local name.
+    pub fn peer(
+        &self,
+        event: &'static str,
+        peer_id: Option<EndpointId>,
+        peer_name: Option<&str>,
+        service: Option<Service>,
+    ) {
+        self.write(Event::new(event, peer_id, peer_name, service));
+    }
+
     pub fn audit(&self, event: &'static str, audit: Audit, service: Option<Service>) {
         self.write(AuditEvent {
             details: Event::new(event, None, None, service),
@@ -141,6 +164,9 @@ impl ConnectionLog {
     }
 
     fn write(&self, event: impl Serialize) {
+        if self.file.is_none() && !self.mirror {
+            return;
+        }
         let mut line = match serde_json::to_vec(&event) {
             Ok(line) => line,
             Err(error) => {
@@ -158,8 +184,15 @@ impl ConnectionLog {
                 eprintln!("massrelay: could not write event log: {error:#}");
             }
         }
+        if !self.mirror {
+            return;
+        }
         // Keep events visible in the supervisor log even with a separate event file.
-        let _ = io::stderr().lock().write_all(&line);
+        // Test builds go through the harness's captured stderr instead.
+        #[cfg(test)]
+        eprint!("{}", String::from_utf8_lossy(&line));
+        #[cfg(not(test))]
+        let _ = std::io::stderr().lock().write_all(&line);
     }
 }
 
@@ -182,9 +215,9 @@ impl<'a> Event<'a> {
 }
 
 impl Session<'_> {
-    pub fn set_peer(&mut self, id: EndpointId, name: String) {
+    pub fn identify(&mut self, id: EndpointId, name: Option<String>) {
         self.peer_id = Some(id);
-        self.peer_name = Some(name);
+        self.peer_name = name;
     }
 
     pub fn set_service(&mut self, service: Service) {

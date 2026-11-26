@@ -41,6 +41,17 @@
 //! direction; the command leaving ends the session) with the format's frame
 //! bound; shell bytes are copied as a stream.
 //!
+//! # Exposures
+//!
+//! `Expose` holds a temporary grant (`Node::expose`) for one port to one
+//! paired peer, optionally forwarding to a target this device's owner chose,
+//! for as long as the command's lifetime socket stays open. The command
+//! leaving, a disable of that service for that peer, a decline, cutoff,
+//! re-pair, removal or stop withdraws exactly that exposure and ends only
+//! the sessions opened under it; the control socket then gets `Done` (the
+//! command left) or the reason. Exposures are never persisted; `Status`
+//! lists them (with targets) apart from persistent grants.
+//!
 //! # Membership pass
 //!
 //! A background task runs `Node::sync_membership` on a blocking worker: it
@@ -71,10 +82,19 @@
 //! PTY reaper that cannot reap its shell. In either case the `Node` is
 //! kept until it finishes (or the process exits) and `Stopped` says so.
 //!
+//! # Event log
+//!
+//! The runtime appends device events (start and stop, every inbound and
+//! outbound service session, every control command, membership
+//! reachability and observed state changes) to `Config::log_file`, by
+//! default `connections.jsonl` in the profile directory, with the legacy
+//! record format and event names. See `super::audit` for what is recorded
+//! and what never is.
+//!
 //! # Not here
 //!
-//! No OS service manager, installer, temporary exposures, destination-chosen
-//! non-loopback targets, roles or additional capabilities. The experimental
+//! No OS service manager, installer, roles or additional capabilities.
+//! Non-loopback targets exist only on exposures. The experimental
 //! CLI over this runtime is `super::cli`.
 
 use std::path::{Path, PathBuf};
@@ -84,7 +104,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
@@ -94,6 +114,7 @@ use crate::local::{self, Channel};
 use crate::wire::{self, GrantRule, Service, ServiceReply};
 use crate::{terminal, tunnel};
 
+use super::audit::{self, DeviceLog};
 use super::binding::EndpointKey;
 use super::codec::{hex, unhex};
 use super::mailbox::Mailbox;
@@ -169,6 +190,15 @@ pub enum ControlRequest {
         lifetime_port: u16,
         lifetime_key: [u8; 32],
     },
+    /// Grant `service` (a port) to `peer` while the lifetime socket stays
+    /// open, forwarding to `target` (`None`: loopback on the same port).
+    Expose {
+        peer: String,
+        service: Service,
+        target: Option<String>,
+        lifetime_port: u16,
+        lifetime_key: [u8; 32],
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +221,11 @@ pub enum ControlReply {
     },
     Shell,
     Connected,
+    /// The exposure is live; a final `Done` or `Error` follows when it ends.
+    Exposed {
+        key: String,
+        alias: String,
+    },
     Error(String),
 }
 
@@ -207,10 +242,21 @@ pub struct StatusView {
     /// Per-peer grants on this device: (endpoint key, service).
     pub grants: Vec<(String, Service)>,
     pub exclusions: Vec<(String, Service)>,
+    /// Live temporary exposures (running owner only; never persisted).
+    #[serde(default)]
+    pub exposures: Vec<ExposureView>,
     /// Outcome of the last membership pass (running owner only).
     pub last_sync: Option<String>,
     /// The recorded membership halt, if any.
     pub halt: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExposureView {
+    pub key: String,
+    pub service: Service,
+    /// Owner-chosen target (`None`: loopback on the service port).
+    pub target: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,6 +329,11 @@ fn view(
         .into_iter()
         .filter(|g| !g.temporary)
         .filter_map(|g| Some((hex(g.id?.as_bytes()), g.service)))
+        .chain(
+            st.pending_grants
+                .iter()
+                .map(|(key, service)| (hex(key), *service)),
+        )
         .collect();
     let exclusions = st.exclusions.iter().map(|(k, s)| (hex(k), *s)).collect();
     StatusView {
@@ -293,6 +344,7 @@ fn view(
         defaults,
         grants,
         exclusions,
+        exposures: vec![],
         last_sync,
         halt,
     }
@@ -348,6 +400,8 @@ pub struct Config {
     /// Interval of the background membership pass (`None`: no pass).
     pub sync_every: Option<Duration>,
     pub addresses: Addresses,
+    /// Event log file (`None`: `connections.jsonl` in `dir`).
+    pub log_file: Option<PathBuf>,
 }
 
 impl Config {
@@ -357,6 +411,7 @@ impl Config {
             shell: None,
             sync_every: Some(Duration::from_secs(30)),
             addresses: Arc::new(|key| EndpointId::from_bytes(key).ok().map(EndpointAddr::new)),
+            log_file: None,
         }
     }
 }
@@ -375,6 +430,7 @@ pub struct Runtime<M: Mailbox + Send + Sync + 'static> {
     dir: PathBuf,
     stop: watch::Sender<bool>,
     tasks: Vec<(&'static str, JoinHandle<()>)>,
+    log: Arc<DeviceLog>,
 }
 
 /// What `stop` achieved.
@@ -413,11 +469,18 @@ impl<M: Mailbox + Send + Sync + 'static> Runtime<M> {
     ) -> Result<Self, PairError> {
         let local = |e: &dyn std::fmt::Display| PairError::Local(format!("runtime: {e:#}"));
         let device = Device::open(&config.dir, mailbox, clock)?;
-        let node = Node::new(device, owner, config.shell)?;
+        let log_file = config
+            .log_file
+            .clone()
+            .unwrap_or_else(|| config.dir.join(audit::EVENT_FILE));
+        let log = Arc::new(DeviceLog::open(&log_file).map_err(|e| local(&e))?);
+        let node = Node::with_log(device, owner, config.shell, log.clone())?;
         node.check_endpoint(&endpoint)?;
         let (listener, marker) = local::listen_on(&config.dir, &CONTROL)
             .await
             .map_err(|e| local(&e))?;
+        // The baseline later state events are diffed against.
+        audit::observe(&node, true);
         let shared = Arc::new(Shared {
             node,
             endpoint,
@@ -477,7 +540,11 @@ impl<M: Mailbox + Send + Sync + 'static> Runtime<M> {
                         _ = tokio::time::sleep(every) => {}
                     }
                     let node = shared.node.clone();
-                    let pass = tokio::task::spawn_blocking(move || node.sync_membership());
+                    let pass = tokio::task::spawn_blocking(move || {
+                        let synced = node.sync_membership();
+                        audit::observe(&node, true);
+                        synced
+                    });
                     tokio::select! {
                         biased;
                         // A pass blocked in the mailbox is left to finish on
@@ -485,7 +552,10 @@ impl<M: Mailbox + Send + Sync + 'static> Runtime<M> {
                         _ = &mut stop => break,
                         r = pass => {
                             let note = match r {
-                                Ok(s) => format!("{s:?}"),
+                                Ok(s) => {
+                                    shared.node.log().membership_pass(&s);
+                                    format!("{s:?}")
+                                }
                                 Err(e) => format!("membership pass failed: {e}"),
                             };
                             *shared.last_sync.lock().expect("sync note") = Some(note);
@@ -496,12 +566,19 @@ impl<M: Mailbox + Send + Sync + 'static> Runtime<M> {
             tasks.push(("membership", tokio::spawn(sync)));
         }
 
+        log.started();
         Ok(Self {
             shared: Some(shared),
             dir: config.dir,
             stop,
             tasks,
+            log,
         })
+    }
+
+    /// The event log file.
+    pub fn log_file(&self) -> Option<&Path> {
+        self.log.path()
     }
 
     pub fn live_sessions(&self) -> usize {
@@ -574,6 +651,7 @@ impl<M: Mailbox + Send + Sync + 'static> Runtime<M> {
                 Err(_) => false,
             }
         };
+        self.log.stopped();
         Stopped {
             aborted,
             native_workers,
@@ -607,17 +685,34 @@ async fn serve_control<M: Mailbox + Send + Sync + 'static>(
     mut socket: TcpStream,
     marker: &local::Runtime,
 ) -> Result<()> {
-    let request: ControlRequest = timeout(wire::RPC_TIMEOUT, async {
+    let log = shared.node.log();
+    let mut authenticated = false;
+    let request = timeout(wire::RPC_TIMEOUT, async {
         local::authenticate_on(&mut socket, marker, &CONTROL).await?;
+        authenticated = true;
         wire::recv(&mut socket).await
     })
     .await
-    .context("local request timed out")??;
+    .context("local request timed out")
+    .and_then(|r| r);
+    let request: ControlRequest = match request {
+        Ok(request) => request,
+        Err(e) => {
+            log.control_unreadable(authenticated);
+            return Err(e);
+        }
+    };
+    // Audited by operation, peer and service only; never the request.
+    let (operation, selector, service) = audit::operation(&request);
+    let target = selector.and_then(|s| parse_key(s).or_else(|| log.alias_key(s)));
+    let audit = |outcome, reason| log.control(operation, outcome, target, service, reason);
+    audit("requested", None);
     socket.set_nodelay(true)?;
     // A command read after stop linearized is refused (status may still be
     // read). `Peers` refuses every mutation then as well.
     if shared.node.stopping() && !matches!(request, ControlRequest::Status | ControlRequest::Peers)
     {
+        audit("denied", Some("device_stopping"));
         let reply = ControlReply::Error("the private runtime is stopping".into());
         return wire::send(&mut socket, reply).await;
     }
@@ -629,7 +724,11 @@ async fn serve_control<M: Mailbox + Send + Sync + 'static>(
             lifetime_port,
             lifetime_key,
         } => {
-            let lifetime = local::lifetime_connect(lifetime_port, &lifetime_key).await?;
+            let lifetime = local::lifetime_connect(lifetime_port, &lifetime_key).await;
+            if lifetime.is_err() {
+                audit("failed", Some("lifetime_channel_failed"));
+            }
+            let lifetime = lifetime?;
             outbound(
                 &shared,
                 socket,
@@ -644,6 +743,7 @@ async fn serve_control<M: Mailbox + Send + Sync + 'static>(
             service: Service::Shell,
             ..
         } => {
+            audit("denied", Some("command_rejected"));
             let reply = ControlReply::Error("connect forwards a port".into());
             wire::send(&mut socket, reply).await
         }
@@ -653,15 +753,45 @@ async fn serve_control<M: Mailbox + Send + Sync + 'static>(
             lifetime_port,
             lifetime_key,
         } => {
-            let lifetime = local::lifetime_connect(lifetime_port, &lifetime_key).await?;
+            let lifetime = local::lifetime_connect(lifetime_port, &lifetime_key).await;
+            if lifetime.is_err() {
+                audit("failed", Some("lifetime_channel_failed"));
+            }
+            let lifetime = lifetime?;
             outbound(&shared, socket, &peer, service, None, lifetime).await
         }
+        ControlRequest::Expose {
+            peer,
+            service,
+            target,
+            lifetime_port,
+            lifetime_key,
+        } => {
+            let lifetime = local::lifetime_connect(lifetime_port, &lifetime_key).await;
+            if lifetime.is_err() {
+                audit("failed", Some("lifetime_channel_failed"));
+            }
+            hold_exposure(shared, socket, peer, service, target, lifetime?).await
+        }
         request => {
+            let changes = !matches!(
+                request,
+                ControlRequest::Status | ControlRequest::Peers | ControlRequest::Invite
+            );
             // Local store and MLS work only; no mailbox wait.
             let shared2 = shared.clone();
-            let reply = tokio::task::spawn_blocking(move || manage(&shared2, request))
-                .await
-                .unwrap_or_else(|e| ControlReply::Error(format!("command failed: {e}")));
+            let reply = tokio::task::spawn_blocking(move || {
+                let reply = manage(&shared2, request);
+                if changes {
+                    audit::observe(&shared2.node, true);
+                }
+                reply
+            })
+            .await
+            .unwrap_or_else(|e| ControlReply::Error(format!("command failed: {e}")));
+            // The reply (an invite token included) is never logged.
+            let (outcome, reason) = audit::reply_outcome(&reply);
+            audit(outcome, reason);
             wire::send(&mut socket, reply).await
         }
     }
@@ -680,7 +810,7 @@ fn manage<M: Mailbox + Send + Sync + 'static>(
             ControlRequest::Status | ControlRequest::Peers => {
                 let roster = node.roster().unwrap_or_default();
                 let last = shared.last_sync.lock().expect("sync note").clone();
-                let v = view(
+                let mut v = view(
                     &node.endpoint_key(),
                     &roster,
                     &st,
@@ -689,6 +819,15 @@ fn manage<M: Mailbox + Send + Sync + 'static>(
                     last,
                     node.halt().map_err(err)?,
                 );
+                v.exposures = node
+                    .exposures()
+                    .into_iter()
+                    .map(|(k, service, target)| ExposureView {
+                        key: hex(&k),
+                        service,
+                        target,
+                    })
+                    .collect();
                 match request {
                     ControlRequest::Peers => ControlReply::Peers(v.peers),
                     _ => ControlReply::Status(v),
@@ -738,12 +877,80 @@ fn manage<M: Mailbox + Send + Sync + 'static>(
             ControlRequest::ClearExclusion { peer: p, service } => {
                 ControlReply::Changed(node.clear_exclusion(&peer(&p)?, service).map_err(err)?)
             }
-            ControlRequest::Shell { .. } | ControlRequest::Connect { .. } => {
+            ControlRequest::Shell { .. }
+            | ControlRequest::Connect { .. }
+            | ControlRequest::Expose { .. } => {
                 return Err("not a management command".into());
             }
         })
     };
     run().unwrap_or_else(ControlReply::Error)
+}
+
+/// Hold one exposure for as long as the command's lifetime socket stays
+/// open; then withdraw exactly it and tell the command why it ended.
+async fn hold_exposure<M: Mailbox + Send + Sync + 'static>(
+    shared: Arc<Shared<M>>,
+    mut socket: TcpStream,
+    selector: String,
+    service: Service,
+    target: Option<String>,
+    mut lifetime: TcpStream,
+) -> Result<()> {
+    // Local store work only; no mailbox wait.
+    let node = shared.node.clone();
+    let made = tokio::task::spawn_blocking(move || {
+        let st = node.pairing_state().map_err(|e| format!("{e:?}"))?;
+        let key = resolve(&st, &selector)?;
+        node.expose(&key, service, target)
+            .map_err(|e| format!("{e:?}"))
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("command failed: {e}")));
+    let log = shared.node.log();
+    let exposure = match made {
+        Ok(exposure) => exposure,
+        Err(e) => {
+            log.control(
+                "expose",
+                "denied",
+                None,
+                Some(service),
+                Some("command_rejected"),
+            );
+            return wire::send(&mut socket, ControlReply::Error(e)).await;
+        }
+    };
+    let peer = exposure.peer;
+    let alias = exposure.alias.clone();
+    let ready = ControlReply::Exposed {
+        key: hex(&peer),
+        alias: alias.clone(),
+    };
+    log.control("expose", "allowed", Some(peer), Some(service), None);
+    log.exposure("exposure_started", &peer, &alias, service);
+    let mut byte = [0u8; 1];
+    let ended: Result<Option<String>> = tokio::select! {
+        biased;
+        why = exposure.ended() => Ok(Some(why)),
+        _ = lifetime.read(&mut byte) => Ok(None),
+        r = async {
+            wire::send(&mut socket, ready).await?;
+            std::future::pending::<Result<Option<String>>>().await
+        } => r,
+    };
+    // Withdraws exactly this exposure and ends its sessions.
+    drop(exposure);
+    log.exposure("exposure_ended", &peer, &alias, service);
+    let ended = ended?;
+
+    let reply = match ended {
+        None => ControlReply::Done,
+        Some(why) => ControlReply::Error(format!("the {service} exposure to {alias} ended: {why}")),
+    };
+    // The command may already be gone.
+    let _ = timeout(wire::RPC_TIMEOUT, wire::send(&mut socket, reply)).await;
+    Ok(())
 }
 
 /// Open a service on a peer for a local command and attach it. The
@@ -776,40 +983,59 @@ async fn outbound<M: Mailbox + Send + Sync + 'static>(
         }
         std::task::Poll::Ready(())
     });
+    let log = shared.node.log();
+    let track = log.outbound(service);
+    // Each failure carries its fixed log reason and the text for the command.
     let setup = async {
-        let st = shared.node.pairing_state().map_err(|e| format!("{e:?}"))?;
-        let key = resolve(&st, selector)?;
-        let addr = (shared.addresses)(&key).ok_or("no address is known for this peer")?;
+        let st = shared
+            .node
+            .pairing_state()
+            .map_err(|e| ("setup_failed", format!("{e:?}")))?;
+        let key = resolve(&st, selector).map_err(|e| ("unknown_peer", e))?;
+        track.peer(log, &key);
+        let addr = (shared.addresses)(&key).ok_or_else(|| {
+            (
+                "setup_failed",
+                "no address is known for this peer".to_string(),
+            )
+        })?;
         if addr.id.as_bytes() != &key {
-            return Err("the peer's address names a different endpoint".to_string());
+            let e = "the peer's address names a different endpoint".to_string();
+            return Err(("setup_failed", e));
         }
         let req = PrivateRequest { service, terminal };
-        shared
-            .node
-            .open_service(&shared.endpoint, addr, req)
-            .await
-            .map_err(|e| format!("{e:?}"))
+        let opened = shared.node.open_service(&shared.endpoint, addr, req).await;
+        // The exchange may have learned a decision or paired.
+        audit::observe(&shared.node, false);
+        opened.map_err(|e| (audit::pair_error_reason(&e), format!("{e:?}")))
     };
     let opened = tokio::select! {
         biased;
-        _ = &mut local_closed => return Ok(()),
+        _ = &mut local_closed => {
+            track.end("local_client_closed", None);
+            return Ok(());
+        }
         r = timeout(wire::RPC_TIMEOUT * 2, setup) => r,
     };
     let error = match opened {
         Ok(Ok(s)) => Ok(s),
         Ok(Err(e)) => Err(e),
-        Err(_) => Err("the peer did not answer in time".to_string()),
+        Err(_) => Err((
+            "deadline_elapsed",
+            "the peer did not answer in time".to_string(),
+        )),
     };
     let error = error.and_then(|s| match &s.reply {
-        ServiceReply::Refused { message, .. } => {
+        ServiceReply::Refused { refusal, message } => {
             s.conn.close(0u32.into(), CLOSE_DONE);
-            Err(format!("the peer refused: {message}"))
+            Err((refusal.reason(), format!("the peer refused: {message}")))
         }
         ServiceReply::Ready => Ok(s),
     });
     let stream = match error {
         Ok(s) => s,
-        Err(e) => {
+        Err((reason, e)) => {
+            track.end(reason, None);
             tokio::select! {
                 biased;
                 _ = &mut local_closed => {}
@@ -822,6 +1048,7 @@ async fn outbound<M: Mailbox + Send + Sync + 'static>(
         Service::Shell => ControlReply::Shell,
         _ => ControlReply::Connected,
     };
+    track.connected();
     let max_frame = stream.max_frame();
     let ServiceStream {
         conn,
@@ -839,10 +1066,12 @@ async fn outbound<M: Mailbox + Send + Sync + 'static>(
         Ok(true) => {}
         Ok(false) => {
             conn.close(0u32.into(), CLOSE_DONE);
+            track.end("local_client_closed", None);
             return Ok(());
         }
         Err(e) => {
             conn.close(0u32.into(), CLOSE_DONE);
+            track.end("local_client_closed", None);
             return Err(e);
         }
     }
@@ -856,10 +1085,12 @@ async fn outbound<M: Mailbox + Send + Sync + 'static>(
     };
     let (mut local_rx, mut local_tx) = socket.into_split();
     if service == Service::Shell {
-        tokio::select! {
-            _ = stopped => {}
-            _ = &mut local_closed => {}
-            _ = async {
+        let reason = tokio::select! {
+            biased;
+            _ = shared.node.watch_routes(&conn) => unreachable!("route watcher stays pending"),
+            _ = stopped => "authorization_ended",
+            _ = &mut local_closed => "local_client_closed",
+            copied = async {
                 tokio::try_join!(
                     async {
                         tokio::io::copy(&mut local_rx, &mut tx).await?;
@@ -870,13 +1101,21 @@ async fn outbound<M: Mailbox + Send + Sync + 'static>(
                         local_tx.shutdown().await
                     },
                 )
-            } => {}
-        }
+            } => match copied {
+                Ok(_) => "stream_closed",
+                Err(_) if conn.close_reason().is_some() => peer_cut_reason(&conn),
+                Err(_) => "shell_io_error",
+            },
+        };
         conn.close(0u32.into(), CLOSE_DONE);
+        track.end(reason, None);
         return Ok(());
     }
     let mut writing = false;
-    let ended = tunnel::forward(
+    let ended = tokio::select! {
+        biased;
+        _ = shared.node.watch_routes(&conn) => unreachable!("route watcher stays pending"),
+        result = tunnel::forward(
         &mut rx,
         &mut tx,
         &mut local_rx,
@@ -885,8 +1124,18 @@ async fn outbound<M: Mailbox + Send + Sync + 'static>(
         &mut local_closed,
         stopped,
         max_frame,
-    )
-    .await;
+        ) => result,
+    };
+    track.end(
+        match ended {
+            tunnel::Forwarded::Stopped => "authorization_ended",
+            tunnel::Forwarded::Done => "stream_closed",
+            tunnel::Forwarded::Failed => "service_failed",
+            tunnel::Forwarded::LocalClosed => "local_client_closed",
+            tunnel::Forwarded::PeerCut => peer_cut_reason(&conn),
+        },
+        None,
+    );
     let message = match ended {
         tunnel::Forwarded::Stopped => Some("the authorization ended on this device"),
         tunnel::Forwarded::Done | tunnel::Forwarded::Failed | tunnel::Forwarded::LocalClosed => {
@@ -912,6 +1161,18 @@ async fn outbound<M: Mailbox + Send + Sync + 'static>(
         biased;
         _ = &mut local_closed => Ok(()),
         r = tunnel::finish_local(&mut local_rx, &mut local_tx, writing, message) => r,
+    }
+}
+
+/// Log reason for a connection the destination (or the path) closed.
+fn peer_cut_reason(conn: &iroh::endpoint::Connection) -> &'static str {
+    match conn.close_reason() {
+        Some(iroh::endpoint::ConnectionError::ApplicationClosed(c))
+            if c.reason.as_ref() == CLOSE_AUTHORITY_ENDED =>
+        {
+            "authorization_ended"
+        }
+        _ => "peer_disconnected",
     }
 }
 
@@ -1001,6 +1262,72 @@ pub async fn connect(
         "invalid runtime address"
     );
     local::attach_forward(socket, datagrams, &peer, service).await
+}
+
+/// Expose a port to one peer through the private runtime until this command
+/// is interrupted or the runtime withdraws the exposure (like
+/// `massrelay expose`).
+pub async fn expose(
+    dir: &Path,
+    service: Service,
+    peer: String,
+    target: Option<String>,
+) -> Result<()> {
+    let forwarding = match (&target, service) {
+        (Some(target), _) => {
+            wire::check_target(target)?;
+            target.clone()
+        }
+        (None, Service::Tcp(port) | Service::Udp(port)) => format!("loopback port {port}"),
+        (None, Service::Shell) => bail!("only a port can be exposed"),
+    };
+    let lifetime = local::Lifetime::bind().await?;
+    let req = ControlRequest::Expose {
+        peer,
+        service,
+        target,
+        lifetime_port: lifetime.port,
+        lifetime_key: lifetime.key,
+    };
+    let (socket, reply) = self::request(dir, req).await?;
+    if let ControlReply::Error(e) = reply {
+        bail!("{e}");
+    }
+    let keep = timeout(wire::RPC_TIMEOUT, lifetime.accept())
+        .await
+        .context("the runtime did not open the lifetime channel")??;
+    let ControlReply::Exposed { key, alias } = reply else {
+        bail!("unexpected exposure reply");
+    };
+    let (mut rx, _tx) = socket.into_split();
+    let ended = wire::recv::<ControlReply>(&mut rx);
+    let interrupted = crate::shutdown();
+    tokio::pin!(ended, interrupted);
+    eprintln!(
+        "massrelay: exposing {service} to {alias} ({key}), forwarding to {forwarding}, \
+         until this command exits. Press Ctrl-C to stop."
+    );
+    tokio::select! {
+        biased;
+        signal = &mut interrupted => {
+            signal.context("wait for shutdown")?;
+            // Closing the lifetime withdraws the exposure; wait for the
+            // runtime to confirm it is gone.
+            drop(keep);
+            let reply = timeout(wire::RPC_TIMEOUT, ended)
+                .await
+                .context("the runtime did not confirm that the exposure ended")??;
+            ensure!(
+                matches!(reply, ControlReply::Done | ControlReply::Error(_)),
+                "unexpected exposure reply"
+            );
+            Ok(())
+        }
+        reply = &mut ended => match reply {
+            Ok(ControlReply::Error(e)) => bail!("{e}"),
+            _ => bail!("the private runtime stopped, which ended the exposure"),
+        },
+    }
 }
 
 #[cfg(test)]

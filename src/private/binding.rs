@@ -6,6 +6,11 @@
 //! and every Welcome joiner verifies the binding, so a leaf can only claim an
 //! endpoint whose secret key signed that exact MLS key.
 //!
+//! A version 2 binding also signs the device's display name. The name lives
+//! only in the encrypted request and MLS state, so the relay never sees it,
+//! and it is cosmetic: the endpoint key stays the identity, two devices may
+//! share a name, and no check ever trusts one.
+//!
 //! The joiner's detached admission proof (`JoinTranscript`) is a second
 //! endpoint-key signature over the exact invite, issuer, relay incarnation and
 //! KeyPackage reference.
@@ -20,6 +25,11 @@ use super::PROTOCOL;
 use super::codec::{Dec, DecodeError, Enc, Hash, hash};
 
 pub const BINDING_VERSION: u8 = 1;
+/// A binding that also carries the device's display name, signed by the
+/// endpoint key. Version 1 bindings carry no name and stay valid as such.
+pub const NAMED_BINDING_VERSION: u8 = 2;
+/// Longest device display name, in bytes.
+pub const MAX_DEVICE_NAME: usize = 63;
 const BINDING_PURPOSE: &[u8] = b"massrelay-private credential-binding";
 const JOIN_PROOF_PURPOSE: &[u8] = b"massrelay-private join-request-proof";
 
@@ -148,6 +158,30 @@ mod replay {
     }
 }
 
+/// Check a device display name. Every replica applies the same rule when it
+/// decodes a binding, so it never consults local state. Names are ASCII
+/// letters, digits, `-` and `_`, at most `MAX_DEVICE_NAME` bytes, and never
+/// look like an endpoint key, so a name cannot pose as a key selector.
+///
+/// A name is a cosmetic, self-asserted label: it is never authority. Two
+/// devices may carry the same name.
+pub fn check_device_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name.len() > MAX_DEVICE_NAME
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(format!(
+            "a device name must be 1 to {MAX_DEVICE_NAME} ASCII letters, digits, hyphens or underscores"
+        ));
+    }
+    if name.parse::<iroh::EndpointId>().is_ok() {
+        return Err("a device name must not look like an endpoint key".into());
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindingError {
     Malformed(String),
@@ -156,6 +190,8 @@ pub enum BindingError {
     /// The binding names a different MLS signature key than the leaf uses.
     SignatureKeyMismatch,
     Signature(SigReject),
+    /// The display name breaks `check_device_name`.
+    Name(String),
 }
 
 impl From<DecodeError> for BindingError {
@@ -170,45 +206,91 @@ pub struct CredentialBinding {
     pub group_tag: Hash,
     pub mls_signature_key: Vec<u8>,
     pub signature: Vec<u8>,
+    /// Display name the device chose at enrollment, signed with the rest
+    /// (version 2). `None` is a version 1 binding. Only cosmetic: it lives in
+    /// the encrypted MLS state, so the relay never sees it.
+    pub name: Option<String>,
 }
 
 impl CredentialBinding {
-    fn signed_message(endpoint: &EndpointKey, group_tag: &Hash, mls_key: &[u8]) -> Hash {
-        hash(
-            BINDING_PURPOSE,
-            &[PROTOCOL, &[BINDING_VERSION], group_tag, endpoint, mls_key],
-        )
+    fn signed_message(
+        endpoint: &EndpointKey,
+        group_tag: &Hash,
+        mls_key: &[u8],
+        name: Option<&str>,
+    ) -> Hash {
+        match name {
+            None => hash(
+                BINDING_PURPOSE,
+                &[PROTOCOL, &[BINDING_VERSION], group_tag, endpoint, mls_key],
+            ),
+            Some(n) => hash(
+                BINDING_PURPOSE,
+                &[
+                    PROTOCOL,
+                    &[NAMED_BINDING_VERSION],
+                    group_tag,
+                    endpoint,
+                    mls_key,
+                    n.as_bytes(),
+                ],
+            ),
+        }
     }
 
     pub fn create(secret: &EndpointSecret, group_tag: &Hash, mls_signature_key: &[u8]) -> Self {
+        Self::create_named(secret, group_tag, mls_signature_key, None)
+            .expect("a nameless binding is always valid")
+    }
+
+    /// A binding carrying `name` (checked with `check_device_name`), or a
+    /// version 1 binding when `name` is `None`.
+    pub fn create_named(
+        secret: &EndpointSecret,
+        group_tag: &Hash,
+        mls_signature_key: &[u8],
+        name: Option<&str>,
+    ) -> Result<Self, BindingError> {
+        if let Some(n) = name {
+            check_device_name(n).map_err(BindingError::Name)?;
+        }
         let endpoint = secret.public();
         let signature = secret.sign(&Self::signed_message(
             &endpoint,
             group_tag,
             mls_signature_key,
+            name,
         ));
-        Self {
+        Ok(Self {
             endpoint,
             group_tag: *group_tag,
             mls_signature_key: mls_signature_key.to_vec(),
             signature,
-        }
+            name: name.map(str::to_owned),
+        })
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        Enc::new()
-            .u8(BINDING_VERSION)
-            .bytes(PROTOCOL)
-            .fixed(&self.endpoint)
-            .fixed(&self.group_tag)
-            .bytes(&self.mls_signature_key)
-            .bytes(&self.signature)
-            .finish()
+        let mut e = Enc::new();
+        e.u8(if self.name.is_some() {
+            NAMED_BINDING_VERSION
+        } else {
+            BINDING_VERSION
+        })
+        .bytes(PROTOCOL)
+        .fixed(&self.endpoint)
+        .fixed(&self.group_tag)
+        .bytes(&self.mls_signature_key);
+        if let Some(n) = &self.name {
+            e.bytes(n.as_bytes());
+        }
+        e.bytes(&self.signature).finish()
     }
 
     pub fn decode(b: &[u8]) -> Result<Self, BindingError> {
         let mut d = Dec::new(b);
-        if d.u8()? != BINDING_VERSION {
+        let version = d.u8()?;
+        if version != BINDING_VERSION && version != NAMED_BINDING_VERSION {
             return Err(BindingError::Malformed("binding version".into()));
         }
         if d.bytes()? != PROTOCOL {
@@ -217,6 +299,14 @@ impl CredentialBinding {
         let endpoint = d.fixed::<32>()?;
         let group_tag = d.fixed::<32>()?;
         let mls_signature_key = d.bytes()?;
+        let name = if version == NAMED_BINDING_VERSION {
+            let n = String::from_utf8(d.bytes()?)
+                .map_err(|_| BindingError::Name("device name is not UTF-8".into()))?;
+            check_device_name(&n).map_err(BindingError::Name)?;
+            Some(n)
+        } else {
+            None
+        };
         let signature = d.bytes()?;
         d.end()?;
         Ok(Self {
@@ -224,6 +314,7 @@ impl CredentialBinding {
             group_tag,
             mls_signature_key,
             signature,
+            name,
         })
     }
 
@@ -239,6 +330,15 @@ impl CredentialBinding {
         leaf_signature_key: &[u8],
         group_tag: &Hash,
     ) -> Result<EndpointKey, BindingError> {
+        Self::verify_credential_named(credential, leaf_signature_key, group_tag).map(|(e, _)| e)
+    }
+
+    /// `verify_credential`, also returning the signed display name.
+    pub fn verify_credential_named(
+        credential: &Credential,
+        leaf_signature_key: &[u8],
+        group_tag: &Hash,
+    ) -> Result<(EndpointKey, Option<String>), BindingError> {
         if credential.credential_type() != CredentialType::Basic {
             return Err(BindingError::WrongCredentialType);
         }
@@ -253,11 +353,16 @@ impl CredentialBinding {
         }
         verify_ed25519(
             &b.endpoint,
-            &Self::signed_message(&b.endpoint, &b.group_tag, &b.mls_signature_key),
+            &Self::signed_message(
+                &b.endpoint,
+                &b.group_tag,
+                &b.mls_signature_key,
+                b.name.as_deref(),
+            ),
             &b.signature,
         )
         .map_err(BindingError::Signature)?;
-        Ok(b.endpoint)
+        Ok((b.endpoint, b.name))
     }
 
     /// Endpoint key claimed by a credential, without verification. Only for
@@ -265,6 +370,15 @@ impl CredentialBinding {
     pub fn claimed_endpoint(credential: &Credential) -> Option<EndpointKey> {
         let basic = BasicCredential::try_from(credential.clone()).ok()?;
         Self::decode(basic.identity()).ok().map(|b| b.endpoint)
+    }
+
+    /// (endpoint, display name) claimed by a credential, without
+    /// verification. Only for already verified state.
+    pub fn claimed(credential: &Credential) -> Option<(EndpointKey, Option<String>)> {
+        let basic = BasicCredential::try_from(credential.clone()).ok()?;
+        Self::decode(basic.identity())
+            .ok()
+            .map(|b| (b.endpoint, b.name))
     }
 }
 

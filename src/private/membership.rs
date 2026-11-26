@@ -1047,6 +1047,21 @@ impl<M: Mailbox> Device<M> {
         mailbox: M,
         clock: Clock,
     ) -> Result<Self, Error> {
+        Self::create_network_named(dir, endpoint, relay_key, incarnation, mailbox, clock, None)
+    }
+
+    /// `create_network`, with this device's display name (see
+    /// `binding::check_device_name`) signed into its credential.
+    pub fn create_network_named(
+        dir: &Path,
+        endpoint: &EndpointSecret,
+        relay_key: [u8; 32],
+        incarnation: Vec<u8>,
+        mailbox: M,
+        clock: Clock,
+        name: Option<&str>,
+    ) -> Result<Self, Error> {
+        check_name_arg(name)?;
         if incarnation.len() != 32 {
             return Err(Error::Internal(
                 "the relay storage incarnation must be 32 bytes".into(),
@@ -1061,7 +1076,8 @@ impl<M: Mailbox> Device<M> {
                 .map_err(internal("signature key"))?;
             s.store(p.storage())
                 .map_err(internal("store signature key"))?;
-            let binding = CredentialBinding::create(endpoint, &group_tag, s.public());
+            let binding = CredentialBinding::create_named(endpoint, &group_tag, s.public(), name)
+                .map_err(internal("binding"))?;
             let cred = CredentialWithKey {
                 credential: binding.credential(),
                 signature_key: s.public().into(),
@@ -1114,6 +1130,21 @@ impl<M: Mailbox> Device<M> {
         mailbox: M,
         clock: Clock,
     ) -> Result<(Self, Vec<u8>), Error> {
+        Self::begin_join_named(dir, endpoint, invite, mailbox, clock, None)
+    }
+
+    /// `begin_join`, with this device's display name signed into the
+    /// credential of its KeyPackage. The name travels only inside the
+    /// encrypted request and MLS state.
+    pub fn begin_join_named(
+        dir: &Path,
+        endpoint: &EndpointSecret,
+        invite: &[u8],
+        mailbox: M,
+        clock: Clock,
+        name: Option<&str>,
+    ) -> Result<(Self, Vec<u8>), Error> {
+        check_name_arg(name)?;
         let token = InviteToken::decode(invite)
             .map_err(|e| Error::Join(JoinError::Malformed(format!("invite: {e:?}"))))?;
         let (store, g) = Store::create(dir, &State::new(endpoint.public()))?;
@@ -1124,7 +1155,9 @@ impl<M: Mailbox> Device<M> {
                 .map_err(internal("signature key"))?;
             s.store(p.storage())
                 .map_err(internal("store signature key"))?;
-            let binding = CredentialBinding::create(endpoint, &token.group_tag, s.public());
+            let binding =
+                CredentialBinding::create_named(endpoint, &token.group_tag, s.public(), name)
+                    .map_err(internal("binding"))?;
             let cred = CredentialWithKey {
                 credential: binding.credential(),
                 signature_key: s.public().into(),
@@ -1774,6 +1807,24 @@ impl<M: Mailbox> Device<M> {
     pub fn stage_remove(&self, subject: &EndpointKey) -> Result<SlotId, Error> {
         let g = self.store.lock()?;
         self.stage_locked(&g, StageKind::Remove { subject: *subject }, None)
+    }
+
+    /// Stage a local cutoff that the accepted history has not applied yet.
+    pub fn stage_pending_removal(&self) -> Result<Option<SlotId>, Error> {
+        let g = self.store.lock()?;
+        let st: State = self.store.load(&g)?;
+        if st.journal.is_some() || st.local_cutoffs.is_empty() {
+            return Ok(None);
+        }
+        let net = st.writable()?;
+        let roster = self.members(&g, net)?;
+        let subject = st
+            .local_cutoffs
+            .iter()
+            .find(|key| roster.iter().any(|(member, _)| member == *key) && **key != st.endpoint);
+        subject
+            .map(|subject| self.stage_locked(&g, StageKind::Remove { subject: *subject }, None))
+            .transpose()
     }
 
     #[cfg(test)]
@@ -3651,6 +3702,26 @@ impl<M: Mailbox> Device<M> {
         Ok(r)
     }
 
+    /// The accepted roster with each member's signed display name, sorted by
+    /// endpoint key. Names are cosmetic: select by `select_peer`, never
+    /// authorize by name.
+    pub fn named_roster(&self) -> Result<Vec<RosterMember>, Error> {
+        let g = self.store.lock()?;
+        let st: State = self.store.load(&g)?;
+        let net = st.net()?;
+        let mut r = self.store.with_mls(&g, &net.mls_file, false, |p, _| {
+            Ok::<_, Error>(
+                load_group(p, &net.group_id)?
+                    .members()
+                    .filter_map(|m| CredentialBinding::claimed(&m.credential))
+                    .map(|(endpoint, name)| RosterMember { endpoint, name })
+                    .collect::<Vec<_>>(),
+            )
+        })?;
+        r.sort_by_key(|m| m.endpoint);
+        Ok(r)
+    }
+
     /// Test hook: slot keys of the accepted head (what any current member,
     /// or a removed member at its removal slot, can derive).
     #[cfg(test)]
@@ -3662,6 +3733,101 @@ impl<M: Mailbox> Device<M> {
             SlotKeys::derive(&load_group(p, &net.group_id)?, &net.head).map_err(Error::Internal)
         })?;
         Ok((k, net.incarnation.clone()))
+    }
+}
+
+/// A display name passed to a named constructor.
+fn check_name_arg(name: Option<&str>) -> Result<(), Error> {
+    match name.map(super::binding::check_device_name) {
+        Some(Err(e)) => Err(Error::Internal(e)),
+        _ => Ok(()),
+    }
+}
+
+// ------------------------------------------------------- display names
+
+/// One accepted member and the display name its own binding signed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RosterMember {
+    pub endpoint: EndpointKey,
+    pub name: Option<String>,
+}
+
+/// How a selector picked a peer. Only `Key` and `Alias` are pinned by this
+/// device; a `Name` match is a self-asserted label, so approving by it needs
+/// the user to confirm the key's fingerprint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PeerMatch {
+    Key(EndpointKey),
+    Alias(EndpointKey),
+    Name(EndpointKey),
+}
+
+impl PeerMatch {
+    pub fn endpoint(&self) -> EndpointKey {
+        match self {
+            PeerMatch::Key(k) | PeerMatch::Alias(k) | PeerMatch::Name(k) => *k,
+        }
+    }
+
+    /// Whether this device pinned the key (exact key or local alias).
+    pub fn pinned(&self) -> bool {
+        !matches!(self, PeerMatch::Name(_))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SelectError {
+    /// No key, local alias or roster name matches.
+    NoMatch,
+    /// More than one local alias matches (should not happen).
+    AmbiguousAlias(Vec<EndpointKey>),
+    /// Several roster members carry this name (case-insensitively); name one
+    /// by exact key or local alias.
+    AmbiguousName(Vec<EndpointKey>),
+}
+
+/// Resolve a peer selector, in order of authority: an exact endpoint key
+/// (`parsed_key`, parsed by the caller), then a local alias this device
+/// pinned, then a display name carried by exactly one accepted roster
+/// member. Names compare ASCII case-insensitively, so look-alike case
+/// variants count as duplicates. A name never overrides a key or alias.
+pub fn select_peer(
+    selector: &str,
+    parsed_key: Option<EndpointKey>,
+    aliases: &[(String, EndpointKey)],
+    roster: &[RosterMember],
+) -> Result<PeerMatch, SelectError> {
+    if let Some(k) = parsed_key {
+        return Ok(PeerMatch::Key(k));
+    }
+    let mut hits: Vec<EndpointKey> = aliases
+        .iter()
+        .filter(|(a, _)| a == selector)
+        .map(|(_, k)| *k)
+        .collect();
+    hits.sort();
+    hits.dedup();
+    match hits.as_slice() {
+        [k] => return Ok(PeerMatch::Alias(*k)),
+        [] => {}
+        _ => return Err(SelectError::AmbiguousAlias(hits)),
+    }
+    let mut hits: Vec<EndpointKey> = roster
+        .iter()
+        .filter(|m| {
+            m.name
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(selector))
+        })
+        .map(|m| m.endpoint)
+        .collect();
+    hits.sort();
+    hits.dedup();
+    match hits.as_slice() {
+        [k] => Ok(PeerMatch::Name(*k)),
+        [] => Err(SelectError::NoMatch),
+        _ => Err(SelectError::AmbiguousName(hits)),
     }
 }
 

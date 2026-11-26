@@ -54,14 +54,14 @@ jobs:
           cache-bin: 'false'
           # Each release tag can restore the corresponding default-branch cache.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo +stable build --locked --release --features private-membership
-      - run: cargo +stable test --locked --release --features private-membership -- --test-threads=1
+      - run: cargo +stable build --locked --release
+      - run: cargo +stable test --locked --release -- --test-threads=1
       - name: Repeat private membership publication on an independent x64 host
         if: matrix.runner == 'ubuntu-22.04'
         shell: bash
         run: |
           for run in {1..100}; do
-            if ! cargo +stable test --locked --release --features private-membership \
+            if ! cargo +stable test --locked --release \
               competing_writers_loser_adopts_winner_and_restages > signature-qualification.log 2>&1
             then
               cat signature-qualification.log
@@ -71,16 +71,15 @@ jobs:
           done
       - name: Test native private networking and shells
         if: runner.os != 'Windows'
-        run: cargo +stable test --locked --release --features private-membership -- --ignored --test-threads=1
-      - name: Test private and legacy CLI workflows
+        run: cargo +stable test --locked --release -- --ignored --test-threads=1
+      - name: Test the CLI workflow
         if: runner.os == 'Linux'
         run: |
           python3 tests/private.py target/release/massrelay
-          python3 tests/pocket.py target/release/massrelay
       - name: Test Windows pseudoconsole cutoff and teardown
         if: runner.os == 'Windows'
         timeout-minutes: 3
-        run: cargo +stable test --locked --release --features private-membership conpty -- --ignored --test-threads=1
+        run: cargo +stable test --locked --release conpty -- --ignored --test-threads=1
       - name: Test Windows installer
         if: runner.os == 'Windows'
         shell: pwsh

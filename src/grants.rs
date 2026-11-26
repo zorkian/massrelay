@@ -82,18 +82,6 @@ impl ServiceDefaults {
         true
     }
 
-    pub fn exclude(&mut self, peer: EndpointId, service: Service) -> bool {
-        self.settings
-            .get_mut(&service)
-            .is_some_and(|setting| setting.enabled && setting.excluded.insert(peer))
-    }
-
-    pub fn clear_exclusion(&mut self, peer: EndpointId, service: Service) -> bool {
-        self.settings
-            .get_mut(&service)
-            .is_some_and(|setting| setting.excluded.remove(&peer))
-    }
-
     pub fn access(&self, peer: EndpointId, service: Service) -> Option<Access> {
         let setting = self.settings.get(&service)?;
         (setting.enabled && !setting.excluded.contains(&peer)).then_some(Access {
@@ -215,6 +203,22 @@ impl Grants {
         self.exposed
             .get(&(peer, service))
             .is_some_and(|exposure| exposure.grant.instance == instance)
+    }
+
+    /// Bind an exposure waiting for its first pairing to that pairing's generation.
+    pub fn bind_exposure(
+        &mut self,
+        peer: EndpointId,
+        service: Service,
+        instance: u64,
+        generation: u64,
+    ) {
+        if let Some(exposure) = self.exposed.get_mut(&(peer, service))
+            && exposure.grant.instance == instance
+            && exposure.grant.generation == 0
+        {
+            exposure.grant.generation = generation;
+        }
     }
 
     /// End one exposure, leaving any grant that has since replaced it.

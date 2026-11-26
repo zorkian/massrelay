@@ -22,7 +22,6 @@ use crate::{
 
 const CHUNK: usize = 8192;
 /// The largest TCP forwarding frame any MassRelay sender produces.
-#[cfg_attr(not(feature = "private-membership"), allow(dead_code))]
 pub const MAX_FRAME: usize = CHUNK + 1;
 
 /// Connect to the owner's chosen address, or else to either loopback address.
@@ -44,15 +43,6 @@ pub async fn dial(port: NonZeroU16, target: Option<&str>) -> io::Result<TcpStrea
 }
 
 /// Copy between the peer's stream and the target until both directions end.
-pub async fn bridge(
-    rx: &mut (impl AsyncRead + Unpin),
-    tx: &mut (impl AsyncWrite + Unpin),
-    target: &mut TcpStream,
-) -> Result<(), Broken> {
-    bridge_with(rx, tx, target, usize::MAX).await
-}
-
-/// `bridge` over any target stream (for example one whose writes are
 /// guarded), refusing peer frames longer than `max_frame`.
 pub async fn bridge_with(
     rx: &mut (impl AsyncRead + Unpin),

@@ -28,7 +28,6 @@ const HEADER: usize = 9;
 /// Large enough for any UDP payload, so that receiving never truncates one.
 const DATAGRAM: usize = 65_535;
 /// The largest UDP forwarding frame the format can carry.
-#[cfg_attr(not(feature = "private-membership"), allow(dead_code))]
 pub const MAX_FRAME: usize = HEADER + DATAGRAM;
 
 fn frame_header(association: u64) -> [u8; HEADER] {
@@ -101,26 +100,6 @@ pub async fn send(socket: &UdpSocket, payload: &[u8]) {
 }
 
 /// Relay datagrams between the peer's stream and the target until either side fails.
-pub async fn bridge<F: Future<Output = Result<UdpSocket, Broken>>>(
-    rx: &mut (impl AsyncRead + Unpin),
-    tx: &mut (impl AsyncWrite + Unpin),
-    start_association: impl Fn(Vec<u8>) -> F,
-) -> Result<(), Broken> {
-    bridge_with(
-        rx,
-        tx,
-        start_association,
-        |socket, payload| async move {
-            send(&socket, &payload).await;
-            Ok(())
-        },
-        usize::MAX,
-    )
-    .await
-}
-
-/// `bridge` with a caller-supplied send for every later datagram of an
-/// association (for example a guarded one), refusing peer frames longer
 /// than `max_frame`.
 pub async fn bridge_with<F, S>(
     rx: &mut (impl AsyncRead + Unpin),

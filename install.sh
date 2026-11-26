@@ -47,6 +47,8 @@ if "$relay"; then
     relay_state=${XDG_DATA_HOME:-"$HOME/.local/share"}/massrelay-relay
     unit_dir=${XDG_CONFIG_HOME:-"$HOME/.config"}/systemd/user
     unit="$unit_dir/massrelay-relay.service"
+    [ ! -e "$relay_state/relay.json" ] ||
+        fail 'This installer needs a fresh relay directory. Move the previous relay state aside before running it.'
     if [ -e "$unit" ] || [ -L "$unit" ]; then
         saved_ip=$(sed -n 's/^# MassRelay installer public IP: //p' "$unit")
         [ -n "$saved_ip" ] || fail "An existing service uses $unit."
@@ -117,13 +119,12 @@ if "$relay"; then
     }
     {
         printf '# MassRelay installer public IP: %s\n' "$public_ip"
-        printf '[Unit]\nDescription=MassRelay shared relay\n\n'
+        printf '[Unit]\nDescription=MassRelay relay\n\n'
         printf '[Service]\nType=exec\nRestart=on-failure\nExecStart='
         unit_arg "$install_dir/massrelay"
         printf ' --state-dir '
         unit_arg "$relay_state"
-        printf ' relay --public-udp "%s:4433" --url "http://%s:3340" --udp-bind "%s:4433" --relay-bind "%s:3340"\n' \
-            "$advertised" "$advertised" "$bind" "$bind"
+        printf ' relay --udp-bind "%s:4433" --relay-bind "%s:3340"\n' "$bind" "$bind"
         printf '\n[Install]\nWantedBy=default.target\n'
     } > "$stage/massrelay-relay.service"
     if [ -e "$unit" ] || [ -L "$unit" ]; then
@@ -171,8 +172,13 @@ fi
 destination_tmp=$(mktemp "$install_dir/.massrelay.XXXXXX")
 install -m 0755 "$stage/$asset" "$destination_tmp"
 if "$relay"; then
-    "$destination_tmp" relay --help | grep -Fq -- '--public-udp' ||
-        fail 'This release does not support shared relays. Install MassRelay v0.2.0 or newer.'
+    "$destination_tmp" relay-grants --help >/dev/null 2>&1 ||
+        fail 'Choose a MassRelay release with encrypted membership for --relay.'
+    if [ ! -e "$relay_state/private-relay.json" ]; then
+        locator=$("$destination_tmp" --state-dir "$relay_state" relay-init \
+            --public-udp "$advertised:4433" --url "http://$advertised:3340")
+        printf 'Relay locator (keep secret): %s\n' "$locator"
+    fi
 fi
 mv -f "$destination_tmp" "$install_dir/massrelay"
 destination_tmp=
@@ -189,15 +195,18 @@ if "$relay"; then
     systemctl --user daemon-reload
     systemctl --user enable massrelay-relay.service
     systemctl --user restart massrelay-relay.service
-    while ! locator=$("$install_dir/massrelay" --state-dir "$relay_state" relay-info 2>/dev/null) ||
-          ! curl -fsS --noproxy '*' -o /dev/null "http://$local_address:3340/healthz" 2>/dev/null; do
+    for attempt in $(seq 1 30); do
+        if curl -fsS --max-time 2 --noproxy '*' -o /dev/null "http://$local_address:3340/healthz" 2>/dev/null; then
+            break
+        fi
         systemctl --user is-active --quiet massrelay-relay.service ||
             fail 'Relay startup failed. Check journalctl --user -u massrelay-relay.service.'
         sleep 1
     done
+    curl -fsS --max-time 2 --noproxy '*' -o /dev/null "http://$local_address:3340/healthz" ||
+        fail 'Relay did not become ready. Check journalctl --user -u massrelay-relay.service.'
     systemctl --user is-active --quiet massrelay-relay.service ||
         fail 'Relay stopped. Check journalctl --user -u massrelay-relay.service.'
-    printf 'Relay locator: %s\n' "$locator"
     if [ "$(loginctl show-user "$(id -u)" -p Linger --value 2>/dev/null || true)" != yes ]; then
         printf '%s\n' 'For boot startup and operation after logout, enable lingering for this user.'
     fi

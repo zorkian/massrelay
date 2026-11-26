@@ -10,12 +10,12 @@ use directories::BaseDirs;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
-use crate::{ServiceAction, default_state_dir, device, storage};
+use crate::{ServiceAction, default_state_dir, private::cli};
 
 const LABEL: &str = "com.massrelay.client";
 
 pub fn install(dir: &Path) -> Result<()> {
-    device::check_enrolled(dir)?;
+    cli::check_enrolled(dir)?;
     let dir = dir
         .canonicalize()
         .context("resolve the device state directory")?;
@@ -25,7 +25,7 @@ pub fn install(dir: &Path) -> Result<()> {
     let loaded = launchctl("print", &service).output()?.status.success();
 
     if !loaded {
-        let _lock = storage::lock(&dir).context("stop the foreground massrelay run first")?;
+        let _lock = cli::claim_owner(&dir).context("stop the foreground massrelay run first")?;
     }
     let directory = job.plist.parent().expect("LaunchAgents directory");
     fs::create_dir_all(directory)?;
@@ -115,8 +115,8 @@ pub fn control(dir: &Path, action: ServiceAction) -> Result<()> {
             }
             ServiceAction::Start | ServiceAction::Restart => {
                 {
-                    let _lock =
-                        storage::lock(&dir).context("stop the foreground massrelay run first")?;
+                    let _lock = cli::claim_owner(&dir)
+                        .context("stop the foreground massrelay run first")?;
                 }
                 bootstrap(&domain, &job.plist)
             }

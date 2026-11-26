@@ -69,9 +69,22 @@
 //! `ServiceDefaults`) and `crate::wire::Service`. Grants are keyed by this
 //! device's local pairing generation, so a re-pair, decline or re-approval
 //! never revives one. Named exclusions are private to this module and
-//! persist whether or not the default is enabled (the legacy
-//! `ServiceDefaults::exclude` behaviour is left unchanged). Legacy temporary
-//! exposures and per-load instance counters are not used.
+//! persist whether or not the default is enabled.
+//!
+//! # Exposures
+//!
+//! `Peers::expose` registers a temporary grant for one approved peer and one
+//! exact port. It becomes usable after pairing, optionally with a target this
+//! device's owner chose (`wire::check_target`). It reuses
+//! `crate::grants::Grants`, but held in the owner's registry, never in the
+//! persisted pairing row, so an exposure cannot outlive the runtime owner.
+//! A peer holds at most one of a persistent grant or an exposure per service,
+//! and an exposure is refused where an enabled default already covers the
+//! peer. The returned `Exposure` is the grant: dropping it withdraws exactly
+//! that exposure and ends only the sessions opened under it, under the
+//! registry lock. Decline, re-approval, re-pair, removal, cutoff, disabling
+//! that service for that peer and owner stop withdraw it the same way and
+//! wake its holder (`Exposure::ended`).
 //!
 //! # Daemon responsibilities
 //!
@@ -103,8 +116,8 @@ use fs2::FileExt;
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
-use crate::grants::{Grants, ServiceDefaults};
-use crate::wire::Service;
+use crate::grants::{GrantInstance, Grants, ServiceDefaults};
+use crate::wire::{self, Service};
 
 use super::PROTOCOL;
 use super::binding::EndpointKey;
@@ -282,6 +295,9 @@ pub struct PairingState {
     pub last_generation: u64,
     pub peers: Vec<PeerRecord>,
     pub grants: Grants,
+    /// Locally granted services waiting for the peer's first confirmed pairing.
+    #[serde(default)]
+    pub pending_grants: Vec<(EndpointKey, Service)>,
     /// Default enablement only; exclusions live in `exclusions`.
     pub defaults: ServiceDefaults,
     /// Named exclusions from defaults, kept whether or not the default is on.
@@ -506,6 +522,17 @@ struct Entry {
     service: Option<Service>,
     generation: u64,
     via_default: bool,
+    /// The exposure instance this session was opened under.
+    exposure: Option<u64>,
+    flag: Arc<Flag>,
+}
+
+/// The holder side of one registered exposure.
+struct Holder {
+    peer: EndpointKey,
+    id: EndpointId,
+    service: Service,
+    generation: u64,
     flag: Arc<Flag>,
 }
 
@@ -519,6 +546,9 @@ struct Registry {
     global: u64,
     /// Set once by `Owner::retire`; never cleared.
     stopping: Option<String>,
+    /// Live exposures only (never persisted), and their holders by instance.
+    exposed: Grants,
+    holders: BTreeMap<u64, Holder>,
 }
 
 impl Registry {
@@ -532,7 +562,10 @@ impl Registry {
                 *self.epochs.entry(*p).or_default() += 1
             }
             Ending::All(_) => self.global += 1,
-            Ending::PeerService(..) | Ending::PeerDefault(..) | Ending::Default(..) => {}
+            Ending::PeerService(..)
+            | Ending::PeerDefault(..)
+            | Ending::Default(..)
+            | Ending::Exposure(..) => {}
         }
         let mut n = 0;
         for e in self.entries.values() {
@@ -544,13 +577,56 @@ impl Registry {
                     e.via_default && &e.peer == p && e.service == Some(*s)
                 }
                 Ending::Default(s, _) => e.via_default && e.service == Some(*s),
+                Ending::Exposure(i, _) => e.exposure == Some(*i),
                 Ending::All(_) => true,
             };
             if hit && e.flag.set(end.reason()) {
                 n += 1;
             }
         }
+        // Exposures the same ending withdraws (their sessions are hit above).
+        let ended: Vec<u64> = self
+            .holders
+            .iter()
+            .filter(|(_, h)| match end {
+                Ending::Peer(p, _) => &h.peer == p,
+                Ending::PeerGeneration(p, g, _) => &h.peer == p && h.generation == *g,
+                Ending::PeerService(p, s, _) => &h.peer == p && h.service == *s,
+                Ending::All(_) => true,
+                Ending::PeerDefault(..) | Ending::Default(..) | Ending::Exposure(..) => false,
+            })
+            .map(|(i, _)| *i)
+            .collect();
+        for i in ended {
+            self.withdraw(i, end.reason());
+        }
         n
+    }
+
+    fn bind_exposures(&mut self, peer: &EndpointKey, generation: u64) {
+        for (&instance, holder) in &mut self.holders {
+            if &holder.peer == peer && holder.generation == 0 {
+                self.exposed
+                    .bind_exposure(holder.id, holder.service, instance, generation);
+                holder.generation = generation;
+            }
+        }
+    }
+
+    /// Withdraw exactly one exposure, wake its holder and end the sessions
+    /// opened under it.
+    fn withdraw(&mut self, instance: u64, why: &str) {
+        if let Some(h) = self.holders.remove(&instance) {
+            self.exposed.withdraw(h.id, h.service, instance);
+            h.flag.set(why);
+            self.flag(&Ending::Exposure(instance, why.into()));
+        }
+    }
+
+    fn is_exposed(&self, peer: &EndpointKey, service: Service) -> bool {
+        self.holders
+            .values()
+            .any(|h| &h.peer == peer && h.service == service)
     }
 }
 
@@ -754,6 +830,64 @@ impl Drop for SessionHandle {
         if let Ok(mut reg) = self.sessions.inner.lock() {
             reg.entries.remove(&self.id);
         }
+    }
+}
+
+// -------------------------------------------------------------- exposures
+
+/// One live exposure (see the module docs). Dropping it withdraws exactly
+/// this exposure and ends the sessions opened under it.
+pub struct Exposure {
+    sessions: Arc<Sessions>,
+    instance: u64,
+    flag: Arc<Flag>,
+    pub peer: EndpointKey,
+    /// The alias this device pinned to `peer`.
+    pub alias: String,
+    pub service: Service,
+    /// Owner-chosen target (`None`: loopback on the service port).
+    pub target: Option<String>,
+}
+
+impl Exposure {
+    /// Resolve when this device withdraws the exposure for any reason other
+    /// than this handle's drop.
+    pub async fn ended(&self) -> String {
+        loop {
+            let notified = self.flag.notify.notified();
+            let mut notified = pin!(notified);
+            notified.as_mut().enable();
+            if let Some(r) = self.flag.get() {
+                return r;
+            }
+            notified.await;
+        }
+    }
+
+    pub fn cancelled(&self) -> Option<String> {
+        self.flag.get()
+    }
+}
+
+impl Drop for Exposure {
+    fn drop(&mut self) {
+        let mut reg = match self.sessions.inner.lock() {
+            Ok(reg) => reg,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        reg.withdraw(self.instance, "the exposure ended");
+        drop(reg);
+        self.sessions.changed.notify_waiters();
+    }
+}
+
+impl std::fmt::Debug for Exposure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Exposure")
+            .field("peer", &hex(&self.peer))
+            .field("service", &self.service)
+            .field("target", &self.target)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1082,6 +1216,8 @@ impl<'d, 'o, M: Mailbox> Peers<'d, 'o, M> {
             Some(t) if t == tag => {}
             Some(_) => return Err(Refusal::WrongGroup.into()),
         }
+        st.pending_grants
+            .retain(|(peer, _)| view.ineligible(peer).is_none());
         Ok(())
     }
 
@@ -1116,6 +1252,15 @@ impl<'d, 'o, M: Mailbox> Peers<'d, 'o, M> {
         f: impl FnOnce(&MemberView, &mut PairingState) -> Result<(R, Vec<Ending>), PairError>,
         then: impl FnOnce(&mut Registry, R) -> T,
     ) -> Result<T, PairError> {
+        self.transition_reg(|_, view, st| f(view, st), then)
+    }
+
+    /// `transition_then`, with `f` also reading the registry (held).
+    fn transition_reg<R, T>(
+        &self,
+        f: impl FnOnce(&Registry, &MemberView, &mut PairingState) -> Result<(R, Vec<Ending>), PairError>,
+        then: impl FnOnce(&mut Registry, R) -> T,
+    ) -> Result<T, PairError> {
         let mut reg = self.running()?;
         let (out, endings) = {
             let g = self.device.store().lock()?;
@@ -1126,7 +1271,7 @@ impl<'d, 'o, M: Mailbox> Peers<'d, 'o, M> {
                 PAIRING_FORMAT,
                 |st: &mut PairingState| {
                     Self::scoped(&view, st)?;
-                    let r = f(&view, st)?;
+                    let r = f(&reg, &view, st)?;
                     st.prune_grants();
                     super::fault::fail("pairing_save")?;
                     Ok::<_, PairError>(r)
@@ -1152,6 +1297,9 @@ impl<'d, 'o, M: Mailbox> Peers<'d, 'o, M> {
     ) -> Result<Approved, PairError> {
         check_alias(alias)?;
         self.transition(|view, st| {
+            if reapprove {
+                st.pending_grants.retain(|(key, _)| key != peer);
+            }
             if let Some(why) = view.ineligible(peer) {
                 return Err(Refusal::NotMember(why).into());
             }
@@ -1208,6 +1356,7 @@ impl<'d, 'o, M: Mailbox> Peers<'d, 'o, M> {
     }
 
     fn decline_in(st: &mut PairingState, peer: &EndpointKey) {
+        st.pending_grants.retain(|(key, _)| key != peer);
         match st.peer_mut(peer) {
             Some(p) => {
                 if p.local != Decision::Decline {
@@ -1273,32 +1422,139 @@ impl<'d, 'o, M: Mailbox> Peers<'d, 'o, M> {
 
     // ------------------------------------------------------------- grants
 
-    /// Grant one exact service to a currently paired peer.
+    /// Grant an exact service to a member. A grant for an unpaired member
+    /// becomes usable when both devices establish the pairing.
     pub fn grant(&self, peer: &EndpointKey, service: Service) -> Result<bool, PairError> {
-        self.transition(|_, st| {
-            let rec = st.peer(peer).ok_or(Refusal::NotApproved)?;
-            let generation = rec.pairing.ok_or(Refusal::NotPaired)?.generation;
-            let alias = rec.alias.clone();
-            let added = st
-                .grants
-                .enable(endpoint_id(peer)?, &alias, service, generation)
-                .map_err(|e| PairError::Local(format!("{e:#}")))?;
+        self.transition_reg(|reg, view, st| {
+            if reg.is_exposed(peer, service) {
+                return Err(PairError::Local(format!("{service} is temporarily exposed; stop the exposure before making it persistent")));
+            }
+            if let Some(why) = view.ineligible(peer) {
+                return Err(Refusal::NotMember(why).into());
+            }
+            let added = match st
+                .peer(peer)
+                .and_then(|rec| rec.pairing.map(|p| (rec.alias.clone(), p)))
+            {
+                Some((alias, pairing)) => st
+                    .grants
+                    .enable(endpoint_id(peer)?, &alias, service, pairing.generation)
+                    .map_err(|e| PairError::Local(format!("{e:#}")))?,
+                None if st.pending_grants.contains(&(*peer, service)) => false,
+                None => {
+                    st.pending_grants.push((*peer, service));
+                    true
+                }
+            };
+            let before = st.exclusions.len();
             st.exclusions.retain(|(e, s)| !(e == peer && *s == service));
-            Ok((added, vec![]))
-        })
+            Ok((added || st.exclusions.len() != before, vec![]))
+        }, |_, r| r)
     }
 
     /// Remove a peer's grant for one service and exclude it from that
     /// service's default.
+    /// Also withdraws a live exposure of that service to that peer.
     pub fn revoke_grant(&self, peer: &EndpointKey, service: Service) -> Result<bool, PairError> {
-        self.transition(|_, st| {
-            let removed = st.grants.disable(endpoint_id(peer)?, service).is_some();
-            let excluded = Self::exclude_in(st, peer, service);
-            Ok((
-                removed || excluded,
-                vec![Ending::PeerService(*peer, service, "grant removed".into())],
-            ))
+        self.transition_reg(
+            |reg, _, st| {
+                let exposed = reg.is_exposed(peer, service);
+                let removed = st.grants.disable(endpoint_id(peer)?, service).is_some();
+                let before = st.pending_grants.len();
+                st.pending_grants.retain(|grant| *grant != (*peer, service));
+                let removed = removed || st.pending_grants.len() != before;
+                let excluded = Self::exclude_in(st, peer, service);
+                Ok((
+                    removed || excluded || exposed,
+                    vec![Ending::PeerService(*peer, service, "grant removed".into())],
+                ))
+            },
+            |_, r| r,
+        )
+    }
+
+    /// Offer a port to an approved peer while the handle lives. Access
+    /// starts only after both sides confirm the pairing.
+    pub fn expose(
+        &self,
+        peer: &EndpointKey,
+        service: Service,
+        target: Option<String>,
+    ) -> Result<Exposure, PairError> {
+        if service == Service::Shell {
+            return Err(PairError::Local("only a port can be exposed".into()));
+        }
+        if let Some(t) = &target {
+            wire::check_target(t).map_err(|e| PairError::Local(format!("{e:#}")))?;
+        }
+        let mut reg = self.running()?;
+        let g = self.device.store().lock()?;
+        let (alias, generation) = self.read_locked(&g, |view, st| {
+            if let Some(why) = view.ineligible(peer) {
+                return Err(Refusal::NotMember(why).into());
+            }
+            let rec = st.peer(peer).ok_or(Refusal::NotApproved)?;
+            if !matches!(rec.local, Decision::Approve { .. }) {
+                return Err(Refusal::NotApproved.into());
+            }
+            let generation = rec.pairing.map_or(0, |pairing| pairing.generation);
+            let (alias, id) = (rec.alias.clone(), endpoint_id(peer)?);
+            if reg.is_exposed(peer, service) {
+                return Err(PairError::Local(format!(
+                    "{service} is already exposed to {alias}; stop that command first"
+                )));
+            }
+            if st.pending_grants.contains(&(*peer, service))
+                || st.grants.access(id, service, generation).is_some()
+            {
+                return Err(PairError::Local(format!(
+                    "{service} is already enabled for {alias}; disable it first"
+                )));
+            }
+            if !st.excluded(peer, service) && st.defaults.access(id, service).is_some() {
+                return Err(PairError::Local(format!(
+                    "{service} is enabled by default for {alias}; \
+                     disable it for {alias} before exposing a different target"
+                )));
+            }
+            Ok((alias, generation))
+        })?;
+        drop(g);
+        let id = endpoint_id(peer)?;
+        let instance = reg
+            .exposed
+            .expose(id, &alias, service, generation, target.clone())
+            .map_err(|e| PairError::Local(format!("{e:#}")))?;
+        let flag = Arc::new(Flag::default());
+        reg.holders.insert(
+            instance,
+            Holder {
+                peer: *peer,
+                id,
+                service,
+                generation,
+                flag: flag.clone(),
+            },
+        );
+        Ok(Exposure {
+            sessions: self.owner.sessions.clone(),
+            instance,
+            flag,
+            peer: *peer,
+            alias,
+            service,
+            target,
         })
+    }
+
+    /// Live exposures: (peer, service, owner-chosen target).
+    pub fn exposures(&self) -> Vec<(EndpointKey, Service, Option<String>)> {
+        self.registry()
+            .exposed
+            .list(|_| None)
+            .into_iter()
+            .filter_map(|g| Some((*g.id?.as_bytes(), g.service, g.target)))
+            .collect()
     }
 
     pub fn set_default(&self, service: Service, enabled: bool) -> Result<bool, PairError> {
@@ -1373,7 +1629,11 @@ impl<'d, 'o, M: Mailbox> Peers<'d, 'o, M> {
         if view.terminal {
             return Ok(self.end(&mut reg, &Ending::All("this device was removed".into())));
         }
-        let peers: Vec<EndpointKey> = reg.entries.values().map(|e| e.peer).collect();
+        // Peers with a live exposure count even with no session open.
+        let mut peers: Vec<EndpointKey> = reg.entries.values().map(|e| e.peer).collect();
+        peers.extend(reg.holders.values().map(|h| h.peer));
+        peers.sort_unstable();
+        peers.dedup();
         let mut n = 0;
         for p in peers {
             if let Some(why) = view.ineligible(&p) {
@@ -1619,10 +1879,15 @@ impl<'d, 'o, M: Mailbox> Peers<'d, 'o, M> {
                 let theirs_value = match &theirs.decision {
                     Decision::Approve { approval } => *approval,
                     _ => {
-                        let ended = rec.pairing.take().map(|p| {
-                            Ending::PeerGeneration(remote, p.generation, "peer declined".into())
-                        });
-                        return Ok((Err(Refusal::RemoteDeclined), ended.into_iter().collect()));
+                        rec.pairing = None;
+                        // Order zero says the peer has never approved.
+                        let endings = if theirs.order == 0 {
+                            vec![]
+                        } else {
+                            st.pending_grants.retain(|(key, _)| *key != remote);
+                            vec![Ending::Peer(remote, "peer declined".into())]
+                        };
+                        return Ok((Err(Refusal::RemoteDeclined), endings));
                     }
                 };
                 let mut endings = vec![];
@@ -1647,11 +1912,23 @@ impl<'d, 'o, M: Mailbox> Peers<'d, 'o, M> {
                         generation
                     }
                 };
+                let alias = st.peer(&remote).expect("record").alias.clone();
+                for service in st
+                    .pending_grants
+                    .iter()
+                    .filter_map(|(key, service)| (*key == remote).then_some(*service))
+                {
+                    st.grants
+                        .enable(endpoint_id(&remote)?, &alias, service, generation)
+                        .map_err(|e| PairError::Local(format!("{e:#}")))?;
+                }
+                st.pending_grants.retain(|(key, _)| *key != remote);
                 Ok((Ok((ours, theirs_value, generation)), endings))
             },
             |reg, r| {
                 r.map(|(ours, theirs_value, generation)| {
                     // Registered in the same critical section as the commit.
+                    reg.bind_exposures(&remote, generation);
                     reg.next += 1;
                     let id = reg.next;
                     let flag = Arc::new(Flag::default());
@@ -1662,6 +1939,7 @@ impl<'d, 'o, M: Mailbox> Peers<'d, 'o, M> {
                             service: None,
                             generation,
                             via_default: false,
+                            exposure: None,
                             flag: flag.clone(),
                         },
                     );
@@ -1710,7 +1988,7 @@ impl<'d, 'o, M: Mailbox> Peers<'d, 'o, M> {
             return Err(Refusal::StaleExchange("authorization is for another connection").into());
         }
         let g = self.device.store().lock()?;
-        let (target, via_default) = self.read_locked(&g, |view, st| {
+        let (target, via_default, exposure) = self.read_locked(&g, |view, st| {
             if let Some(why) = view.ineligible(&auth.remote) {
                 return Err(Refusal::NotMember(why).into());
             }
@@ -1749,13 +2027,18 @@ impl<'d, 'o, M: Mailbox> Peers<'d, 'o, M> {
                 return Err(Refusal::NotPaired.into());
             }
             let id = endpoint_id(&auth.remote)?;
+            if let Some(a) = reg.exposed.access(id, service, auth.generation)
+                && let GrantInstance::Peer(instance) = a.instance
+            {
+                return Ok((a.target, false, Some(instance)));
+            }
             if let Some(a) = st.grants.access(id, service, auth.generation) {
-                return Ok((a.target, false));
+                return Ok((a.target, false, None));
             }
             if !st.excluded(&auth.remote, service)
                 && let Some(a) = st.defaults.access(id, service)
             {
-                return Ok((a.target, true));
+                return Ok((a.target, true, None));
             }
             Err(Refusal::ServiceNotGranted.into())
         })?;
@@ -1772,6 +2055,7 @@ impl<'d, 'o, M: Mailbox> Peers<'d, 'o, M> {
                 service: Some(service),
                 generation: auth.generation,
                 via_default,
+                exposure,
                 flag: flag.clone(),
             },
         );
@@ -1904,6 +2188,8 @@ enum Ending {
     /// Sessions of this peer and service that rely on the default only.
     PeerDefault(EndpointKey, Service, String),
     Default(Service, String),
+    /// Sessions opened under one exposure instance.
+    Exposure(u64, String),
     All(String),
 }
 
@@ -1915,6 +2201,7 @@ impl Ending {
             | Ending::PeerService(_, _, r)
             | Ending::PeerDefault(_, _, r)
             | Ending::Default(_, r)
+            | Ending::Exposure(_, r)
             | Ending::All(r) => r,
         }
     }

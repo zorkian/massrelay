@@ -1,12 +1,7 @@
-//! EXPERIMENTAL and UNRELEASED: device-side private membership and
-//! authenticated admission for MassRelay private discovery.
+//! Encrypted membership, admission, and peer services.
 //!
-//! Compiled only with the off-by-default `private-membership` Cargo feature.
-//! Only the experimental `massrelay private` commands use it; legacy
-//! commands, profiles, the legacy daemon and the legacy relay never do.
-//! Every record and the state row carry an explicit experimental version;
-//! none of them is a released or frozen wire format, and the OpenMLS
-//! release-candidate pin is an evaluation choice, not a release selection.
+//! Devices verify the membership history locally and authorize each
+//! connection against their accepted roster and service grants.
 //!
 //! Module map:
 //!
@@ -17,7 +12,7 @@
 //! - `policy`: the single parent-scoped policy author and recipients share.
 //! - `store`: the profile lock, state row and per-epoch MLS files.
 //! - `mailbox`: the opaque relay boundary (slot create/read, reply box).
-//! - `relay_mailbox`: that boundary over the real private relay (Unix builds).
+//! - `relay_mailbox`: that boundary over the relay.
 //! - `membership`: the state machine.
 //! - `pairing`: peer approval, reciprocal consent per connection, grants,
 //!   local cutoff and session invalidation over the accepted membership.
@@ -27,9 +22,10 @@
 //!   Windows ConPTY).
 //! - `runtime`: the thin foreground runtime (owner, listener, authenticated
 //!   local control on its own channel, outbound attach, ordered stop).
-//! - `cli`: the experimental `massrelay private` commands over a separate
-//!   private profile directory.
+//! - `audit`: device state, control, and connection events.
+//! - `cli`: top-level commands for the device profile.
 
+pub mod audit;
 pub mod binding;
 pub mod cli;
 pub mod codec;
@@ -40,6 +36,7 @@ pub mod membership;
 pub mod pairing;
 pub mod policy;
 pub mod pty;
+mod routes;
 pub mod runtime;
 pub mod service;
 pub mod store;

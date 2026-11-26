@@ -78,10 +78,9 @@
 //!
 //! # Parity gaps against the legacy daemon
 //!
-//! - No temporary exposures (`massrelay expose`).
-//! - No destination-chosen non-loopback targets yet: TCP and UDP forward to
-//!   loopback on the service port, like legacy grants without a target.
-//! - No connection log or refusal explanation catalogue.
+//! Persistent grants and defaults forward to loopback. Temporary exposures
+//! can choose a local target. Connections are logged through `super::audit` with
+//! fixed event reasons.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -94,7 +93,9 @@ use crate::tunnel::{self, Broken};
 use crate::wire::{self, Refusal as WireRefusal, Service, ServiceReply};
 use crate::{tcp, terminal, udp};
 
+use super::audit::{self, DeviceLog, Tracked};
 use super::pty;
+use super::routes::Routes;
 
 use super::binding::EndpointKey;
 use super::codec::{Dec, Enc, hex};
@@ -103,8 +104,8 @@ use super::membership::{
     Advance, Device, Dispatch, Error as MembershipError, Gate, Polled, Settle, Stop,
 };
 use super::pairing::{
-    Approved, Authorization, Cutoff, Owner, PAIRING_ALPN, PairError, PairingState, Peers, Refusal,
-    SessionHandle, read_bounded,
+    Approved, Authorization, Cutoff, Exposure, Owner, PAIRING_ALPN, PairError, PairingState, Peers,
+    Refusal, SessionHandle, read_bounded,
 };
 
 /// ALPN of the private service listener.
@@ -268,7 +269,7 @@ type Admitted = (
 pub struct Synced {
     /// Invite request queues processed (reservations, rejections, acknowledgements).
     pub requests: Result<Vec<Polled>, PairError>,
-    /// The Add staged for a reserved invite, if one was due and nothing else was journaled.
+    /// A pending removal or reserved admission staged when the journal was free.
     pub staged: Option<Result<(), PairError>>,
     pub settle: Result<Settle, PairError>,
     pub published: Option<Result<(), String>>,
@@ -287,6 +288,8 @@ pub struct Node<M: Mailbox> {
     shell: Option<PathBuf>,
     /// Held by every native PTY worker until its shell is reaped.
     workers: Arc<()>,
+    log: Arc<DeviceLog>,
+    routes: Routes,
 }
 
 impl<M: Mailbox + Send + Sync + 'static> Node<M> {
@@ -295,15 +298,37 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
         owner: Owner,
         shell: Option<PathBuf>,
     ) -> Result<Arc<Self>, PairError> {
+        Self::with_log(device, owner, shell, Arc::new(DeviceLog::disabled()))
+    }
+
+    /// `new`, recording connections and state changes to `log`.
+    pub fn with_log(
+        device: Device<M>,
+        owner: Owner,
+        shell: Option<PathBuf>,
+        log: Arc<DeviceLog>,
+    ) -> Result<Arc<Self>, PairError> {
         Peers::new(&device, &owner)?;
         let endpoint = device.state()?.endpoint;
+        log.set_own(endpoint);
+        let routes = Routes::open(device.store().dir());
         Ok(Arc::new(Self {
             device,
             owner,
             endpoint,
             shell,
             workers: Arc::new(()),
+            log,
+            routes,
         }))
+    }
+
+    pub fn log(&self) -> &DeviceLog {
+        &self.log
+    }
+
+    pub async fn watch_routes(&self, conn: &Connection) {
+        self.routes.watch(conn).await;
     }
 
     fn peers(&self) -> Peers<'_, '_, M> {
@@ -384,6 +409,21 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
         self.peers().set_default(service, enabled)
     }
 
+    /// Expose one port to one paired peer until the handle drops.
+    pub fn expose(
+        &self,
+        peer: &EndpointKey,
+        service: Service,
+        target: Option<String>,
+    ) -> Result<Exposure, PairError> {
+        self.peers().expose(peer, service, target)
+    }
+
+    /// Live exposures: (peer, service, owner-chosen target).
+    pub fn exposures(&self) -> Vec<(EndpointKey, Service, Option<String>)> {
+        self.peers().exposures()
+    }
+
     pub fn exclude(&self, peer: &EndpointKey, service: Service) -> Result<bool, PairError> {
         self.peers().exclude(peer, service)
     }
@@ -446,6 +486,12 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
         if st.journal.is_some() || st.halt.is_some() || st.terminal.is_some() {
             return (requests, None);
         }
+        match peers.run(|_| self.device.stage_pending_removal()) {
+            Some(Ok(None)) => {}
+            Some(Ok(Some(_))) => return (requests, Some(Ok(()))),
+            Some(Err(e)) => return (requests, Some(Err(e.into()))),
+            None => return (requests, Some(Err(Refusal::Stopping.into()))),
+        }
         let due = st
             .invites
             .iter()
@@ -475,7 +521,9 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
         let (requests, staged) = self.admit(&peers);
         let mut published = None;
         let mut settle = self.settle();
-        if matches!(settle, Ok(Settle::NotPublished)) && !self.stopping() {
+        // Both outcomes follow an authenticated absent read. A previous
+        // uncertain send is retried with the same durable bytes and eligibility checks.
+        if matches!(settle, Ok(Settle::NotPublished | Settle::Pending)) && !self.stopping() {
             published = Some(
                 self.device
                     .publish_gated(&peers)
@@ -536,8 +584,11 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
                     let Some(incoming) = incoming else { break };
                     let node = self.clone();
                     tasks.spawn(async move {
-                        if let Ok(conn) = incoming.await {
-                            node.serve_connection(conn).await;
+                        match incoming.await {
+                            Ok(conn) => {
+                                node.serve_connection(conn).await;
+                            }
+                            Err(_) => node.log.handshake_failed(),
                         }
                     });
                 }
@@ -550,18 +601,29 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
     /// Serve one completed connection through its whole registered lifetime:
     /// exchange, one request, its reply and payload, and the final drain.
     pub async fn serve_connection(&self, conn: Connection) -> Ended {
+        let track = self.log.inbound(conn.remote_id());
         if conn.alpn() != SERVICE_ALPN {
             conn.close(0u32.into(), CLOSE_WRONG_PROTOCOL);
+            track.end("wrong_protocol", None);
             return Ended::WrongProtocol;
         }
-        let (auth, mut tx, mut rx) = match self.peers().authorize(&conn, false).await {
+        let authorized = self.peers().authorize(&conn, false).await;
+        // The exchange may have learned a decision or paired.
+        audit::observe(self, false);
+        let (auth, mut tx, mut rx) = match authorized {
             Ok(x) => x,
             Err(e) => {
                 conn.close(0u32.into(), CLOSE_NOT_AUTHORIZED);
+                track.end(audit::pair_error_reason(&e), None);
                 return Ended::NotAuthorized(format!("{e:?}"));
             }
         };
-        let (ended, session) = self.serve_authorized(&conn, &auth, &mut tx, &mut rx).await;
+        let (ended, session) = tokio::select! {
+            biased;
+            _ = self.watch_routes(&conn) => unreachable!("route watcher stays pending"),
+            result = self.serve_authorized(&conn, &auth, &mut tx, &mut rx, &track) => result,
+        };
+        track.end_served(&ended);
         if ended.drains() {
             // The final frames are finished on the stream. Let the dialer
             // read them and close, for at most `RPC_TIMEOUT`. The exact
@@ -600,11 +662,13 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
         auth: &Authorization,
         tx: &mut SendStream,
         rx: &mut RecvStream,
+        track: &Tracked<'_>,
     ) -> (Ended, Option<SessionHandle>) {
         let over = |why: Refusal| match why {
             Refusal::ConnectionClosed => Ended::PeerDisconnected,
             why => {
                 conn.close(0u32.into(), CLOSE_AUTHORITY_ENDED);
+                track.authority_ended(&why);
                 Ended::AuthorityEnd(format!("{why:?}"))
             }
         };
@@ -618,6 +682,7 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
             conn.close(0u32.into(), CLOSE_DONE);
             return (Ended::BadRequest, None);
         };
+        track.service(req.service);
         let session = match self.peers().open(auth, req.service) {
             Ok(s) => s,
             Err(e) => {
@@ -638,7 +703,7 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
         let outcome = tokio::select! {
             biased;
             why = session.done() => Outcome::Over(why),
-            ended = self.serve_service(&session, &req, rx, tx, &mut teardown) => Outcome::Served(ended),
+            ended = self.serve_service(&session, &req, rx, tx, &mut teardown, track) => Outcome::Served(ended),
         };
         // The serving future is dropped here: copies stop, sockets close and
         // a shell's PTY is dropped (its reaper wakes, kills and reaps).
@@ -659,6 +724,7 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
         rx: &mut RecvStream,
         tx: &mut SendStream,
         teardown: &mut Option<pty::Teardown>,
+        track: &Tracked<'_>,
     ) -> Ended {
         let target = session.target.as_deref();
         match req.service {
@@ -672,6 +738,7 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
                 {
                     Ok(Ok(mut pty)) => {
                         *teardown = Some(pty.teardown());
+                        track.connected();
                         match serve_shell(session, &mut pty, rx, tx).await {
                             Ok(code) => {
                                 let _ = tx.finish();
@@ -707,6 +774,7 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
                 if wire::send(&mut *tx, ServiceReply::Ready).await.is_err() {
                     return Ended::PeerDisconnected;
                 }
+                track.connected();
                 let mut target = session.guard(stream);
                 let result = tcp::bridge_with(rx, tx, &mut target, tcp::MAX_FRAME).await;
                 finish_tunnel(result, tx, tcp::MAX_FRAME).await
@@ -723,6 +791,7 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
                 if wire::send(&mut *tx, ServiceReply::Ready).await.is_err() {
                     return Ended::PeerDisconnected;
                 }
+                track.connected();
                 let ended = || Broken::Denied(WireRefusal::PairingRequired);
                 // Each association's bind, connect and first send, and every
                 // later datagram, are handed to the OS under the guard.
@@ -765,6 +834,9 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
     ) -> Result<ServiceStream, PairError> {
         self.check_endpoint(endpoint)?;
         let local = |e: &dyn std::fmt::Display| PairError::Local(format!("service: {e}"));
+        if let Some(address) = self.routes.get(addr.id) {
+            addr = addr.with_ip_addr(address);
+        }
         // Preserve the pinned identity and relay while offering direct paths
         // learned by Iroh during earlier connections to this peer.
         if let Some(remote) = endpoint.remote_info(addr.id).await {

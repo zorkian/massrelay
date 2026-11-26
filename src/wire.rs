@@ -1,28 +1,16 @@
 use std::{fmt, io, net::SocketAddr, num::NonZeroU16, str::FromStr, time::Duration};
 
 use anyhow::{Context, Result, ensure};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use iroh::{EndpointAddr, EndpointId, RelayUrl};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+// Retired protocol identifiers are only used in downgrade tests.
+#[cfg(test)]
 pub const CONTROL: &[u8] = b"massrelay/control/1";
-/// Peer services. A destination checks a grant for every request made over this protocol.
+#[cfg(test)]
 pub const SERVICE: &[u8] = b"massrelay/service/1";
-/// Connection close reasons with which a destination tells a peer why access ended.
-pub const CLOSE_PAIRING_REQUIRED: &[u8] = b"pairing required";
-pub const CLOSE_PAIRING_ENDED: &[u8] = b"pairing ended";
-pub const CLOSE_GRANT_REMOVED: &[u8] = b"service grant removed";
-pub const PAIRING_REQUIRED: &str = "both devices must approve this pairing";
 pub const RPC_TIMEOUT: Duration = Duration::from_secs(10);
-pub const INVALID_CREATE_TICKET: &str = "invalid create ticket";
-pub const INVALID_JOIN_INVITE: &str = "invalid or already used invite";
-pub const EXPIRED_INVITE: &str = "invite expired";
-pub const NAME_IN_USE: &str = "name already in use";
-/// A public relay locator names a relay. It carries no secret and grants no membership.
-const LOCATOR_PREFIX: &str = "mrrelay1_";
-/// Operator creation tickets and join invites share this secret-bearing format.
-const TICKET_PREFIX: &str = "mr1_";
 
 pub async fn send<T: Serialize>(writer: &mut (impl AsyncWrite + Unpin), value: T) -> Result<()> {
     let data = serde_json::to_vec(&value)?;
@@ -74,25 +62,6 @@ pub fn random() -> Result<[u8; 32]> {
     let mut secret = [0; 32];
     getrandom::fill(&mut secret).map_err(|error| anyhow::anyhow!("{error}"))?;
     Ok(secret)
-}
-
-pub fn token() -> Result<String> {
-    Ok(URL_SAFE_NO_PAD.encode(random()?))
-}
-
-pub fn check_name(name: &str) -> Result<()> {
-    ensure!(
-        !name.is_empty()
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
-        "name must contain ASCII letters, digits, hyphens, or underscores"
-    );
-    ensure!(
-        name.parse::<EndpointId>().is_err(),
-        "name cannot be an endpoint ID"
-    );
-    Ok(())
 }
 
 /// Check an exposure target's form. Its host is resolved later, on the exposing device.
@@ -162,13 +131,6 @@ impl TryFrom<String> for Service {
     }
 }
 
-fn encode(prefix: &str, value: &impl Serialize) -> Result<String> {
-    Ok(format!(
-        "{prefix}{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(value)?)
-    ))
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ServerAddr {
     pub id: EndpointId,
@@ -185,41 +147,6 @@ impl ServerAddr {
             addr
         }
     }
-
-    pub fn locator(&self) -> Result<String> {
-        encode(LOCATOR_PREFIX, self)
-    }
-
-    pub fn from_locator(text: &str) -> Result<Self> {
-        let encoded = text
-            .trim()
-            .strip_prefix(LOCATOR_PREFIX)
-            .context("expected a MassRelay relay locator starting with mrrelay1_")?;
-        let bytes = URL_SAFE_NO_PAD
-            .decode(encoded)
-            .context("invalid relay locator")?;
-        serde_json::from_slice(&bytes).context("invalid relay locator")
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Ticket {
-    pub server: ServerAddr,
-    pub secret: String,
-}
-
-impl Ticket {
-    pub fn encode(&self) -> Result<String> {
-        encode(TICKET_PREFIX, self)
-    }
-
-    pub fn decode(text: &str) -> Result<Self> {
-        let text = text.trim();
-        let encoded = text
-            .strip_prefix(TICKET_PREFIX)
-            .context("expected a MassRelay ticket or invite starting with mr1_")?;
-        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded)?).context("invalid ticket")
-    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -228,127 +155,6 @@ pub struct Member {
     pub name: String,
     pub addr: Option<EndpointAddr>,
     pub last_seen: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Decision {
-    Approve,
-    Decline,
-}
-
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
-pub struct PairView {
-    pub generation: u64,
-    pub ours: Option<Decision>,
-    pub theirs: Option<Decision>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Peer {
-    pub member: Member,
-    pub pair: PairView,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Roster {
-    pub network: String,
-    pub peers: Vec<Peer>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub enum Request {
-    Enroll {
-        secret: String,
-        name: String,
-        create: bool,
-    },
-    Sync {
-        addr: EndpointAddr,
-    },
-    Invite,
-    Pair {
-        peer: EndpointId,
-        decision: Decision,
-        generation: u64,
-    },
-    Revoke {
-        peer: EndpointId,
-    },
-    /// Open creation on a shared relay. Membership and the first invite are issued together.
-    /// Repeating it from the founder returns that invite while it remains unused and unexpired.
-    Create {
-        name: String,
-    },
-}
-
-#[derive(Serialize, Deserialize)]
-pub enum Reply {
-    Roster(Roster),
-    Invite(String),
-    Revoked,
-    Error(String),
-    Created {
-        /// The founder's registered name, which a retry cannot change.
-        name: String,
-        roster: Roster,
-        invite: String,
-    },
-}
-
-#[derive(Serialize, Deserialize)]
-pub enum LocalRequest {
-    Peers,
-    Invite,
-    Pair {
-        peer: String,
-        decision: Decision,
-    },
-    Revoke {
-        peer: String,
-    },
-    Shell {
-        peer: String,
-        cols: u16,
-        rows: u16,
-    },
-    /// Forward a TCP or UDP service on a peer through this command.
-    Connect {
-        peer: String,
-        service: Service,
-        lifetime_port: u16,
-        lifetime_key: [u8; 32],
-    },
-    Enable {
-        service: Service,
-        peer: String,
-    },
-    Disable {
-        service: Service,
-        peer: String,
-    },
-    SetServiceDefault {
-        service: Service,
-        enabled: bool,
-    },
-    Grants,
-    /// Grant a service for as long as the requesting command stays connected.
-    Expose {
-        service: Service,
-        peer: String,
-        target: Option<String>,
-    },
-}
-
-#[derive(Serialize, Deserialize)]
-pub enum LocalReply {
-    Peers(Vec<Peer>),
-    Invite(String),
-    Done,
-    Shell,
-    Error(String),
-    Connected,
-    Grants(Vec<GrantView>),
-    Exposed { peer: String, id: EndpointId },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -366,16 +172,6 @@ pub struct GrantView {
 pub enum GrantRule {
     Default,
     Excluded,
-}
-
-/// A peer's request to use a service. It cannot choose what the destination connects to.
-#[derive(Serialize, Deserialize)]
-pub struct ServiceRequest {
-    pub network: String,
-    pub generation: u64,
-    pub service: Service,
-    /// The initial columns and rows of a shell.
-    pub terminal: Option<(u16, u16)>,
 }
 
 #[derive(Serialize, Deserialize)]
