@@ -4,7 +4,7 @@ MassRelay connects your own machines in a pocket network. Enrolled devices can s
 
 ## Install
 
-[MassRelay v0.3.11](https://github.com/zorkian/massrelay/releases/tag/v0.3.11) adds service defaults for current and future peers.
+[MassRelay v0.4.0](https://github.com/zorkian/massrelay/releases/tag/v0.4.0) adds private discovery on Linux, macOS, and Windows.
 
 On Linux or macOS, sign in with `gh auth login` using an account that has access to this repository. Then install the latest release to `~/.local/bin/massrelay`.
 
@@ -29,15 +29,26 @@ curl -fsSL https://raw.githubusercontent.com/zorkian/massrelay/main/install.sh |
 
 The installer selects the x86-64 or ARM64 binary and verifies its SHA-256 checksum. Set `MASSRELAY_VERSION` in the environment to install a specific tag. If `~/.local/bin` is outside your `PATH`, run `~/.local/bin/massrelay --version` or add `export PATH="$HOME/.local/bin:$PATH"` to your shell startup file.
 
-On Windows x64, sign in with GitHub CLI and run this in PowerShell.
+On Windows x64 (Windows 10 version 1809 or later), sign in with GitHub CLI and run this in PowerShell. The installer verifies the release checksum before replacing `massrelay.exe`.
 
 ```powershell
-New-Item -ItemType Directory -Force "$HOME/bin" | Out-Null
-gh release download --repo zorkian/massrelay --pattern massrelay-windows-x86_64.exe --output "$HOME/bin/massrelay.exe" --clobber
+$installer = Join-Path $env:TEMP ("massrelay-install-" + [Guid]::NewGuid() + ".ps1")
+try {
+    gh api repos/zorkian/massrelay/contents/install.ps1 -H 'Accept: application/vnd.github.raw+json' > $installer
+    if ($LASTEXITCODE -ne 0) { throw 'Could not download the MassRelay installer.' }
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer
+    if ($LASTEXITCODE -ne 0) { throw 'MassRelay installation failed.' }
+} finally {
+    Remove-Item -LiteralPath $installer -ErrorAction SilentlyContinue
+}
 & "$HOME/bin/massrelay.exe" --version
 ```
 
 Release binaries and their checksums are also available on the [Releases page](https://github.com/zorkian/massrelay/releases).
+
+## Private networks
+
+Private discovery uses an encrypted membership history and a separate device profile. The release binaries include the `massrelay private` commands. See [Set up a private network](docs/private-discovery-setup.md) for relay setup, enrollment, and moving an existing network.
 
 ## Pair two machines
 
@@ -299,7 +310,7 @@ Keep the device state directory to preserve keys, approvals, and grants across r
 
 ## Build from source
 
-Install stable Rust and a platform C toolchain, then run `cargo build --locked --release`. The executable is `target/release/massrelay` or `target\release\massrelay.exe` on Windows.
+Install stable Rust and a platform C toolchain, then run `cargo build --locked --release --features private-membership` to build the same features as the release. The executable is `target/release/massrelay` or `target\release\massrelay.exe` on Windows.
 
 Pushing a tag that matches the Cargo version, such as `v0.3.0`, builds and publishes the release binaries through GitHub Actions.
 

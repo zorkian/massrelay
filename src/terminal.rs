@@ -14,10 +14,16 @@ use tokio::{
 
 use crate::wire::{self, ServiceReply};
 
-const DATA: u8 = 1;
-const RESIZE: u8 = 2;
-const EXIT: u8 = 3;
-const CHUNK: usize = 8192;
+pub(crate) const DATA: u8 = 1;
+pub(crate) const RESIZE: u8 = 2;
+pub(crate) const EXIT: u8 = 3;
+pub(crate) const CHUNK: usize = 8192;
+/// The largest shell input frame a MassRelay client sends (data or resize).
+#[cfg_attr(not(feature = "private-membership"), allow(dead_code))]
+pub const MAX_INPUT_FRAME: usize = CHUNK;
+/// The largest output frame a shell server sends (output chunk or exit).
+#[cfg_attr(not(feature = "private-membership"), allow(dead_code))]
+pub const MAX_OUTPUT_FRAME: usize = CHUNK;
 
 fn dimensions(cols: u16, rows: u16) -> PtySize {
     #[cfg(windows)]
@@ -129,9 +135,19 @@ impl Drop for WindowsConsole {
 }
 
 pub async fn attach(
+    rx: impl AsyncRead + Unpin,
+    tx: impl AsyncWrite + Unpin,
+    initial_size: (u16, u16),
+) -> Result<i32> {
+    attach_max(rx, tx, initial_size, usize::MAX).await
+}
+
+/// `attach`, refusing shell output frames longer than `max_frame`.
+pub async fn attach_max(
     mut rx: impl AsyncRead + Unpin,
     mut tx: impl AsyncWrite + Unpin,
     initial_size: (u16, u16),
+    max_frame: usize,
 ) -> Result<i32> {
     let _terminal = LocalTerminal::enter()?;
     let (input_tx, mut input_rx) = mpsc::channel::<io::Result<Vec<u8>>>(8);
@@ -165,7 +181,7 @@ pub async fn attach(
         #[cfg(windows)]
         let mut pending = Vec::new();
         loop {
-            let data = wire::read_frame(&mut rx)
+            let data = wire::read_frame_max(&mut rx, max_frame)
                 .await
                 .context("remote shell disconnected")?;
             match data.split_first() {

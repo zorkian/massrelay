@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     fs::File,
     future::{Future, poll_fn},
-    net::{Ipv4Addr, SocketAddr},
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
     task::{Poll, ready},
@@ -1185,13 +1185,7 @@ impl Node {
                 lifetime_port,
                 lifetime_key,
             } if service != Service::Shell => {
-                let lifetime = async {
-                    let mut lifetime =
-                        TcpStream::connect((Ipv4Addr::LOCALHOST, lifetime_port)).await?;
-                    lifetime.write_all(&lifetime_key).await?;
-                    Ok::<_, io::Error>(lifetime)
-                }
-                .await;
+                let lifetime = local::lifetime_connect(lifetime_port, &lifetime_key).await;
                 let lifetime = match lifetime {
                     Ok(lifetime) => lifetime,
                     Err(error) => {
@@ -1455,43 +1449,41 @@ impl Node {
         }
 
         let mut writing = false;
+        let stopped = async {
+            self.until_unpaired(id, &request).await;
+            connection.close(0u32.into(), wire::CLOSE_PAIRING_ENDED);
+        };
+        let ended = tunnel::forward(
+            &mut rx,
+            &mut tx,
+            &mut local_rx,
+            &mut local_tx,
+            &mut writing,
+            &mut local_closed,
+            stopped,
+            usize::MAX,
+        )
+        .await;
         // A message is what to tell the local command when the destination cannot.
-        // Polling order varies, so that a busy download cannot hold back the upload.
-        let (reason, message) = tokio::select! {
-            _ = self.until_unpaired(id, &request) => {
-                connection.close(0u32.into(), wire::CLOSE_PAIRING_ENDED);
-                ("pairing_ended", Some("this pairing ended".to_owned()))
-            }
-            delivered = tunnel::deliver(&mut rx, &mut local_tx, &mut writing) => match delivered {
-                Ok(true) => ("stream_closed", None),
-                Ok(false) => ("service_failed", None),
-                Err(tunnel::Cut::Local) => ("local_client_closed", None),
-                Err(tunnel::Cut::Peer) => match closed_by_peer(&connection, service) {
-                    Some((reason, message)) => (reason, Some(message)),
-                    None => (
-                        "peer_disconnected",
-                        Some("the connection to the destination was lost".to_owned()),
-                    ),
-                },
+        let (reason, message) = match ended {
+            tunnel::Forwarded::Stopped => ("pairing_ended", Some("this pairing ended".to_owned())),
+            tunnel::Forwarded::Done => ("stream_closed", None),
+            tunnel::Forwarded::Failed => ("service_failed", None),
+            tunnel::Forwarded::LocalClosed => ("local_client_closed", None),
+            tunnel::Forwarded::PeerCut => match closed_by_peer(&connection, service) {
+                Some((reason, message)) => (reason, Some(message)),
+                None => (
+                    "peer_disconnected",
+                    Some("the connection to the destination was lost".to_owned()),
+                ),
             },
-            _ = &mut local_closed => ("local_client_closed", None),
-            _ = tunnel::pump(&mut local_rx, &mut tx) => ("local_client_closed", None),
         };
         connection.close(0u32.into(), b"done");
         session.end(reason, None);
         if reason == "local_client_closed" {
             return Ok(());
         }
-        if let Some(message) = message {
-            // After part of a frame, only closing the socket can report the failure.
-            if writing {
-                return Ok(());
-            }
-            tunnel::fail(&mut local_tx, &message).await?;
-        }
-        // Closing with unread input could discard the final frame before the command reads it.
-        io::copy(&mut local_rx, &mut io::sink()).await?;
-        Ok(())
+        tunnel::finish_local(&mut local_rx, &mut local_tx, writing, message.as_deref()).await
     }
 
     async fn serve_peer(&self, connection: Connection) {

@@ -1,0 +1,4 @@
+[build]
+# Use the same Dalek arithmetic backend for app bindings, MLS, and Iroh TLS.
+# Native release tests qualify this path with strict verification unchanged.
+rustflags = ['--cfg=curve25519_dalek_backend="serial"']

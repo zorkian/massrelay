@@ -27,6 +27,9 @@ use crate::{
 const HEADER: usize = 9;
 /// Large enough for any UDP payload, so that receiving never truncates one.
 const DATAGRAM: usize = 65_535;
+/// The largest UDP forwarding frame the format can carry.
+#[cfg_attr(not(feature = "private-membership"), allow(dead_code))]
+pub const MAX_FRAME: usize = HEADER + DATAGRAM;
 
 fn frame_header(association: u64) -> [u8; HEADER] {
     let mut header = [tunnel::DATA; HEADER];
@@ -92,7 +95,7 @@ pub async fn associate(target: SocketAddr, first: &[u8]) -> io::Result<UdpSocket
     Ok(socket)
 }
 
-async fn send(socket: &UdpSocket, payload: &[u8]) {
+pub async fn send(socket: &UdpSocket, payload: &[u8]) {
     // Delivery is not guaranteed beyond the tunnel, so a refused datagram is dropped.
     let _ = socket.send(payload).await;
 }
@@ -103,19 +106,48 @@ pub async fn bridge<F: Future<Output = Result<UdpSocket, Broken>>>(
     tx: &mut (impl AsyncWrite + Unpin),
     start_association: impl Fn(Vec<u8>) -> F,
 ) -> Result<(), Broken> {
+    bridge_with(
+        rx,
+        tx,
+        start_association,
+        |socket, payload| async move {
+            send(&socket, &payload).await;
+            Ok(())
+        },
+        usize::MAX,
+    )
+    .await
+}
+
+/// `bridge` with a caller-supplied send for every later datagram of an
+/// association (for example a guarded one), refusing peer frames longer
+/// than `max_frame`.
+pub async fn bridge_with<F, S>(
+    rx: &mut (impl AsyncRead + Unpin),
+    tx: &mut (impl AsyncWrite + Unpin),
+    start_association: impl Fn(Vec<u8>) -> F,
+    send_datagram: impl Fn(Arc<UdpSocket>, Vec<u8>) -> S,
+    max_frame: usize,
+) -> Result<(), Broken>
+where
+    F: Future<Output = Result<UdpSocket, Broken>>,
+    S: Future<Output = Result<(), Broken>>,
+{
     let (replies, mut queued) = mpsc::channel::<io::Result<Vec<u8>>>(8);
     // Dropping these closes every association's socket.
     let mut sockets = BTreeMap::<u64, Arc<UdpSocket>>::new();
     let mut readers = JoinSet::new();
     let upload = async {
         loop {
-            let frame = wire::read_frame(rx).await.map_err(|_| Broken::Peer)?;
+            let frame = wire::read_frame_max(rx, max_frame)
+                .await
+                .map_err(|_| Broken::Peer)?;
             let Some((&tunnel::DATA, data)) = frame.split_first() else {
                 return Err::<(), _>(Broken::Peer);
             };
             let (association, payload) = split_datagram(data).ok_or(Broken::Peer)?;
             match sockets.get(&association) {
-                Some(socket) => send(socket, payload).await,
+                Some(socket) => send_datagram(socket.clone(), payload.to_vec()).await?,
                 None => {
                     let socket = Arc::new(start_association(payload.to_vec()).await?);
                     sockets.insert(association, socket.clone());

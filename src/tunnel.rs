@@ -62,13 +62,17 @@ pub enum Cut {
 
 /// Pass the destination's frames to the local command, through its final frame. Returns whether
 /// the destination reported success. `writing` remains set if a local write was left unfinished.
+/// A destination frame longer than `max_frame` cuts the delivery.
 pub async fn deliver(
     remote: &mut (impl AsyncRead + Unpin),
     local: &mut (impl AsyncWrite + Unpin),
     writing: &mut bool,
+    max_frame: usize,
 ) -> Result<bool, Cut> {
     loop {
-        let frame = wire::read_frame(remote).await.map_err(|_| Cut::Peer)?;
+        let frame = wire::read_frame_max(remote, max_frame)
+            .await
+            .map_err(|_| Cut::Peer)?;
         let last = match parse(&frame).ok_or(Cut::Peer)? {
             Incoming::Done => Some(true),
             Incoming::Failed(_) => Some(false),
@@ -98,4 +102,67 @@ pub async fn pump(local: &mut (impl AsyncRead + Unpin), remote: &mut (impl Async
             }
         }
     }
+}
+
+/// How a local command's port forward ended (destination side of the CLI).
+pub enum Forwarded {
+    /// Authority ended (the `stopped` future resolved).
+    Stopped,
+    /// The destination reported success.
+    Done,
+    /// The destination reported a failure.
+    Failed,
+    /// The local command went away (its lifetime socket or upload ended).
+    LocalClosed,
+    /// The destination's stream failed without a final frame.
+    PeerCut,
+}
+
+/// Bridge a local command's forwarding socket and a destination stream until
+/// one of them ends or `stopped` resolves. The lifetime socket, not the
+/// upload's EOF, signals that the command left, so a TCP half-close keeps the
+/// other direction open. Polling order varies, so that a busy download cannot
+/// hold back the upload. Destination frames longer than `max_frame` cut it.
+#[allow(clippy::too_many_arguments)]
+pub async fn forward(
+    remote_rx: &mut (impl AsyncRead + Unpin),
+    remote_tx: &mut (impl AsyncWrite + Unpin),
+    local_rx: &mut (impl AsyncRead + Unpin),
+    local_tx: &mut (impl AsyncWrite + Unpin),
+    writing: &mut bool,
+    local_closed: &mut (impl std::future::Future<Output = ()> + Unpin),
+    stopped: impl std::future::Future<Output = ()>,
+    max_frame: usize,
+) -> Forwarded {
+    tokio::select! {
+        _ = stopped => Forwarded::Stopped,
+        delivered = deliver(remote_rx, local_tx, writing, max_frame) => match delivered {
+            Ok(true) => Forwarded::Done,
+            Ok(false) => Forwarded::Failed,
+            Err(Cut::Local) => Forwarded::LocalClosed,
+            Err(Cut::Peer) => Forwarded::PeerCut,
+        },
+        _ = local_closed => Forwarded::LocalClosed,
+        _ = pump(local_rx, remote_tx) => Forwarded::LocalClosed,
+    }
+}
+
+/// After a forward ended for a reason other than the command leaving: tell
+/// the command why if a frame can still be written, then drain its input so
+/// closing cannot discard the final frame before the command reads it.
+pub async fn finish_local(
+    local_rx: &mut (impl AsyncRead + Unpin),
+    local_tx: &mut (impl AsyncWrite + Unpin),
+    writing: bool,
+    message: Option<&str>,
+) -> anyhow::Result<()> {
+    if let Some(message) = message {
+        // After part of a frame, only closing the socket can report the failure.
+        if writing {
+            return Ok(());
+        }
+        fail(local_tx, message).await?;
+    }
+    tokio::io::copy(local_rx, &mut tokio::io::sink()).await?;
+    Ok(())
 }

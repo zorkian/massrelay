@@ -25,6 +25,12 @@ use crate::{
 };
 
 const STATE_FILE: &str = "relay.json";
+/// The legacy relay profile, which a private relay's directory must not hold.
+#[cfg_attr(not(all(unix, feature = "private-relay")), allow(dead_code))]
+pub(crate) const LEGACY_PROFILE_FILE: &str = STATE_FILE;
+/// An experimental private relay profile, which a legacy relay's directory must not hold.
+pub(crate) const PRIVATE_PROFILE_FILE: &str = "private-relay.json";
+pub(crate) const PRIVATE_STORE_DIR: &str = "mailbox";
 const EVENT_FILE: &str = "relay-events.jsonl";
 const INVITE_SECONDS: u64 = 600;
 
@@ -366,9 +372,20 @@ impl RelayState {
     }
 }
 
+fn refuse_private(dir: &Path) -> Result<()> {
+    ensure!(
+        !dir.join(PRIVATE_PROFILE_FILE).try_exists()?
+            && !dir.join(PRIVATE_STORE_DIR).try_exists()?,
+        "{} holds an experimental private relay; use a separate state directory",
+        dir.display()
+    );
+    Ok(())
+}
+
 /// Initialize a ticket-only relay.
 pub fn init(dir: &Path, udp: SocketAddr, relay: RelayUrl) -> Result<()> {
     let _lock = storage::lock(dir)?;
+    refuse_private(dir)?;
     ensure!(!dir.join(STATE_FILE).exists(), "relay already initialized");
     let log = ConnectionLog::open(Some(&dir.join(EVENT_FILE)))?;
     let state = RelayState::new(udp, relay, false)?;
@@ -382,6 +399,7 @@ pub fn init(dir: &Path, udp: SocketAddr, relay: RelayUrl) -> Result<()> {
 /// state exists. Returns whether the state is new and still needs saving. Advertised addresses
 /// never alter saved state; they must match it.
 fn configure(dir: &Path, advertised: Option<(SocketAddr, RelayUrl)>) -> Result<(RelayState, bool)> {
+    refuse_private(dir)?;
     if !dir.join(STATE_FILE).try_exists()? {
         let (udp, relay) = advertised.context(
             "relay is not initialized; pass --public-udp and --url to start a shared relay, \
@@ -728,6 +746,18 @@ async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_private_initialization_keeps_directory_private() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::create_dir(dir.path().join(PRIVATE_STORE_DIR))?;
+        let udp = "127.0.0.1:4433".parse()?;
+        let url: RelayUrl = "http://127.0.0.1:3340".parse()?;
+        assert!(init(dir.path(), udp, url.clone()).is_err());
+        assert!(configure(dir.path(), Some((udp, url))).is_err());
+        assert!(!dir.path().join(STATE_FILE).exists());
+        Ok(())
+    }
 
     fn id(seed: u8) -> EndpointId {
         SecretKey::from_bytes(&[seed; 32]).public()

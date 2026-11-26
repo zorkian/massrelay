@@ -8,7 +8,30 @@ mod connection_log;
 mod device;
 mod grants;
 mod local;
+#[cfg(feature = "private-membership")]
+#[allow(dead_code)]
+mod private;
 mod relay;
+// Portable slot write primitives shared by the private relay and device membership.
+#[allow(dead_code)]
+mod slot_wire;
+// Foundation for private discovery. Private relay hosting is Unix-only and behind the
+// off-by-default private-relay feature; default builds and Windows keep the legacy client and
+// relay.
+#[cfg(all(unix, feature = "private-relay"))]
+#[allow(dead_code)]
+mod slot_store;
+// Experimental private mailbox wire codec, setup locator and client, built wherever the
+// opt-in private client is. Only the private-membership adapter and tests use the client so far.
+#[cfg(feature = "private-relay")]
+#[allow(dead_code)]
+mod mailbox;
+// The private relay's request dispatch and stream server: hosting is Unix-only.
+#[cfg(all(unix, feature = "private-relay"))]
+#[allow(dead_code)]
+mod mailbox_server;
+#[cfg(all(unix, feature = "private-relay"))]
+mod private_relay;
 mod storage;
 mod tcp;
 mod terminal;
@@ -49,6 +72,58 @@ struct Cli {
     command: Option<Command>,
 }
 
+#[cfg(all(unix, feature = "private-relay"))]
+#[derive(Subcommand)]
+enum PrivateRelayAccess {
+    /// Issue an access grant and print a locator carrying its secret.
+    Issue {
+        /// The operator's own note for this grant, such as whose network uses it.
+        #[arg(long, default_value = "")]
+        label: String,
+    },
+    /// List every access grant, revoked ones included.
+    List,
+    /// Revoke an access grant. It stops admitting at the relay's next start.
+    Revoke {
+        /// The grant identifier shown by 'list'.
+        id: String,
+    },
+}
+
+#[cfg(all(unix, feature = "private-relay"))]
+#[derive(Subcommand)]
+enum PrivateRelayStore {
+    /// Verify the whole store: integrity, exact schema, links and every body.
+    Check,
+    /// Write a verified, signed snapshot into a new directory.
+    Backup {
+        #[arg(long, value_name = "DIR")]
+        to: PathBuf,
+        /// Seal the store first: the snapshot becomes the incarnation's final state, and this
+        /// relay will not serve again.
+        #[arg(long = "final")]
+        final_: bool,
+    },
+    /// Restore a backup into an empty state directory.
+    Restore {
+        #[arg(long, value_name = "DIR")]
+        from: PathBuf,
+        /// The relay endpoint identity the backup must be signed by, from a locator you trust.
+        #[arg(long, value_name = "ENDPOINT_ID")]
+        relay: String,
+        /// Keep the incarnation. Only a complete (final) backup, restored once.
+        #[arg(long)]
+        keep_incarnation: bool,
+    },
+    /// Set the store aside and start a new, empty incarnation. Every network on the old one
+    /// must be created again.
+    Rotate {
+        /// Required: confirms that networks on the current incarnation end here.
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Initialize a ticket-only relay and print its creation ticket.
@@ -75,6 +150,31 @@ enum Command {
     RelayInfo,
     /// Print the relay's current one-use network creation ticket.
     RelayTicket,
+    /// Initialize a private relay in its own state directory.
+    #[cfg(all(unix, feature = "private-relay"))]
+    PrivateRelayInit {
+        #[arg(long)]
+        public_udp: SocketAddr,
+        #[arg(long)]
+        url: RelayUrl,
+    },
+    /// Run an initialized private relay in the foreground.
+    #[cfg(all(unix, feature = "private-relay"))]
+    PrivateRelay {
+        #[arg(long, default_value = "0.0.0.0:4433")]
+        udp_bind: SocketAddr,
+        #[arg(long, default_value = "0.0.0.0:3340")]
+        relay_bind: SocketAddr,
+    },
+    /// Manage a stopped private relay's operator access grants.
+    #[cfg(all(unix, feature = "private-relay"))]
+    #[command(subcommand)]
+    PrivateRelayAccess(PrivateRelayAccess),
+    /// Verify, back up, restore or rotate a stopped private
+    /// relay's store.
+    #[cfg(all(unix, feature = "private-relay"))]
+    #[command(subcommand)]
+    PrivateRelayStore(PrivateRelayStore),
     /// Create a network on a shared relay and print its first invite.
     Create {
         /// Device name for an operator creation ticket, which is read from stdin.
@@ -176,6 +276,12 @@ enum Command {
         #[arg(value_name = "HOST:PORT", value_parser = target)]
         target: Option<String>,
     },
+    /// Create, join, and use a private network.
+    #[cfg(feature = "private-membership")]
+    Private {
+        #[command(subcommand)]
+        command: private::cli::Command,
+    },
     /// Connect to a peer's shell or forwarded port.
     ///
     /// A TCP service is connected to standard input and output. A UDP service is
@@ -225,6 +331,16 @@ async fn main() {
 fn grouped_cli() -> clap::Command {
     let command = Cli::command();
     let groups: &[(&str, &[&str])] = &[
+        (
+            "Private networks",
+            &[
+                "private",
+                "private-relay-init",
+                "private-relay",
+                "private-relay-access",
+                "private-relay-store",
+            ],
+        ),
         ("Set up a network", &["create", "join", "invite"]),
         (
             "Manage this device",
@@ -246,11 +362,24 @@ fn grouped_cli() -> clap::Command {
     ];
     let mut help = String::from("{about-with-newline}\n{usage-heading} {usage}\n");
     for &(heading, names) in groups {
+        // Feature-gated groups are absent from builds without the feature.
+        if !names
+            .iter()
+            .any(|name| command.find_subcommand(name).is_some())
+        {
+            continue;
+        }
         writeln!(help, "\n{heading}:").expect("write to string");
+        let width = names
+            .iter()
+            .map(|name| name.len())
+            .max()
+            .unwrap_or(0)
+            .max(12);
         for &name in names {
             if let Some(subcommand) = command.find_subcommand(name) {
                 let description = subcommand.get_about().expect("command description");
-                writeln!(help, "  {name:12}  {description}").expect("write to string");
+                writeln!(help, "  {name:width$}  {description}").expect("write to string");
             }
         }
     }
@@ -265,6 +394,10 @@ async fn execute(cli: Cli) -> Result<i32> {
     };
 
     let Some(command) = cli.command else {
+        #[cfg(feature = "private-membership")]
+        if private::cli::profile_exists(&dir) {
+            return private::cli::execute(&dir, private::cli::Command::Status).await;
+        }
         device::show_home(&dir).await?;
         return Ok(0);
     };
@@ -278,6 +411,43 @@ async fn execute(cli: Cli) -> Result<i32> {
         } => relay::run(dir, udp_bind, relay_bind, public_udp.zip(url)).await?,
         Command::RelayInfo => relay::info(&dir)?,
         Command::RelayTicket => relay::create_ticket(&dir)?,
+        #[cfg(all(unix, feature = "private-relay"))]
+        Command::PrivateRelayInit { public_udp, url } => {
+            private_relay::init(&dir, public_udp, url)?
+        }
+        #[cfg(all(unix, feature = "private-relay"))]
+        Command::PrivateRelay {
+            udp_bind,
+            relay_bind,
+        } => private_relay::run(dir, udp_bind, relay_bind).await?,
+        #[cfg(all(unix, feature = "private-relay"))]
+        Command::PrivateRelayAccess(command) => match command {
+            PrivateRelayAccess::Issue { label } => private_relay::access_issue(&dir, &label)?,
+            PrivateRelayAccess::List => private_relay::access_list(&dir)?,
+            PrivateRelayAccess::Revoke { id } => private_relay::access_revoke(&dir, &id)?,
+        },
+        #[cfg(all(unix, feature = "private-relay"))]
+        Command::PrivateRelayStore(command) => match command {
+            PrivateRelayStore::Check => private_relay::store_check(&dir)?,
+            PrivateRelayStore::Backup { to, final_ } => {
+                private_relay::store_backup(&dir, &to, final_)?
+            }
+            PrivateRelayStore::Restore {
+                from,
+                relay,
+                keep_incarnation,
+            } => {
+                let relay: EndpointId = relay
+                    .trim()
+                    .parse()
+                    .context("expected the relay's endpoint identity")?;
+                private_relay::store_restore(&dir, &from, &relay, keep_incarnation)?
+            }
+            PrivateRelayStore::Rotate { confirm } => {
+                anyhow::ensure!(confirm, "pass --confirm to start a new incarnation");
+                private_relay::store_rotate(&dir)?
+            }
+        },
         Command::Create {
             ticket_name: Some(name),
             ..
@@ -446,6 +616,8 @@ async fn execute(cli: Cli) -> Result<i32> {
             };
             local::expose(&dir, service, to, target).await?
         }
+        #[cfg(feature = "private-membership")]
+        Command::Private { command } => return private::cli::execute(&dir, command).await,
         Command::Connect {
             peer,
             service,

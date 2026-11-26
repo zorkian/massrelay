@@ -21,6 +21,9 @@ use crate::{
 };
 
 const CHUNK: usize = 8192;
+/// The largest TCP forwarding frame any MassRelay sender produces.
+#[cfg_attr(not(feature = "private-membership"), allow(dead_code))]
+pub const MAX_FRAME: usize = CHUNK + 1;
 
 /// Connect to the owner's chosen address, or else to either loopback address.
 pub async fn dial(port: NonZeroU16, target: Option<&str>) -> io::Result<TcpStream> {
@@ -46,11 +49,24 @@ pub async fn bridge(
     tx: &mut (impl AsyncWrite + Unpin),
     target: &mut TcpStream,
 ) -> Result<(), Broken> {
-    let (mut target_rx, mut target_tx) = target.split();
+    bridge_with(rx, tx, target, usize::MAX).await
+}
+
+/// `bridge` over any target stream (for example one whose writes are
+/// guarded), refusing peer frames longer than `max_frame`.
+pub async fn bridge_with(
+    rx: &mut (impl AsyncRead + Unpin),
+    tx: &mut (impl AsyncWrite + Unpin),
+    target: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    max_frame: usize,
+) -> Result<(), Broken> {
+    let (mut target_rx, mut target_tx) = tokio::io::split(target);
     // A failed write must not discard what the target already sent, so it is reported at the end.
     let upload = async {
         loop {
-            let frame = wire::read_frame(rx).await.map_err(|_| Broken::Peer)?;
+            let frame = wire::read_frame_max(rx, max_frame)
+                .await
+                .map_err(|_| Broken::Peer)?;
             match frame.split_first() {
                 Some((&tunnel::DATA, data)) => {
                     if let Err(error) = target_tx.write_all(data).await {

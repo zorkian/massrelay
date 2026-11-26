@@ -1,6 +1,6 @@
 [package]
 name = "massrelay"
-version = "0.3.11"
+version = "0.4.0"
 edition = "2024"
 description = "User-mode pocket networks for your own machines"
 
@@ -25,6 +25,45 @@ tokio = { version = "1", features = ["full"] }
 hmac = "0.12"
 sha2 = "0.10"
 socket2 = "0.6"
+# Keep the OpenMLS set pinned together. 0.10.0-rc.1 supplies the historical
+# per-message lifetime policy that private membership requires (Rust >= 1.94).
+openmls = { version = "=0.10.0-rc.1", optional = true }
+openmls_rust_crypto = { version = "=0.7.0-rc.1", optional = true }
+openmls_basic_credential = { version = "=0.7.0-rc.1", optional = true }
+openmls_sqlite_storage = { version = "=0.4.0-rc.1", optional = true }
+openmls_traits = { version = "=0.7.0-rc.1", optional = true }
+# Same version as openmls_sqlite_storage 0.4.0-rc.1, which enables `bundled`; the private
+# relay's slot store uses the same build.
+rusqlite = { version = "0.41", optional = true, features = ["bundled"] }
+ed25519-dalek = { version = "3", optional = true }
+
+[features]
+default = []
+# Unreleased private relay mailbox and its SQLite slot store. Experimental formats.
+private-relay = ["dep:rusqlite"]
+# Unreleased private membership and admission state. Experimental formats.
+private-membership = [
+    "dep:openmls",
+    "dep:openmls_rust_crypto",
+    "dep:openmls_basic_credential",
+    "dep:openmls_sqlite_storage",
+    "dep:openmls_traits",
+    "dep:rusqlite",
+    "dep:ed25519-dalek",
+    "private-relay",
+]
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false }

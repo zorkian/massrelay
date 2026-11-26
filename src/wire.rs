@@ -42,7 +42,22 @@ pub async fn frame(writer: &mut (impl AsyncWrite + Unpin), data: &[u8]) -> Resul
 }
 
 pub async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<Vec<u8>> {
+    read_frame_max(reader, usize::MAX).await
+}
+
+/// `read_frame`, refusing a frame longer than `max` (the largest frame the
+/// format can legitimately carry) before reading its body.
+pub async fn read_frame_max(
+    reader: &mut (impl AsyncRead + Unpin),
+    max: usize,
+) -> io::Result<Vec<u8>> {
     let len = reader.read_u32().await?;
+    if len as usize > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame longer than the format allows",
+        ));
+    }
     // Grow the buffer as bytes arrive rather than allocating the advertised length up front.
     let mut data = Vec::new();
     reader.take(u64::from(len)).read_to_end(&mut data).await?;
