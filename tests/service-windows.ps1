@@ -15,8 +15,8 @@ Run it from an elevated PowerShell in the repository, after 'cargo build --relea
 registers a service for a throwaway state directory under the user profile and removes it.
 With -Password the account keeps the "Log on as a service" right the install granted.
 
--ConPty also runs the ignored ConPTY unit tests under a service logon (session 0, no
-console, this account), by registering their executable as a throwaway service.
+-ConPty also launches PowerShell through ConPTY under a service logon (session 0,
+no interactive console) by registering a test executable as a throwaway service.
 #>
 [CmdletBinding()]
 param(
@@ -247,30 +247,26 @@ try {
             Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.executable } |
             Select-Object -Last 1 -ExpandProperty executable
         Assert ([bool]$tests) 'Could not find the unit-test executable.'
-        $log = Join-Path $root 'conpty.log'
-        $done = Join-Path $root 'conpty.exit'
-        $script = Join-Path $root 'conpty.cmd'
-        Set-Content -LiteralPath $script -Encoding ascii -Value @(
-            '@echo off'
-            "`"$tests`" conpty --ignored --test-threads=1 > `"$log`" 2>&1"
-            "echo %errorlevel% > `"$done`""
-        )
         $probe = "MassRelayConPtyProbe-$($id.Substring(0, 8))"
+        $probeExe = Join-Path $root 'probe.exe'
+        $done = Join-Path $root 'probe.result'
+        Copy-Item -LiteralPath $tests -Destination $probeExe
+        @{ name = $probe; state = $state; result = $done } | ConvertTo-Json |
+            Set-Content -LiteralPath (Join-Path $root 'probe.json') -Encoding utf8NoBOM
         $credential = [pscredential]::new("$env:COMPUTERNAME\$user", (ConvertTo-SecureString $secret -AsPlainText -Force))
-        New-Service -Name $probe -BinaryPathName "`"$env:ComSpec`" /d /c `"$script`"" -Credential $credential -StartupType Manual | Out-Null
-        # cmd.exe does not speak the service protocol, so Windows reports a failed start. It
-        # has still run the tests under a service logon.
-        try {
-            Start-Service -Name $probe
-        } catch {
-        }
-        $deadline = (Get-Date).AddSeconds(120)
+        New-Service -Name $probe -BinaryPathName "`"$probeExe`" scm_powershell_probe --ignored --test-threads=1" -Credential $credential -StartupType Manual | Out-Null
+        Start-Service -Name $probe
+        $scmProbe = Get-DeviceService $probe
+        $probeProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$($scmProbe.ProcessId)"
+        Assert ($probeProcess.SessionId -eq 0) 'The PowerShell probe did not run in the services session.'
+        $deadline = (Get-Date).AddSeconds(60)
         while (-not (Test-Path -LiteralPath $done) -and (Get-Date) -lt $deadline) {
             Start-Sleep -Milliseconds 500
         }
-        $output = if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Raw } else { '' }
-        Assert (Test-Path -LiteralPath $done) "The ConPTY tests did not finish under a service logon: $output"
-        Assert ((Get-Content -LiteralPath $done -Raw).Trim() -eq '0' -and $output -match 'test result: ok\. [1-9]') "The ConPTY tests failed under a service logon: $output"
+        Assert (Test-Path -LiteralPath $done) 'PowerShell did not finish under a service logon.'
+        $output = Get-Content -LiteralPath $done -Raw
+        Assert ($output -eq 'ok') "PowerShell failed under a service logon: $output"
+        Stop-Service -Name $probe
     }
     Write-Output "The Windows service fixture passed for $name."
 } catch {

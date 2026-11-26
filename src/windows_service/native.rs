@@ -1386,3 +1386,60 @@ fn last_error() -> u32 {
 fn os_error(code: u32) -> anyhow::Error {
     io::Error::from_raw_os_error(code as i32).into()
 }
+
+#[cfg(test)]
+mod service_fixture {
+    use super::*;
+    use serde::Deserialize;
+    use std::sync::Arc;
+    use tokio::{io::AsyncWriteExt, time::timeout};
+
+    #[derive(Deserialize)]
+    struct Probe {
+        name: String,
+        state: PathBuf,
+        result: PathBuf,
+    }
+
+    #[test]
+    #[ignore = "started by Windows SCM with a disposable service configuration"]
+    fn scm_powershell_probe() -> Result<()> {
+        let config = env::current_exe()?.with_extension("json");
+        let probe: Probe = serde_json::from_reader(File::open(config)?)?;
+        serve(&probe.name, probe.state, move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async {
+                let (_, recorded) = tokio::join!(until_stopped(), async {
+                    let result = match exercise_powershell().await {
+                        Ok(()) => "ok".into(),
+                        Err(error) => format!("{error:#}"),
+                    };
+                    fs::write(probe.result, result)
+                });
+                recorded?;
+                Ok(0)
+            })
+        })?;
+        Ok(())
+    }
+
+    async fn exercise_powershell() -> Result<()> {
+        let shell = PathBuf::from(powershell()?);
+        let mut pty = crate::private::pty::spawn(80, 24, Some(&shell), Arc::new(()))?;
+        let exit = pty.take_exit();
+        let teardown = pty.teardown();
+        let result = timeout(Duration::from_secs(30), async {
+            pty.writer().write_all(b"exit 37\r").await?;
+            let code = exit.await??;
+            ensure!(code == 37, "PowerShell exited with {code} instead of 37");
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        drop(pty);
+        timeout(Duration::from_secs(10), teardown.wait()).await?;
+        result??;
+        Ok(())
+    }
+}
