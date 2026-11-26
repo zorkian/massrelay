@@ -110,6 +110,8 @@ Run `massrelay logs` to read recent diagnostics for the selected profile, or `ma
 
 Run `massrelay status` in another terminal to see active inbound and outbound shells and port forwards. Each row shows the peer, service, and current route. Run `massrelay list` to see the shell and port permissions on this device, including defaults, exclusions, and temporary exposures with their targets. `massrelay peers` shows membership, approvals, and pairing state.
 
+`status` also shows the client and running daemon versions, alongside each member's last reported version and when it was observed. Devices share version reports over an encrypted connection after mutual pairing. Older peers can still connect and show up as `unknown` until they send a report. Observations are kept locally so they remain visible when the runtime is stopped.
+
 ## How connections work
 
 The forwarding relay can see the endpoint IDs it forwards between, their relay-facing IP addresses, and the size and timing of encrypted packets. Shell and port traffic remains end-to-end encrypted on either route. The forwarding relay cannot read the service type, destination service port, or payload.

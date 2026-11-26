@@ -416,6 +416,9 @@ def _exercise(binary, root, processes):
 
     eventually(lambda: shows_connection("a", "inbound", "bob", "shell"), "inbound shell status")
     eventually(lambda: shows_connection("b", "outbound", "alice", "shell"), "outbound shell status")
+    version = subprocess.check_output([binary, "--version"], text=True).strip().rsplit(" ", 1)[1]
+    eventually(lambda: f"bob\t{version}\t20" in status("a"), "inbound peer version")
+    eventually(lambda: f"alice\t{version}\t20" in status("b"), "outbound peer version")
     os.kill(relay.pid, signal.SIGSTOP)
     try:
         time.sleep(3)  # at least two pass intervals: a membership call is now in flight
@@ -432,6 +435,7 @@ def _exercise(binary, root, processes):
         assert "the profile is released" in shutdown_log, shutdown_log
         assert process_gone(shell_pid), "the runtime stopped and reaped its shell"
         assert "Runtime: not running" in status("a")
+        assert f"bob\t{version}\t20" in status("a")
         run_a = run("a")
         assert json.loads(profile_file.read_text())["udp_port"] == previous_port
     finally:

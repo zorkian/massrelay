@@ -121,6 +121,7 @@ use super::mailbox::Mailbox;
 use super::membership::{Clock, Device};
 use super::pairing::{self, Decision, Owner, PairError, PairingState, Refusal};
 use super::service::{CLOSE_AUTHORITY_ENDED, CLOSE_DONE, Node, PrivateRequest, ServiceStream};
+use super::versions::{Observation, Observations, PeerVersions};
 
 /// The private runtime's local control channel.
 pub const CONTROL: Channel = Channel {
@@ -232,6 +233,9 @@ pub enum ControlReply {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusView {
     pub endpoint: String,
+    /// Version of the executable that produced this view.
+    #[serde(default)]
+    pub version: Option<String>,
     /// Read from the running owner (`true`) or without one (`false`).
     pub running: bool,
     /// Established service connections (running owner only).
@@ -272,6 +276,8 @@ pub struct PeerView {
     /// The peer's newest decision proved on an authenticated exchange.
     pub remote: String,
     pub paired: bool,
+    #[serde(default)]
+    pub version: Option<Observation>,
 }
 
 fn decision(d: &Decision) -> String {
@@ -290,7 +296,13 @@ fn view(
     running: bool,
     last_sync: Option<String>,
     halt: Option<String>,
+    versions: &Observations,
 ) -> StatusView {
+    let report = |key: &EndpointKey| {
+        EndpointId::from_bytes(key)
+            .ok()
+            .and_then(|id| versions.get(&id).cloned())
+    };
     let mut peers: Vec<PeerView> = st
         .peers
         .iter()
@@ -301,6 +313,7 @@ fn view(
             local: decision(&p.local),
             remote: decision(&p.remote),
             paired: p.pairing.is_some(),
+            version: report(&p.endpoint),
         })
         .collect();
     for key in roster {
@@ -312,6 +325,7 @@ fn view(
                 local: "none".into(),
                 remote: "none".into(),
                 paired: false,
+                version: report(key),
             });
         }
     }
@@ -338,6 +352,7 @@ fn view(
     let exclusions = st.exclusions.iter().map(|(k, s)| (hex(k), *s)).collect();
     StatusView {
         endpoint: hex(endpoint),
+        version: Some(env!("CARGO_PKG_VERSION").into()),
         running,
         connections: vec![],
         peers,
@@ -357,7 +372,15 @@ pub fn offline_status<M: Mailbox>(device: &Device<M>) -> Result<StatusView, Pair
     let st = pairing::read_state(device)?;
     let roster = device.roster().unwrap_or_default();
     let halt = state.halt.map(|h| format!("{h:?}"));
-    Ok(view(&state.endpoint, &roster, &st, false, None, halt))
+    Ok(view(
+        &state.endpoint,
+        &roster,
+        &st,
+        false,
+        None,
+        halt,
+        &PeerVersions::read(device.store().dir()),
+    ))
 }
 
 /// An endpoint key written as 64 hex digits or in Iroh's own form.
@@ -817,6 +840,7 @@ fn manage<M: Mailbox + Send + Sync + 'static>(
                     true,
                     last,
                     node.halt().map_err(err)?,
+                    &node.version_observations(),
                 );
                 v.connections = node.log().connections();
                 v.exposures = node

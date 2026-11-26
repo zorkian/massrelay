@@ -43,6 +43,7 @@ mod routes;
 pub mod runtime;
 pub mod service;
 pub mod store;
+mod versions;
 
 /// The real relay adapter, over the portable mailbox client.
 pub mod relay_mailbox;

@@ -96,6 +96,7 @@ use crate::{tcp, terminal, udp};
 use super::audit::{self, DeviceLog, Tracked};
 use super::pty;
 use super::routes::Routes;
+use super::versions::{Exchange, Observations, PeerVersions};
 
 use super::binding::EndpointKey;
 use super::codec::{Dec, Enc, hex};
@@ -290,6 +291,7 @@ pub struct Node<M: Mailbox> {
     workers: Arc<()>,
     log: Arc<DeviceLog>,
     routes: Routes,
+    versions: Arc<PeerVersions>,
 }
 
 impl<M: Mailbox + Send + Sync + 'static> Node<M> {
@@ -312,6 +314,7 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
         let endpoint = device.state()?.endpoint;
         log.set_own(endpoint);
         let routes = Routes::open(device.store().dir());
+        let versions = Arc::new(PeerVersions::open(device.store().dir()));
         Ok(Arc::new(Self {
             device,
             owner,
@@ -320,11 +323,16 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
             workers: Arc::new(()),
             log,
             routes,
+            versions,
         }))
     }
 
     pub fn log(&self) -> &DeviceLog {
         &self.log
+    }
+
+    pub(super) fn version_observations(&self) -> Observations {
+        self.versions.observations()
     }
 
     pub async fn watch_routes(&self, conn: &Connection) {
@@ -618,6 +626,8 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
                 return Ended::NotAuthorized(format!("{e:?}"));
             }
         };
+        let auth = Arc::new(auth);
+        let _versions = self.versions.exchange(&conn, &auth);
         let (ended, session) = tokio::select! {
             biased;
             _ = self.watch_routes(&conn) => unreachable!("route watcher stays pending"),
@@ -852,6 +862,8 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
             .await
             .map_err(|e| local(&e))?;
         let (auth, mut tx, mut rx) = self.peers().authorize(&conn, true).await?;
+        let auth = Arc::new(auth);
+        let versions = self.versions.exchange(&conn, &auth);
         let io = async {
             crate::wire::frame(&mut tx, &req.encode())
                 .await
@@ -884,6 +896,7 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
             tx,
             rx,
             reply,
+            _versions: versions,
         })
     }
 }
@@ -997,11 +1010,12 @@ pub struct ServiceStream {
     pub conn: Connection,
     /// Disjoint from the streams, so `auth.done()` can be awaited while
     /// they are copied.
-    pub auth: Authorization,
+    pub auth: Arc<Authorization>,
     pub service: Service,
     pub tx: SendStream,
     pub rx: RecvStream,
     pub reply: ServiceReply,
+    _versions: Exchange,
 }
 
 impl ServiceStream {

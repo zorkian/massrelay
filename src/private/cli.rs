@@ -1064,6 +1064,7 @@ async fn status(dir: &Path) -> Result<()> {
         }
     }
     println!("Endpoint: {endpoint}");
+    println!("Client version: {}", env!("CARGO_PKG_VERSION"));
     println!(
         "Relay: {} incarnation {}",
         profile.locator.server.id,
@@ -1087,14 +1088,14 @@ async fn status(dir: &Path) -> Result<()> {
         return Ok(());
     }
     let view = current_view(dir).await?;
-    println!(
-        "Runtime: {}",
-        if view.running {
-            "running"
-        } else {
-            "not running"
-        }
-    );
+    if view.running {
+        println!(
+            "Runtime: running (version {})",
+            view.version.as_deref().unwrap_or("unknown")
+        );
+    } else {
+        println!("Runtime: not running");
+    }
     let members = view.peers.iter().filter(|p| p.member).count() + 1;
     match &view.halt {
         Some(h) => println!("Membership: halted: {}", crate::visible(h)),
@@ -1102,6 +1103,25 @@ async fn status(dir: &Path) -> Result<()> {
             "Membership: {members} members, epoch {}",
             st.net.map_or(0, |n| n.epoch)
         ),
+    }
+    let mut versions = vec![["PEER", "VERSION", "REPORTED (UTC)"].map(String::from)];
+    for peer in view.peers.iter().filter(|peer| peer.member) {
+        let label = peer.alias.as_deref().unwrap_or(&peer.key);
+        let (version, observed) = match &peer.version {
+            Some(report) => (
+                report.version.as_str(),
+                i64::try_from(report.observed_at)
+                    .ok()
+                    .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+                    .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                    .unwrap_or_else(|| "-".into()),
+            ),
+            None => ("unknown", "-".into()),
+        };
+        versions.push([crate::visible(label), crate::visible(version), observed]);
+    }
+    if versions.len() > 1 {
+        crate::print_table(&versions, io::stdout().is_terminal());
     }
     let list = |services: &[Service]| {
         if services.is_empty() {
