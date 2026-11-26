@@ -178,6 +178,8 @@ try {
     Assert ($owner.User -eq $user) "The service process belongs to $($owner.User)."
     Assert (Test-Runtime) 'The runtime does not answer local commands under the service.'
     Assert (Get-Acl -LiteralPath $marker).AreAccessRulesProtected 'The control key inherits the directory ACL.'
+    $audit = Join-Path $state 'connections.jsonl'
+    Assert (Get-Acl -LiteralPath $audit).AreAccessRulesProtected 'The audit log inherits the directory ACL.'
     $logged = Invoke-Device @('logs')
     Assert ($logged.ExitCode -eq 0 -and $logged.Output -match 'the runtime started') "Service diagnostics did not reach the Windows Event Log: $($logged.Output) $($logged.Error)"
     $first = $service.ProcessId
@@ -198,6 +200,13 @@ try {
     Assert ($service.ExitCode -eq 0) "The service reported exit code $($service.ExitCode) for a requested stop."
     # The runtime removes its marker only in its ordered stop.
     Assert (-not (Test-Path -LiteralPath $marker)) 'The runtime did not stop in order.'
+
+    & icacls.exe $audit /grant '*S-1-5-32-545:(R)' | Out-Null
+    Assert ($LASTEXITCODE -eq 0) 'Could not make the deliberately readable audit log.'
+    $refused = Invoke-Device @('start')
+    Assert ($refused.ExitCode -ne 0) 'A readable audit log was accepted.'
+    & icacls.exe $audit /remove:g '*S-1-5-32-545' | Out-Null
+    Assert ($LASTEXITCODE -eq 0) 'Could not restore the private audit log permissions.'
 
     foreach ($attempt in 1..2) {
         $started = Invoke-Device @('start')

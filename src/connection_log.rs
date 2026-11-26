@@ -1,5 +1,5 @@
 use std::{
-    fs::{File, OpenOptions},
+    fs::File,
     io::Write,
     path::Path,
     sync::{
@@ -88,15 +88,20 @@ impl ConnectionLog {
     pub fn open(path: Option<&Path>) -> Result<Self> {
         let file = path
             .map(|path| {
-                let mut opts = OpenOptions::new();
-                opts.create(true).append(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    opts.mode(0o600);
-                }
-                opts.open(path)
-                    .with_context(|| format!("open event log {}", path.display()))
+                #[cfg(windows)]
+                let file = crate::windows_service::private_audit(path);
+                #[cfg(not(windows))]
+                let file = (|| {
+                    let mut opts = std::fs::OpenOptions::new();
+                    opts.create(true).append(true);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        opts.mode(0o600);
+                    }
+                    Ok::<_, anyhow::Error>(opts.open(path)?)
+                })();
+                file.with_context(|| format!("open event log {}", path.display()))
                     .map(Mutex::new)
             })
             .transpose()?;

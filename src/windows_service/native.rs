@@ -41,7 +41,8 @@ use windows_sys::Win32::{
         },
         Authorization::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-            ConvertStringSidToSidW, GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+            ConvertStringSidToSidW, GetNamedSecurityInfoW, GetSecurityInfo, SDDL_REVISION_1,
+            SE_FILE_OBJECT,
         },
         CheckTokenMembership, CreateWellKnownSid, DACL_SECURITY_INFORMATION, GetAce,
         GetTokenInformation, LOGON32_LOGON_SERVICE, LOGON32_PROVIDER_DEFAULT, LogonUserW,
@@ -49,8 +50,9 @@ use windows_sys::Win32::{
         SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid,
     },
     Storage::FileSystem::{
-        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        CREATE_NEW, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS, READ_CONTROL,
     },
     System::{
         Console::{
@@ -540,43 +542,46 @@ fn check_private_profile(path: &Path, account: &Account) -> Result<()> {
     Ok(())
 }
 
-/// Create the control marker with its own ACL before writing the control key.
-pub fn private_marker(dir: &Path) -> Result<tempfile::NamedTempFile> {
-    let account = Account::current()?;
-    let sddl = wide(format!(
-        "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{})",
-        account.sid
-    ))?;
-    let mut descriptor = null_mut();
-    // SAFETY: `sddl` is NUL-terminated and the output is writable.
-    ensure!(
-        unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl.as_ptr(),
-                SDDL_REVISION_1,
-                &mut descriptor,
-                null_mut(),
-            )
-        } != 0,
-        "prepare the control file permissions: {}",
-        io::Error::last_os_error()
-    );
-    let access = SECURITY_ATTRIBUTES {
-        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: descriptor,
-        bInheritHandle: 0,
-    };
-    let file = tempfile::Builder::new().make_in(dir, |path| {
+struct PrivateFile(SECURITY_ATTRIBUTES);
+
+impl PrivateFile {
+    fn new(account: &Account) -> Result<Self> {
+        let sddl = wide(format!(
+            "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{})",
+            account.sid
+        ))?;
+        let mut descriptor = null_mut();
+        // SAFETY: `sddl` is NUL-terminated and the output is writable.
+        ensure!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    null_mut(),
+                )
+            } != 0,
+            "prepare private file permissions: {}",
+            io::Error::last_os_error()
+        );
+        Ok(Self(SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        }))
+    }
+
+    fn open(&self, path: &Path, access: u32, disposition: u32) -> io::Result<File> {
         let name: Vec<_> = path.as_os_str().encode_wide().chain([0]).collect();
         // SAFETY: the path is NUL-terminated and the security descriptor is live.
         let handle = unsafe {
             CreateFileW(
                 name.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
+                access,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                &access,
-                CREATE_NEW,
-                FILE_ATTRIBUTE_NORMAL,
+                &self.0,
+                disposition,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
                 null_mut(),
             )
         };
@@ -585,29 +590,86 @@ pub fn private_marker(dir: &Path) -> Result<tempfile::NamedTempFile> {
         }
         // SAFETY: this is a new owned file handle.
         Ok(unsafe { File::from_raw_handle(handle) })
-    });
-    // SAFETY: Windows allocated the descriptor and the call above has returned.
-    unsafe { LocalFree(descriptor) };
-    file.context("create a private control marker")
+    }
+}
+
+impl Drop for PrivateFile {
+    fn drop(&mut self) {
+        // SAFETY: Windows allocated this descriptor and all opens have returned.
+        unsafe { LocalFree(self.0.lpSecurityDescriptor) };
+    }
+}
+
+/// Create the control marker with its own ACL before writing the control key.
+pub fn private_marker(dir: &Path) -> Result<tempfile::NamedTempFile> {
+    let permissions = PrivateFile::new(&Account::current()?)?;
+    tempfile::Builder::new()
+        .make_in(dir, |path| {
+            permissions.open(path, GENERIC_READ | GENERIC_WRITE, CREATE_NEW)
+        })
+        .context("create a private control marker")
+}
+
+pub fn private_audit(path: &Path) -> Result<File> {
+    let account = Account::current()?;
+    // Windows applies the descriptor only when creating a new file.
+    let file = PrivateFile::new(&account)?.open(
+        path,
+        FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL,
+        OPEN_ALWAYS,
+    )?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+        "the audit log must be a regular file"
+    );
+    let permissions = read_security(path, |owner, dacl, descriptor| {
+        // SAFETY: the handle is live and the outputs are writable.
+        unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                owner,
+                null_mut(),
+                dacl,
+                null_mut(),
+                descriptor,
+            )
+        }
+    })?;
+    ensure!(
+        super::untrusted(&permissions, Role::Private, &account.sid).is_none(),
+        "the audit log has unsafe permissions; restrict access before restarting MassRelay"
+    );
+    Ok(file)
 }
 
 fn security(path: &Path) -> Result<Security> {
     let name = wide(path)?;
+    read_security(path, |owner, dacl, descriptor| {
+        // SAFETY: `name` is NUL-terminated and the outputs are writable.
+        unsafe {
+            GetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                owner,
+                null_mut(),
+                dacl,
+                null_mut(),
+                descriptor,
+            )
+        }
+    })
+}
+
+fn read_security(
+    path: &Path,
+    get: impl FnOnce(&mut PSID, &mut *mut ACL, &mut *mut c_void) -> u32,
+) -> Result<Security> {
     let (mut owner, mut dacl, mut descriptor) = (null_mut(), null_mut::<ACL>(), null_mut());
-    // SAFETY: `name` is NUL-terminated. `owner` and `dacl` receive pointers into
-    // `descriptor`, which is freed below after its last use.
-    let code = unsafe {
-        GetNamedSecurityInfoW(
-            name.as_ptr(),
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-            &mut owner,
-            null_mut(),
-            &mut dacl,
-            null_mut(),
-            &mut descriptor,
-        )
-    };
+    let code = get(&mut owner, &mut dacl, &mut descriptor);
     if code != 0 {
         return Err(os_error(code).context(format!("read the permissions of {}", path.display())));
     }
