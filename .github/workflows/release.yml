@@ -59,6 +59,11 @@ jobs:
         if: runner.os == 'Windows'
         timeout-minutes: 3
         run: cargo +stable test --locked --release conpty -- --ignored --test-threads=1
+      - name: Test Windows background service
+        if: runner.os == 'Windows'
+        timeout-minutes: 10
+        shell: pwsh
+        run: ./tests/service-windows.ps1 -ResetAccountPassword -ConPty
       - run: cargo +stable test --locked --release -- --test-threads=1
       - name: Repeat private membership publication on an independent x64 host
         if: matrix.runner == 'ubuntu-22.04'
@@ -92,11 +97,6 @@ jobs:
           ./tests/install-windows.ps1
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./tests/install-windows.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Test Windows background service
-        if: runner.os == 'Windows'
-        timeout-minutes: 10
-        shell: pwsh
-        run: ./tests/service-windows.ps1 -ResetAccountPassword -ConPty
       - name: Stage binary
         shell: bash
         env:

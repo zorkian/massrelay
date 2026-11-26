@@ -726,17 +726,20 @@ fn token_info(token: &Handle, class: TOKEN_INFORMATION_CLASS) -> io::Result<Vec<
     let mut bytes = 0u32;
     // SAFETY: a size query; nothing is written but `bytes`.
     unsafe { GetTokenInformation(token.0, class, null_mut(), 0, &mut bytes) };
-    let mut buf = vec![0u64; (bytes as usize).div_ceil(8).max(1)];
-    // SAFETY: `buf` is writable for the length given.
+    if bytes == 0 {
+        return Err(pty_error(
+            &format!("size of token information class {class}"),
+            io::Error::last_os_error(),
+        ));
+    }
+    let mut buf = vec![0u64; (bytes as usize).div_ceil(8)];
+    // The allocation is rounded up for alignment. Win32 requires the
+    // exact requested length for fixed-size information classes.
+    // SAFETY: `buf` is writable for at least `bytes` bytes.
     check(unsafe {
-        GetTokenInformation(
-            token.0,
-            class,
-            buf.as_mut_ptr().cast(),
-            std::mem::size_of_val(buf.as_slice()) as u32,
-            &mut bytes,
-        )
-    })?;
+        GetTokenInformation(token.0, class, buf.as_mut_ptr().cast(), bytes, &mut bytes)
+    })
+    .map_err(|error| pty_error(&format!("read token information class {class}"), error))?;
     Ok(buf)
 }
 
