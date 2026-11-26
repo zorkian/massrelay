@@ -760,11 +760,21 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
     pub async fn open_service(
         &self,
         endpoint: &Endpoint,
-        addr: EndpointAddr,
+        mut addr: EndpointAddr,
         req: PrivateRequest,
     ) -> Result<ServiceStream, PairError> {
         self.check_endpoint(endpoint)?;
         let local = |e: &dyn std::fmt::Display| PairError::Local(format!("service: {e}"));
+        // Preserve the pinned identity and relay while offering direct paths
+        // learned by Iroh during earlier connections to this peer.
+        if let Some(remote) = endpoint.remote_info(addr.id).await {
+            addr.addrs.extend(
+                remote
+                    .into_addrs()
+                    .map(|info| info.into_addr())
+                    .filter(|candidate| matches!(candidate, iroh::TransportAddr::Ip(_))),
+            );
+        }
         let conn = endpoint
             .connect(addr, SERVICE_ALPN)
             .await

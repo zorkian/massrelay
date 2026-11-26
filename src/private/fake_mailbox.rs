@@ -239,7 +239,9 @@ impl FsMailbox {
     fn create_if_absent(&self, target: &Path, bytes: &[u8]) -> Result<CreateOutcome, MailboxError> {
         let tmp = self.dir.join("tmp").join(hex(&random::<12>()));
         fs::write(&tmp, bytes).map_err(|e| MailboxError::Uncertain(e.to_string()))?;
-        fs::File::open(&tmp)
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&tmp)
             .and_then(|f| f.sync_all())
             .map_err(|e| MailboxError::Uncertain(e.to_string()))?;
         let r = match fs::hard_link(&tmp, target) {

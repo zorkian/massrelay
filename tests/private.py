@@ -340,9 +340,12 @@ def _exercise(binary, root, processes):
     private("a", "enable", "shell", "bob")
     terminal("b", "alice", True)
 
-    # --------------------------------------------- direct path with the relay down
+    # The native shell/TCP/UDP test establishes direct routes with the mailbox
+    # offline. This CLI fixture uses relay discovery, so a previous call alone
+    # says nothing about whether Iroh has negotiated a direct path.
     stop_relay(relay)
-    terminal("b", "alice", True)
+    assert b in status("a")
+    assert a in status("b")
     relay = start_relay()
 
     # ------------------------------- stop while a relay call stalls and a shell is live
