@@ -328,17 +328,25 @@ impl PairingState {
         }
     }
 
-    fn check_alias_binding(&self, alias: &str, peer: &EndpointKey) -> Result<(), PairError> {
-        if let Some(other) = self
-            .peers
-            .iter()
-            .find(|p| p.alias == alias && &p.endpoint != peer)
-        {
+    fn claim_alias(
+        &mut self,
+        view: &MemberView,
+        alias: &str,
+        peer: &EndpointKey,
+    ) -> Result<(), PairError> {
+        let conflicts = |p: &PeerRecord| p.alias == alias && &p.endpoint != peer;
+        let retired = |p: &PeerRecord| {
+            view.revoked.contains(&p.endpoint) || view.local_cutoffs.contains(&p.endpoint)
+        };
+        if let Some(other) = self.peers.iter().find(|p| conflicts(p) && !retired(p)) {
             return Err(PairError::Alias(format!(
                 "alias {alias:?} is bound to {}",
                 hex(&other.endpoint)
             )));
         }
+        // Retired endpoints cannot use the pairing again. Leave their
+        // membership cutoff and audit history intact while releasing this label.
+        self.peers.retain(|p| !conflicts(p));
         Ok(())
     }
 
@@ -1350,7 +1358,7 @@ impl<'d, 'o, M: Mailbox> Peers<'d, 'o, M> {
             if let Some(why) = view.ineligible(peer) {
                 return Err(Refusal::NotMember(why).into());
             }
-            st.check_alias_binding(alias, peer)?;
+            st.claim_alias(view, alias, peer)?;
             let fresh = Decision::Approve { approval: random() };
             match st.peer_mut(peer) {
                 None => {
@@ -1402,7 +1410,7 @@ impl<'d, 'o, M: Mailbox> Peers<'d, 'o, M> {
             if let Some(why) = view.ineligible(&key) {
                 return Err(Refusal::NotMember(why).into());
             }
-            st.check_alias_binding(alias, &key)?;
+            st.claim_alias(&view, alias, &key)?;
             let peer = st.peer_mut(&key).ok_or_else(|| {
                 PairError::Alias("this endpoint has no local alias to rename".into())
             })?;

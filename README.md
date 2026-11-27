@@ -72,7 +72,7 @@ Pairing completes on the next connection attempt. You can set a grant before pai
 
 Run `massrelay ping PEER` to send four encrypted QUIC datagram probes and see round-trip times and packet loss. Set the count with `-c`. Ping requires mutual approval and works over direct or relayed connections. Upgrade and restart both devices' daemons to use ping.
 
-Run `massrelay rename PEER NEW_NAME` to change an existing local alias. Select the peer by its current alias or exact endpoint ID. The new name applies on this device only and preserves the peer's pairing, permissions, and active connections.
+Run `massrelay rename PEER NEW_NAME` to change an existing local alias. Select the peer by its current alias or exact endpoint ID. The new name applies on this device only and preserves the peer's pairing, permissions, and active connections. You can reuse aliases from revoked peers. Restart the daemon after upgrading to use rename.
 
 Run `massrelay decline PEER` to end a pairing. Run `massrelay revoke PEER` to cut off the peer locally and remove it from the network when membership sync completes.
 

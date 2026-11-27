@@ -848,9 +848,12 @@ fn manage<M: Mailbox + Send + Sync + 'static>(
     let err = |e: PairError| format!("{e:?}");
     let run = || -> Result<ControlReply, String> {
         if let ControlRequest::Rename { peer, alias } = &request {
-            return Ok(ControlReply::Changed(
-                node.rename(peer, alias).map_err(err)?,
-            ));
+            return Ok(ControlReply::Changed(node.rename(peer, alias).map_err(
+                |e| match e {
+                    PairError::Alias(message) => message,
+                    other => err(other),
+                },
+            )?));
         }
         let st = node.pairing_state().map_err(err)?;
         let peer = |s: &str| st.resolve_selector(s);
@@ -1024,7 +1027,7 @@ async fn ping_peer<M: Mailbox + Send + Sync + 'static>(
         .node
         .pairing_state()
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    let key = resolve(&state, peer).map_err(anyhow::Error::msg)?;
+    let key = state.resolve_selector(peer).map_err(anyhow::Error::msg)?;
     let addr = peer_address(shared, &key)?;
     let opened = timeout(
         wire::RPC_TIMEOUT * 2,

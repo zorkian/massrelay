@@ -5237,18 +5237,25 @@ mod runtime {
             alias: alias.into(),
         };
         assert!(matches!(
-            cmd(&bob, approve(&carol, "carol")).await,
+            cmd(&bob, approve(&carol, "workstation")).await,
             ControlReply::Approved { fresh: true, .. }
         ));
         let before = crate::private::pairing::read_state(&bob.dev).unwrap();
         let mut expected = before.peer(&alice.ep).unwrap().clone();
         assert!(expected.pairing.is_some());
-        for unavailable in ["carol".to_owned(), key(&carol)] {
+        for unavailable in ["workstation".to_owned(), key(&carol)] {
             assert!(matches!(
                 cmd(&bob, rename("alice", &unavailable)).await,
                 ControlReply::Error(_)
             ));
         }
+        let revoke = ControlRequest::Revoke {
+            peer: "workstation".into(),
+        };
+        assert!(matches!(
+            cmd(&bob, revoke).await,
+            ControlReply::CutOff { .. }
+        ));
         assert_eq!(
             cmd(&bob, rename("alice", "workstation")).await,
             ControlReply::Changed(true)
@@ -5260,7 +5267,7 @@ mod runtime {
         let after = crate::private::pairing::read_state(&bob.dev).unwrap();
         expected.alias = "workstation".into();
         assert_eq!(after.peer(&alice.ep), Some(&expected));
-        assert_eq!(after.peer(&carol.ep), before.peer(&carol.ep));
+        assert!(after.peer(&carol.ep).is_none());
         let enable_port = |peer: &str| ControlRequest::Enable {
             peer: peer.into(),
             service: tcp(port),
