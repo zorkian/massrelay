@@ -110,7 +110,9 @@ On Windows, open PowerShell as administrator under the same account that enrolle
 
 Linux uses a systemd user unit. macOS uses a LaunchAgent in your login session.
 
-Run `massrelay logs` to read recent diagnostics for the selected profile, or `massrelay logs --follow` for new messages. Diagnostics use journald on Linux, Unified Logging on macOS, and Windows Event Log. The operating system manages retention. The separate JSONL connection audit file contains one event per line. Use `massrelay run --log-file PATH` to select its location. Install and run print the audit path.
+Run `massrelay logs` to read recent runtime diagnostics, peer approvals, service grants, and inbound and outbound connections for the selected profile. Add `--follow` to keep reading both sources as new entries arrive. Diagnostics use journald on Linux, Unified Logging on macOS, and Windows Event Log. The operating system manages retention.
+
+Lines marked `[audit]` come from local JSONL files. MassRelay checks `connections.jsonl` in the state directory and, on macOS, the profile's LaunchAgent audit in `~/Library/Logs`. The command scans up to the last 1 MiB of each audit file and shows up to 200 recent records per file. Install and run print the audit path. If you used `massrelay run --log-file PATH`, read that audit with `massrelay logs --log-file PATH`.
 
 ## Inspect a running device
 

@@ -14,6 +14,11 @@ use crate::{ServiceAction, default_state_dir, private::cli};
 
 const LABEL: &str = "com.massrelay.client";
 
+/// The audit path used by installed LaunchAgents, including older installs.
+pub fn audit_path(dir: &Path) -> Result<PathBuf> {
+    Ok(Job::for_profile(dir)?.events)
+}
+
 pub fn install(dir: &Path) -> Result<()> {
     cli::check_enrolled(dir)?;
     let dir = dir

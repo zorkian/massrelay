@@ -565,8 +565,9 @@ def _exercise(binary, root, processes):
     # private to this account, so it names no device, peer, credential, target or payload.
     if Path("/run/systemd/journal/socket").exists() and shutil.which("journalctl"):
         def diagnostics(state, last):
+            audit = ("--log-file", str(root / "laptop-events.jsonl")) if state == "b" else ()
             return eventually(
-                lambda: (text := cli(state, "logs").stdout).rstrip().endswith(last) and text,
+                lambda: (text := cli(state, "logs", *audit).stdout).rstrip().endswith(last) and text,
                 f"{state} diagnostics end with {last!r}",
             )
 
@@ -576,9 +577,15 @@ def _exercise(binary, root, processes):
             assert recorded in logs["a"], logs["a"]
         removed = "this device was removed from the network"
         assert removed in logs["b"] and removed not in logs["a"] + logs["c"], logs
-        for secret in [a, b, key("c"), relay_locator, invite, target, "LIVE_SHELL", "alice",
+        assert "[audit] approval granted" in logs["a"], logs["a"]
+        assert "[audit] service enabled shell" in logs["a"], logs["a"]
+        assert "[audit] connected inbound" in logs["a"], logs["a"]
+        assert "[audit] connected outbound" in logs["b"], logs["b"]
+        for secret in [a, b, key("c"), relay_locator, invite, target, "LIVE_SHELL",
                        "renamed-workstation", "renamed-laptop"]:
             assert secret not in "".join(logs.values()), secret
+        assert all("alice" not in line for text in logs.values() for line in text.splitlines()
+                   if " [audit] " not in line), logs
 
         follower = popen("a", "logs", "--follow")
         try:
@@ -586,6 +593,8 @@ def _exercise(binary, root, processes):
             again = run("a")
             try:
                 read_line(follower.stdout, f"massrelay[{again.pid}]: the runtime started")
+                cli("a", "status")
+                read_line(follower.stdout, "[audit] local control status")
             finally:
                 finish(again)
         finally:

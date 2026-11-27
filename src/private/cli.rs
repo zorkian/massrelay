@@ -21,7 +21,7 @@
 //!   the runtime's owner.
 //!   Its diagnostics go to the host's native log (`super::diagnostics`), in the foreground and
 //!   under a service manager alike; the connection audit stays in its own JSONL file.
-//! - `logs` prints the profile's recent diagnostics from that log, and follows it on request.
+//! - `logs` reads both native diagnostics and the profile's local connection audit.
 //! - `rename NEW_NAME` sets the profile's display name through the running owner or under the
 //!   offline owner lock. `rename PEER NEW_NAME` changes a local alias through the running owner.
 //! - Every other command talks to the running runtime over its authenticated local control
@@ -150,11 +150,14 @@ pub enum Command {
         #[arg(value_name = "NEW_NAME")]
         new_name: Option<String>,
     },
-    /// Show this device’s recent diagnostics from the system log.
+    /// Show this device’s recent diagnostics and connection audit.
     Logs {
-        /// Keep printing new diagnostics as they are written.
+        /// Keep printing new events as they are written.
         #[arg(long, short)]
         follow: bool,
+        /// Read the connection audit from this file instead of the profile defaults.
+        #[arg(long, value_name = "PATH")]
+        log_file: Option<PathBuf>,
     },
     /// List members and pairing decisions, by endpoint key and local alias.
     Peers {
@@ -270,7 +273,7 @@ pub async fn execute(state_dir: &Path, command: Command) -> Result<i32> {
             let ran = run(
                 &dir,
                 shell,
-                log_file.unwrap_or_else(|| state_dir.join("connections.jsonl")),
+                log_file.unwrap_or_else(|| state_dir.join(super::audit::EVENT_FILE)),
                 bind,
                 sync_every,
             )
@@ -289,7 +292,9 @@ pub async fn execute(state_dir: &Path, command: Command) -> Result<i32> {
             name_or_peer,
             new_name: None,
         } => rename_self(&dir, name_or_peer).await?,
-        Command::Logs { follow } => return diagnostics::show(state_dir, follow),
+        Command::Logs { follow, log_file } => {
+            return diagnostics::show(state_dir, follow, log_file.as_deref()).await;
+        }
         Command::Peers { full } => peers(&dir, full).await?,
         Command::Ping { peer, count } => return ping(&dir, &peer, count).await,
         Command::Approve {

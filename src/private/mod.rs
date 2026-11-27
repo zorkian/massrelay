@@ -23,11 +23,13 @@
 //! - `runtime`: the thin foreground runtime (owner, listener, authenticated
 //!   local control on its own channel, outbound attach, ordered stop).
 //! - `audit`: device state, control, and connection events.
+//! - `audit_view`: history and live output from the local connection audit.
 //! - `diagnostics`: human-readable runtime diagnostics in the host's native log
 //!   (journald, Unified Logging, Windows Event Log) and their reader.
 //! - `cli`: top-level commands for the device profile.
 
 pub mod audit;
+mod audit_view;
 pub mod binding;
 pub mod cli;
 pub mod codec;

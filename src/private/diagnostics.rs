@@ -12,8 +12,8 @@
 //!
 //! The host owns storage, retention and rotation. MassRelay writes no
 //! diagnostics file of its own. The connection audit (`super::audit`,
-//! `connections.jsonl` or `--log-file`) is a separate record with its own
-//! contract and is not touched here.
+//! `connections.jsonl` or `--log-file`) stays on disk. The logs command reads
+//! it locally alongside native diagnostics.
 //!
 //! # Profiles
 //!
@@ -48,14 +48,17 @@
 
 use std::fmt::Display;
 use std::io::{self, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 
+use super::audit::EVENT_FILE;
+use super::audit_view::Tail;
 use super::codec::hex;
 
 /// How many recent entries `massrelay logs` shows.
@@ -65,8 +68,9 @@ const MAX_ENTRY: usize = 1000;
 /// A run of this many key-alphabet characters is treated as a secret.
 const SECRET_RUN: usize = 32;
 const REDACTED: &str = "[redacted]";
-const NONE_YET: &str = "No diagnostics are recorded for this profile. They are written while \
-                        'massrelay run' or the background service is running.";
+const NONE_YET: &str = "No diagnostics or connection audit events are recorded for this profile. \
+                        They are written while 'massrelay run' or the background service is running.";
+const AUDIT_POLL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Level {
@@ -238,24 +242,91 @@ fn byte_array(text: &[char]) -> Option<usize> {
 
 // ----------------------------------------------------------------- reading
 
-/// `massrelay logs`: print the profile's recent diagnostics, then, with
-/// `follow`, new ones as they are written.
-pub fn show(state_dir: &Path, follow: bool) -> Result<i32> {
-    let profile = profile_id(state_dir);
-    if follow {
-        return native::follow(&profile);
+fn audit_paths(state_dir: &Path) -> Vec<PathBuf> {
+    let foreground = state_dir.join(EVENT_FILE);
+    #[cfg(target_os = "macos")]
+    if let Ok(dir) = state_dir.canonicalize()
+        && let Ok(background) = crate::background_service::audit_path(&dir)
+        && background != dir.join(EVENT_FILE)
+    {
+        return vec![foreground, background];
     }
-    let lines = native::recent(&profile)?;
-    if lines.is_empty() {
+    vec![foreground]
+}
+
+/// Print recent audit and diagnostic entries, then optionally follow both sources.
+pub async fn show(state_dir: &Path, follow: bool, log_file: Option<&Path>) -> Result<i32> {
+    let profile = profile_id(state_dir);
+    let mut audits: Vec<_> = match log_file {
+        Some(path) => vec![Tail::new(path.to_owned(), true)],
+        None => audit_paths(state_dir)
+            .into_iter()
+            .map(|path| Tail::new(path, false))
+            .collect(),
+    };
+    let mut had_audit = false;
+    let mut audit_error = None;
+    for audit in &mut audits {
+        match audit.read(RECENT) {
+            Ok(lines) => {
+                had_audit |= !lines.is_empty();
+                if !write_lines(&lines)? {
+                    return Ok(0);
+                }
+            }
+            Err(error) => {
+                // Collect other sources and still show their history.
+                if let Some(previous) = audit_error.replace(error) {
+                    print(&format!("{previous:#}"));
+                }
+            }
+        }
+    }
+    if follow && audit_error.is_none() {
+        return native::follow(&profile, until_done(&mut audits)).await;
+    }
+    let lines = match native::recent(&profile) {
+        Ok(lines) => lines,
+        Err(error) => {
+            if let Some(audit_error) = audit_error {
+                print(&format!("{audit_error:#}"));
+            }
+            return Err(error);
+        }
+    };
+    if lines.is_empty() && !had_audit && audit_error.is_none() {
         eprintln!("{NONE_YET}");
     }
-    write_lines(&lines)?;
-    Ok(0)
+    if !write_lines(&lines)? {
+        return Ok(0);
+    }
+    audit_error.map_or(Ok(0), Err)
+}
+
+async fn until_done(audits: &mut [Tail]) -> Result<i32> {
+    tokio::select! {
+        result = follow_audits(audits) => result,
+        result = crate::shutdown() => result.map(|()| 0).map_err(Into::into),
+    }
+}
+
+async fn follow_audits(audits: &mut [Tail]) -> Result<i32> {
+    loop {
+        tokio::time::sleep(AUDIT_POLL).await;
+        for audit in &mut *audits {
+            if !write_lines(&audit.read(usize::MAX)?)? {
+                return Ok(0);
+            }
+        }
+    }
 }
 
 /// Print to standard output. A reader that stops early (a closed pipe) ends
 /// the output without an error.
 fn write_lines(lines: &[String]) -> Result<bool> {
+    if lines.is_empty() {
+        return Ok(true);
+    }
     let mut out = io::stdout().lock();
     let written = lines
         .iter()
@@ -298,14 +369,42 @@ fn capture(command: &mut Command) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Become a host log tool that prints until it is interrupted. Replacing
-/// this process leaves no child behind when only this process is signalled.
-#[cfg(unix)]
-fn become_tool(command: &mut Command) -> Result<i32> {
-    use std::os::unix::process::CommandExt;
+/// Stream the native tool while the audit is followed in the same process.
+/// On shutdown or a closed output pipe, stop and reap the child.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn stream_tool(command: Command, stop: impl Future<Output = Result<i32>>) -> Result<i32> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
 
-    let error = command.stdin(Stdio::null()).exec();
-    Err(tool_error(command, error))
+    let mut command = tokio::process::Command::from(command);
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| tool_error(command.as_std(), error))?;
+    let stream = async {
+        let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+        let mut line = Vec::new();
+        while stdout.read_until(b'\n', &mut line).await? > 0 {
+            let text = String::from_utf8_lossy(&line);
+            if !write_lines(&[text.trim_end_matches(['\r', '\n']).to_owned()])? {
+                return Ok(0);
+            }
+            line.clear();
+        }
+        let status = child.wait().await?;
+        if !status.success() {
+            bail!("could not read {} ({status})", native::FACILITY);
+        }
+        Ok(0)
+    };
+    let result = tokio::select! {
+        result = stream => result,
+        result = stop => result,
+    };
+    // kill() also waits. It succeeds when the stream already waited for the tool.
+    let stopped = child.kill().await;
+    result.and_then(|code| stopped.map(|()| code).map_err(Into::into))
 }
 
 /// One Windows event of this program, from `wevtutil`'s XML rendering.
@@ -448,8 +547,10 @@ mod native {
         Ok(text.lines().map(str::to_owned).collect())
     }
 
-    pub fn follow(profile: &str) -> Result<i32> {
-        super::become_tool(journalctl(profile).arg("--follow"))
+    pub async fn follow(profile: &str, stop: impl Future<Output = Result<i32>>) -> Result<i32> {
+        let mut command = journalctl(profile);
+        command.arg("--follow");
+        super::stream_tool(command, stop).await
     }
 }
 
@@ -529,11 +630,11 @@ mod native {
             .collect())
     }
 
-    pub fn follow(profile: &str) -> Result<i32> {
+    pub async fn follow(profile: &str, stop: impl Future<Output = Result<i32>>) -> Result<i32> {
         if !super::write_lines(&recent(profile)?)? {
             return Ok(0);
         }
-        super::become_tool(&mut log("stream", profile))
+        super::stream_tool(log("stream", profile), stop).await
     }
 }
 
@@ -679,7 +780,14 @@ mod native {
         Ok(lines(&recent_events(profile)?))
     }
 
-    pub fn follow(profile: &str) -> Result<i32> {
+    pub async fn follow(profile: &str, stop: impl Future<Output = Result<i32>>) -> Result<i32> {
+        tokio::select! {
+            result = follow_events(profile) => result,
+            result = stop => result,
+        }
+    }
+
+    async fn follow_events(profile: &str) -> Result<i32> {
         let mut events = recent_events(profile)?;
         let mut last = 0;
         loop {
@@ -687,7 +795,7 @@ mod native {
             if !super::write_lines(&lines(&events))? {
                 return Ok(0);
             }
-            std::thread::sleep(POLL);
+            tokio::time::sleep(POLL).await;
             events = query(profile, RECENT)?;
             events.retain(|event| event.record > last);
         }
@@ -729,7 +837,7 @@ mod native {
         bail!("MassRelay keeps no diagnostics log on this platform")
     }
 
-    pub fn follow(profile: &str) -> Result<i32> {
+    pub async fn follow(profile: &str, _stop: impl Future<Output = Result<i32>>) -> Result<i32> {
         recent(profile).map(|_| 0)
     }
 }

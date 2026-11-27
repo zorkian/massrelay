@@ -182,6 +182,7 @@ try {
     Assert (Get-Acl -LiteralPath $audit).AreAccessRulesProtected 'The audit log inherits the directory ACL.'
     $logged = Invoke-Device @('logs')
     Assert ($logged.ExitCode -eq 0 -and $logged.Output -match 'the runtime started') "Service diagnostics did not reach the Windows Event Log: $($logged.Output) $($logged.Error)"
+    Assert ($logged.Output -match '\[audit\] device started') "Logs did not show the Windows service audit: $($logged.Output)"
     $first = $service.ProcessId
 
     # A second install replaces the registration and restarts the one service.
