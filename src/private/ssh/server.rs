@@ -192,12 +192,17 @@ impl Prepared {
         let (local, remote) = StdStream::pair()?;
         local.set_nonblocking(true)?;
         let local = UnixStream::from_std(local)?;
+        let stderr = if cfg!(test) {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        };
         let child = self
             .command(dir)
             .arg("-i")
             .stdin(OwnedFd::from(remote.try_clone()?))
             .stdout(OwnedFd::from(remote))
-            .stderr(Stdio::null())
+            .stderr(stderr)
             .spawn()
             .context("start OpenSSH in inetd mode")?;
         Ok((

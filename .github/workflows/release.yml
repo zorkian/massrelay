@@ -55,6 +55,12 @@ jobs:
           # Each release tag can restore the corresponding default-branch cache.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo +stable build --locked --release
+      - name: Test macOS SSH through MassRelay
+        if: runner.os == 'macOS'
+        timeout-minutes: 5
+        run: |
+          /usr/bin/ssh -V
+          cargo +stable test --locked --release private_ssh -- --ignored --test-threads=1
       - name: Test Windows pseudoconsole cutoff and teardown
         if: runner.os == 'Windows'
         timeout-minutes: 3
@@ -88,7 +94,11 @@ jobs:
           done
       - name: Test native private networking and shells
         if: runner.os != 'Windows'
-        run: cargo +stable test --locked --release -- --ignored --test-threads=1
+        shell: bash
+        run: |
+          args=(--ignored --test-threads=1)
+          if [ "$RUNNER_OS" = macOS ]; then args+=(--skip private_ssh); fi
+          cargo +stable test --locked --release -- "${args[@]}"
       - name: Test the CLI workflow
         if: runner.os == 'Linux'
         run: |
