@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+allowlist=.tracked-files
+if ! git diff --cached --quiet -- "$allowlist" .githooks/pre-commit &&
+    [[ ${MASSRELAY_HUMAN_APPROVED_ALLOWLIST:-} != 1 ]]; then
+    printf '%s\n' 'The tracked-file policy may only be changed with human approval.' >&2
+    exit 1
+fi
+
+# Check the staged allowlist and staged paths, independent of unstaged edits.
+allowed=$(git show ":$allowlist" | sed '/^#/d; /^$/d')
+git ls-files --cached -z | while IFS= read -r -d '' path; do
+    case "$path" in
+        *.rs) continue ;;
+    esac
+    if [[ "$path" == *$'\n'* ]] || ! grep -Fqx -e "$path" <<< "$allowed"; then
+        printf 'Path is outside the human-approved allowlist: %q\n' "$path" >&2
+        exit 1
+    fi
+done

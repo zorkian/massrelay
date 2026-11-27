@@ -1,0 +1,21 @@
+# HUMAN APPROVAL ONLY. Add a path only after explicit approval from the human owner.
+# To commit an approved change, set MASSRELAY_HUMAN_APPROVED_ALLOWLIST=1 for that commit.
+# Rust source (*.rs) is allowed automatically. All other paths match exactly.
+.cargo/config.toml
+.githooks/pre-commit
+.github/workflows/release.yml
+.gitignore
+.tracked-files
+Cargo.lock
+Cargo.toml
+LICENSE
+README.md
+install.ps1
+install.sh
+src/private/diagnostics_oslog.c
+tests/fixtures/private-binding-signatures.txt
+tests/install-windows.ps1
+tests/network_fixtures.py
+tests/private.py
+tests/service-windows.ps1
+tests/update-systemd.sh
