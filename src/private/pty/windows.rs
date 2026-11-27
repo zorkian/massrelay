@@ -39,6 +39,7 @@
 use super::*;
 use std::ffi::{OsStr, OsString, c_void};
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::FromRawHandle;
 use std::pin::Pin;
 use std::ptr::{null, null_mut};
 use std::sync::mpsc::RecvTimeoutError;
@@ -47,10 +48,10 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, LUID,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT,
+    INVALID_HANDLE_VALUE, LUID, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAce, CheckTokenMembership,
@@ -66,16 +67,20 @@ use windows_sys::Win32::Security::{
     TokenUser, WELL_KNOWN_SID_TYPE, WinBuiltinAdministratorsSid, WinLocalSystemSid,
     WinMediumLabelSid,
 };
-use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
-use windows_sys::Win32::System::Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON};
+use windows_sys::Win32::Security::{LookupAccountSidW, SidTypeUser};
+use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType, ReadFile, WriteFile};
+use windows_sys::Win32::System::Console::{
+    COORD, ClosePseudoConsole, CreatePseudoConsole, GetStdHandle, HPCON, ResizePseudoConsole,
+    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+};
 use windows_sys::Win32::System::Pipes::{CreatePipe, PIPE_NOWAIT, SetNamedPipeHandleState};
 use windows_sys::Win32::System::Threading::{
-    CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateProcessW,
-    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
+    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
     GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    OpenProcessToken, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject,
+    OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+    PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 /// Requested buffer of each pipe. Large enough that the console host's
@@ -125,6 +130,14 @@ impl Drop for Handle {
     fn drop(&mut self) {
         // SAFETY: the handle is open and owned only by this value.
         unsafe { CloseHandle(self.0) };
+    }
+}
+
+impl From<Handle> for std::fs::File {
+    fn from(handle: Handle) -> Self {
+        let handle = std::mem::ManuallyDrop::new(handle);
+        // SAFETY: the open handle was owned by Handle and is now owned by File.
+        unsafe { Self::from_raw_handle(handle.0) }
     }
 }
 
@@ -216,7 +229,24 @@ impl Pty {
         elevated: bool,
     ) -> io::Result<Pty> {
         let identity = Identity::select(elevated)?;
-        launch(cols, rows, shell, token, &identity)
+        launch(cols, rows, shell, token, &identity, None)
+    }
+
+    pub(in crate::private) fn spawn_ssh(
+        shell: &Path,
+        arguments: &str,
+        dimensions: watch::Receiver<(u16, u16)>,
+    ) -> io::Result<Self> {
+        require_regular_process()?;
+        let (cols, rows) = *dimensions.borrow();
+        launch(
+            cols,
+            rows,
+            Some(shell),
+            Arc::new(()),
+            &Identity::Inherited,
+            Some((arguments, dimensions)),
+        )
     }
 }
 
@@ -227,6 +257,7 @@ fn launch(
     shell: Option<&Path>,
     token: Arc<()>,
     identity: &Identity,
+    ssh: Option<(&str, watch::Receiver<(u16, u16)>)>,
 ) -> io::Result<Pty> {
     let (input_read, input) = input_pipe()?;
     let (output, output_write) = pipe()?;
@@ -236,8 +267,8 @@ fn launch(
     let reaper = std::thread::Builder::new()
         .name("massrelay-private-pty-wait".into())
         .spawn(move || {
-            if let Ok((shell, console, reader, exit, stop, token)) = ready.recv() {
-                reap(shell, console, reader, exit, stop, token);
+            if let Ok((shell, console, reader, exit, stop, token, dimensions)) = ready.recv() {
+                reap(shell, console, reader, exit, stop, token, dimensions);
             }
         })?;
     let mut con: HPCON = 0;
@@ -258,10 +289,22 @@ fn launch(
             .name("massrelay-private-pty-read".into())
             .spawn(move || read_output(output, chunks, token))?
     };
-    let shell = Shell(start(con, shell, identity)?);
+    let (arguments, dimensions) = match ssh {
+        Some((arguments, dimensions)) => (arguments, Some(dimensions)),
+        None => ("", None),
+    };
+    let shell = Shell(start(
+        con,
+        shell,
+        arguments,
+        identity,
+        dimensions.is_some(),
+    )?);
     let (exit_tx, exited) = oneshot::channel();
     let (_stop, stop) = std::sync::mpsc::channel::<()>();
-    if let Err(unsent) = start_reaper.send((shell, console, reader, exit_tx, stop, token)) {
+    if let Err(unsent) =
+        start_reaper.send((shell, console, reader, exit_tx, stop, token, dimensions))
+    {
         // Disconnect output first so the reader drains while ConPTY closes.
         drop(rx);
         drop(unsent);
@@ -290,6 +333,7 @@ fn reap(
     exit: oneshot::Sender<io::Result<i32>>,
     stop: std::sync::mpsc::Receiver<()>,
     _token: Arc<()>,
+    mut dimensions: Option<watch::Receiver<(u16, u16)>>,
 ) {
     let mut exit = Some(exit);
     loop {
@@ -297,7 +341,16 @@ fn reap(
         let status = unsafe { WaitForSingleObject(shell.0.0, 0) };
         let report = match status {
             WAIT_TIMEOUT => match stop.recv_timeout(REAP_POLL) {
-                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Some(dimensions) = dimensions.as_mut()
+                        && dimensions.has_changed().unwrap_or(false)
+                    {
+                        let (cols, rows) = *dimensions.borrow_and_update();
+                        // SAFETY: the reaper owns this open pseudoconsole.
+                        unsafe { ResizePseudoConsole(console.0, size(cols, rows)) };
+                    }
+                    continue;
+                }
                 _ => break,
             },
             WAIT_OBJECT_0 => shell.exit_code(),
@@ -306,8 +359,10 @@ fn reap(
         if let Some(exit) = exit.take() {
             let _ = exit.send(report);
         }
-        // Nobody sends; this returns when the `Pty` is dropped.
-        let _ = stop.recv();
+        if dimensions.is_none() {
+            // Nobody sends; this returns when the legacy `Pty` is dropped.
+            let _ = stop.recv();
+        }
         break;
     }
     drop(shell);
@@ -393,13 +448,24 @@ fn pty_error(action: &str, error: io::Error) -> io::Error {
 
 /// Start the shell attached to `con` under `identity`, returning its
 /// process handle.
-fn start(con: HPCON, shell: Option<&Path>, identity: &Identity) -> io::Result<Handle> {
+fn start(
+    con: HPCON,
+    shell: Option<&Path>,
+    arguments: &str,
+    identity: &Identity,
+    ssh: bool,
+) -> io::Result<Handle> {
     let program: OsString = match shell {
         Some(path) => path.as_os_str().to_owned(),
         None => std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into()),
     };
     let mut command_line = quote(&program)?;
-    let environment = environment();
+    command_line.pop();
+    command_line.extend(arguments.encode_utf16());
+    command_line.push(0);
+    let application = shell.filter(|_| ssh).map(|path| wide(path.as_os_str()));
+    let application = application.as_ref().map_or(null(), |path| path.as_ptr());
+    let environment = environment(ssh);
     let directory = std::env::var_os("USERPROFILE")
         .filter(|dir| Path::new(dir).is_dir())
         .map(|dir| wide(&dir));
@@ -439,7 +505,7 @@ fn start(con: HPCON, shell: Option<&Path>, identity: &Identity) -> io::Result<Ha
     check(unsafe {
         match identity {
             Identity::Inherited => CreateProcessW(
-                null(),
+                application,
                 command_line.as_mut_ptr(),
                 null(),
                 null(),
@@ -452,7 +518,7 @@ fn start(con: HPCON, shell: Option<&Path>, identity: &Identity) -> io::Result<Ha
             ),
             Identity::Filtered(token) => CreateProcessAsUserW(
                 token.0,
-                null(),
+                application,
                 command_line.as_mut_ptr(),
                 null(),
                 null(),
@@ -705,7 +771,17 @@ fn is_regular_token(token: &Handle, kept: &[LUID]) -> io::Result<bool> {
     let held = token_info(token, TokenPrivileges)?;
     // SAFETY: `held` holds the TOKEN_PRIVILEGES just read.
     let held = unsafe { privilege_entries(&held) }?;
+    let user = token_info(token, TokenUser)?;
+    let system = Sid::well_known(WinLocalSystemSid)?;
+    // SAFETY: both SIDs are valid for these buffers' lifetimes.
+    let is_system = unsafe {
+        EqualSid(
+            (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid,
+            system.as_psid(),
+        )
+    } != 0;
     Ok(primary
+        && !is_system
         && held
             .iter()
             .all(|privilege| kept.iter().any(|keep| same_luid(keep, &privilege.Luid))))
@@ -713,11 +789,285 @@ fn is_regular_token(token: &Handle, kept: &[LUID]) -> io::Result<bool> {
 
 /// This process's primary token.
 fn process_token(access: TOKEN_ACCESS_MASK) -> io::Result<Handle> {
+    // SAFETY: GetCurrentProcess returns the current process pseudo-handle.
+    token_for_process(unsafe { GetCurrentProcess() }, access)
+}
+
+fn token_for_process(process: HANDLE, access: TOKEN_ACCESS_MASK) -> io::Result<Handle> {
     let mut token = null_mut();
-    // SAFETY: the pseudo-handle of this process is always valid; `token` is
-    // a valid out pointer.
-    check(unsafe { OpenProcessToken(GetCurrentProcess(), access, &mut token) })?;
+    // SAFETY: callers supply a live process handle; token is a valid out pointer.
+    check(unsafe { OpenProcessToken(process, access, &mut token) })?;
     Ok(Handle(token))
+}
+
+pub(in crate::private) fn require_regular_process() -> io::Result<()> {
+    if is_regular_token(&process_token(TOKEN_QUERY)?, &regular_privileges()?)? {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "SSH worker requires a regular token",
+        ))
+    }
+}
+
+/// Resolve the account carried by the same token the regular shell uses.
+pub(in crate::private) fn regular_account() -> io::Result<String> {
+    let identity = Identity::select(false)?;
+    let own = process_token(TOKEN_QUERY)?;
+    let token = match &identity {
+        Identity::Inherited => &own,
+        Identity::Filtered(token) => token,
+    };
+    let user = token_info(token, TokenUser)?;
+    let mut name = [0u16; 257];
+    let mut domain = [0u16; 257];
+    let (mut name_size, mut domain_size) = (name.len() as u32, domain.len() as u32);
+    let mut sid_type = 0;
+    // SAFETY: the SID points into the token information. Both output buffers
+    // and their lengths are valid.
+    check(unsafe {
+        LookupAccountSidW(
+            null(),
+            (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid,
+            name.as_mut_ptr(),
+            &mut name_size,
+            domain.as_mut_ptr(),
+            &mut domain_size,
+            &mut sid_type,
+        )
+    })?;
+    if sid_type != SidTypeUser {
+        return Err(other("the SSH token does not identify a Windows user"));
+    }
+    String::from_utf16(&name[..name_size as usize]).map_err(other)
+}
+
+pub(in crate::private) struct WorkerStream {
+    read: tokio::fs::File,
+    write: Option<Handle>,
+    retry: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl AsyncRead for WorkerStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match Pin::new(&mut self.read).poll_read(cx, buf) {
+            Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::BrokenPipe => {
+                Poll::Ready(Ok(()))
+            }
+            result => result,
+        }
+    }
+}
+
+impl AsyncWrite for WorkerStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let stream = self.get_mut();
+        let Some(pipe) = stream.write.as_ref() else {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        };
+        poll_pipe_write(pipe, &mut stream.retry, cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.write.take();
+        Poll::Ready(Ok(()))
+    }
+}
+
+pub(in crate::private) struct WorkerProcess(Handle);
+
+impl WorkerProcess {
+    fn exited(&self) -> bool {
+        // SAFETY: the process handle remains open.
+        unsafe { WaitForSingleObject(self.0.0, 0) == WAIT_OBJECT_0 }
+    }
+
+    pub(in crate::private) fn terminate(&self) {
+        if !self.exited() {
+            // SAFETY: the process handle is open and grants termination.
+            unsafe { TerminateProcess(self.0.0, 1) };
+        }
+    }
+
+    pub(in crate::private) async fn wait(&self) {
+        while !self.exited() {
+            tokio::time::sleep(REAP_POLL).await;
+        }
+    }
+}
+
+impl Drop for WorkerProcess {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+/// Start the SSH worker with only its private pipe ends. The process is
+/// suspended until its actual token has been verified against the caller.
+pub(in crate::private) fn start_ssh_worker(
+    exe: &Path,
+    argument: &str,
+    bootstrap: &[u8; 64],
+) -> io::Result<(WorkerStream, WorkerProcess)> {
+    let identity = Identity::select(false)?;
+    let (stdin, write) = input_pipe()?;
+    let (read, stdout) = pipe()?;
+    let handles = [stdin.0, stdout.0];
+    for handle in handles {
+        // SAFETY: the handles are live, and only the child ends are inheritable.
+        check(unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) })?;
+    }
+    let mut attributes = Attributes::new()?;
+    // SAFETY: the initialized list and handle array both outlive process startup.
+    check(unsafe {
+        UpdateProcThreadAttribute(
+            attributes.list(),
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            handles.as_ptr().cast(),
+            std::mem::size_of_val(&handles),
+            null_mut(),
+            null(),
+        )
+    })?;
+    let mut startup = STARTUPINFOEXW::default();
+    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = stdin.0;
+    startup.StartupInfo.hStdOutput = stdout.0;
+    startup.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
+    startup.lpAttributeList = attributes.list();
+    let application = wide(exe.as_os_str());
+    let mut line = quote(exe.as_os_str())?;
+    line.pop();
+    line.push(u16::from(b' '));
+    line.extend(argument.encode_utf16());
+    line.push(0);
+    let environment = environment(false);
+    let environment = environment.as_ptr().cast::<c_void>();
+    let directory = exe.parent().map(|dir| wide(dir.as_os_str()));
+    let directory = directory.as_ref().map_or(null(), |dir| dir.as_ptr());
+    let flags = EXTENDED_STARTUPINFO_PRESENT
+        | CREATE_UNICODE_ENVIRONMENT
+        | CREATE_NO_WINDOW
+        | CREATE_SUSPENDED;
+    let mut process = PROCESS_INFORMATION::default();
+    // SAFETY: all buffers and attributes remain live until startup returns.
+    // The child inherits only the two pipe ends listed in the attribute.
+    check(unsafe {
+        match identity {
+            Identity::Inherited => CreateProcessW(
+                application.as_ptr(),
+                line.as_mut_ptr(),
+                null(),
+                null(),
+                1,
+                flags,
+                environment,
+                directory,
+                &startup.StartupInfo,
+                &mut process,
+            ),
+            Identity::Filtered(token) => CreateProcessAsUserW(
+                token.0,
+                application.as_ptr(),
+                line.as_mut_ptr(),
+                null(),
+                null(),
+                1,
+                flags,
+                environment,
+                directory,
+                &startup.StartupInfo,
+                &mut process,
+            ),
+        }
+    })?;
+    let worker = WorkerProcess(Handle(process.hProcess));
+    let thread = Handle(process.hThread);
+    drop((stdin, stdout));
+    let child = token_for_process(worker.0.0, TOKEN_QUERY)?;
+    let caller = process_token(TOKEN_QUERY)?;
+    let child_user = token_info(&child, TokenUser)?;
+    let caller_user = token_info(&caller, TokenUser)?;
+    // SAFETY: both SIDs point into these live token buffers.
+    let same_user = unsafe {
+        EqualSid(
+            (*child_user.as_ptr().cast::<TOKEN_USER>()).User.Sid,
+            (*caller_user.as_ptr().cast::<TOKEN_USER>()).User.Sid,
+        ) != 0
+    };
+    if !same_user || !is_regular_token(&child, &regular_privileges()?)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unexpected SSH worker token",
+        ));
+    }
+    let mut count = 0;
+    // SAFETY: the pipe is open and nonblocking. The worker is suspended, so
+    // this writes the only data into the empty startup pipe.
+    check(unsafe {
+        WriteFile(
+            write.0,
+            bootstrap.as_ptr(),
+            bootstrap.len() as u32,
+            &mut count,
+            null_mut(),
+        )
+    })?;
+    if count != bootstrap.len() as u32 {
+        return Err(io::ErrorKind::WriteZero.into());
+    }
+    // SAFETY: the thread handle belongs to the worker created suspended.
+    if unsafe { ResumeThread(thread.0) } != 1 {
+        return Err(other("could not resume the SSH worker"));
+    }
+    let mut read = tokio::fs::File::from_std(read.into());
+    read.set_max_buf_size(16 * 1024);
+    Ok((
+        WorkerStream {
+            read,
+            write: Some(write),
+            retry: None,
+        },
+        worker,
+    ))
+}
+
+/// Claim the worker pipes before the worker launches any subprocesses.
+pub(in crate::private) fn ssh_worker_stdio() -> io::Result<(std::fs::File, std::fs::File)> {
+    // SAFETY: reading standard handles does not transfer ownership.
+    let (read, write) = unsafe {
+        (
+            GetStdHandle(STD_INPUT_HANDLE),
+            GetStdHandle(STD_OUTPUT_HANDLE),
+        )
+    };
+    if read == write {
+        return Err(other("SSH worker requires separate input and output pipes"));
+    }
+    for pipe in [read, write] {
+        // SAFETY: GetFileType also handles missing and invalid handles.
+        if unsafe { GetFileType(pipe) } != FILE_TYPE_PIPE {
+            return Err(other("SSH worker requires private input and output pipes"));
+        }
+        // SAFETY: the handle is a live pipe.
+        check(unsafe { SetHandleInformation(pipe, HANDLE_FLAG_INHERIT, 0) })?;
+    }
+    Ok((Handle(read).into(), Handle(write).into()))
 }
 
 /// One class of a token's information. `u64` elements keep the structure in
@@ -924,13 +1274,21 @@ fn quote(program: &OsStr) -> io::Result<Vec<u16>> {
 
 /// This process's environment with `TERM=xterm-256color` and the serving
 /// runtime's process ID, as a sorted UTF-16 block.
-fn environment() -> Vec<u16> {
+fn environment(preserve_host: bool) -> Vec<u16> {
     let host = crate::private::HOST_ENV;
     let mut vars: Vec<(OsString, OsString)> = std::env::vars_os()
         .filter(|(k, _)| !k.eq_ignore_ascii_case("TERM") && !k.eq_ignore_ascii_case(host))
         .collect();
     vars.push(("TERM".into(), "xterm-256color".into()));
-    vars.push((host.into(), std::process::id().to_string().into()));
+    let pid = if preserve_host {
+        std::env::var_os(host)
+    } else {
+        None
+    };
+    vars.push((
+        host.into(),
+        pid.unwrap_or_else(|| std::process::id().to_string().into()),
+    ));
     vars.sort_by_cached_key(|(k, _)| k.to_string_lossy().to_uppercase());
     let mut block = Vec::new();
     for (k, v) in vars {
@@ -1033,34 +1391,8 @@ impl AsyncWrite for PtyWriter<'_> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-        let len = buf.len().min(MAX_WRITE) as u32;
-        let mut written = 0u32;
-        // SAFETY: the handle is open while this writer borrows the `Pty`;
-        // `buf` is valid for `len` bytes; the pipe is synchronous (no
-        // OVERLAPPED) and in nonblocking mode, so this returns at once.
-        let ok = unsafe { WriteFile(this.pipe.0, buf.as_ptr(), len, &mut written, null_mut()) };
-        if ok == 0 {
-            // ERROR_NO_DATA or ERROR_BROKEN_PIPE once the host has gone.
-            return Poll::Ready(Err(io::Error::last_os_error()));
-        }
-        if written > 0 {
-            return Poll::Ready(Ok(written as usize));
-        }
-        // The pipe is full. Poll again shortly; each retry is a new guarded
-        // poll, so it re-checks authority first.
-        let at = tokio::time::Instant::now() + WRITE_RETRY;
-        let retry = this
-            .retry
-            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(at)));
-        retry.as_mut().reset(at);
-        if retry.as_mut().poll(cx).is_ready() {
-            cx.waker().wake_by_ref();
-        }
-        Poll::Pending
+        let writer = self.get_mut();
+        poll_pipe_write(writer.pipe, &mut writer.retry, cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -1071,4 +1403,34 @@ impl AsyncWrite for PtyWriter<'_> {
     fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
+}
+
+fn poll_pipe_write(
+    pipe: &Handle,
+    retry: &mut Option<Pin<Box<tokio::time::Sleep>>>,
+    cx: &mut Context<'_>,
+    buf: &[u8],
+) -> Poll<io::Result<usize>> {
+    if buf.is_empty() {
+        return Poll::Ready(Ok(0));
+    }
+    let len = buf.len().min(MAX_WRITE) as u32;
+    let mut written = 0u32;
+    // SAFETY: `pipe` is open and synchronous, `buf` is valid for `len`
+    // bytes, and the pipe is in nonblocking mode.
+    let ok = unsafe { WriteFile(pipe.0, buf.as_ptr(), len, &mut written, null_mut()) };
+    if ok == 0 {
+        return Poll::Ready(Err(io::Error::last_os_error()));
+    }
+    if written > 0 {
+        return Poll::Ready(Ok(written as usize));
+    }
+    // The pipe is full. Each retry is a new poll that can re-check authority.
+    let at = tokio::time::Instant::now() + WRITE_RETRY;
+    let retry = retry.get_or_insert_with(|| Box::pin(tokio::time::sleep_until(at)));
+    retry.as_mut().reset(at);
+    if retry.as_mut().poll(cx).is_ready() {
+        cx.waker().wake_by_ref();
+    }
+    Poll::Pending
 }

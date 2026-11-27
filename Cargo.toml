@@ -1,6 +1,6 @@
 [package]
 name = "massrelay"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2024"
 description = "User-mode pocket networks for your own machines"
 
@@ -40,6 +40,8 @@ rusqlite = { version = "0.41", features = ["bundled"] }
 ed25519-dalek = { version = "3" }
 
 [target.'cfg(windows)'.dependencies]
+russh = { version = "=0.65.4", default-features = false, features = ["ring"] }
+zeroize = "1"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",

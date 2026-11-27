@@ -97,6 +97,7 @@ use crate::{tcp, terminal, udp};
 use super::audit::{self, DeviceLog, Tracked};
 use super::pty;
 use super::routes::Routes;
+use super::ssh;
 use super::versions::{self, Exchange, Observations, PeerVersions};
 
 use super::binding::EndpointKey;
@@ -134,6 +135,8 @@ const MSG_ELEVATED_UNAVAILABLE: &str = "this device cannot start an administrato
 const MSG_CONNECT: &str = "could not connect to the target";
 const MSG_RESOLVE: &str = "could not resolve the target";
 const MSG_ENDED: &str = "authorization ended";
+const MSG_SSH: &str = "could not start the private OpenSSH transport";
+const MSG_SSH_CUSTOM_SHELL: &str = "this device uses a custom shell; SSH access is disabled";
 const REPLY_MESSAGES: &[&str] = &[
     MSG_NOT_AUTHORIZED,
     MSG_SHELL,
@@ -144,6 +147,8 @@ const REPLY_MESSAGES: &[&str] = &[
     MSG_CONNECT,
     MSG_RESOLVE,
     MSG_ENDED,
+    MSG_SSH,
+    MSG_SSH_CUSTOM_SHELL,
 ];
 
 /// Largest encoded private service reply.
@@ -774,12 +779,23 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
             };
             return (ended, None);
         }
-        let Some(req) = read.ok().and_then(|b| PrivateRequest::decode(&b)) else {
+        let Ok(header) = read else {
             conn.close(0u32.into(), CLOSE_DONE);
             return (Ended::BadRequest, None);
         };
-        track.service(req.service);
-        let session = match self.peers().open(auth, req.service) {
+        let ssh_info = ssh::is_info(&header);
+        let ssh_tunnel = ssh::is_tunnel(&header);
+        let req = PrivateRequest::decode(&header);
+        let grant = match req {
+            Some(req) => req.service,
+            None if ssh_info || ssh_tunnel => Service::Shell,
+            None => {
+                conn.close(0u32.into(), CLOSE_DONE);
+                return (Ended::BadRequest, None);
+            }
+        };
+        track.service(grant);
+        let session = match self.peers().open(auth, grant) {
             Ok(s) => s,
             Err(e) => {
                 let refusal = wire_refusal(&e);
@@ -796,13 +812,40 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
             Over(Refusal),
         }
         let mut teardown = None;
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        let mut sshd = None;
+        let serve = async {
+            let connected = || track.connected(Some(conn));
+            match req {
+                Some(req) => {
+                    self.serve_service(&session, &req, rx, tx, &mut teardown, connected)
+                        .await
+                }
+                #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+                None => {
+                    self.serve_ssh(&session, ssh_info, rx, tx, &mut sshd, connected)
+                        .await
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+                None => {
+                    refuse(tx, WireRefusal::TargetUnavailable, MSG_SSH).await;
+                    Ended::Refused(WireRefusal::TargetUnavailable)
+                }
+            }
+        };
         let outcome = tokio::select! {
             biased;
             why = session.done() => Outcome::Over(why),
-            ended = self.serve_service(&session, &req, rx, tx, &mut teardown, || track.connected(Some(conn))) => Outcome::Served(ended),
+            ended = serve => Outcome::Served(ended),
         };
         // The serving future is dropped here: copies stop, sockets close and
         // a shell's PTY is dropped (its reaper wakes, kills and reaps).
+        #[cfg(windows)]
+        if matches!(outcome, Outcome::Over(_))
+            && let Some(child) = sshd.as_ref()
+        {
+            child.terminate();
+        }
         let ended = match outcome {
             Outcome::Served(e) => e,
             Outcome::Over(why) => over(why),
@@ -810,7 +853,88 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
         if let Some(t) = teardown {
             t.wait().await;
         }
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        if let Some(child) = sshd {
+            child.reap().await;
+        }
         (ended, Some(session))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    async fn serve_ssh(
+        &self,
+        session: &SessionHandle,
+        info: bool,
+        rx: &mut RecvStream,
+        tx: &mut SendStream,
+        sshd: &mut Option<ssh::Sshd>,
+        connected: impl FnOnce(),
+    ) -> Ended {
+        let custom_shell = self.shell.as_deref().is_some_and(|shell| {
+            #[cfg(windows)]
+            {
+                !crate::windows_service::is_default_shell(shell)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = shell;
+                true
+            }
+        });
+        if custom_shell {
+            refuse(tx, WireRefusal::TargetUnavailable, MSG_SSH_CUSTOM_SHELL).await;
+            return Ended::Refused(WireRefusal::TargetUnavailable);
+        }
+        let unavailable = |tx| refuse(tx, WireRefusal::TargetUnavailable, MSG_SSH);
+        let dir = self.device.store().dir();
+        if info {
+            let Ok(host) = ssh::host_info(dir).await else {
+                unavailable(tx).await;
+                return Ended::Refused(WireRefusal::TargetUnavailable);
+            };
+            let mut guarded = session.guard(&mut *tx);
+            if wire::send(&mut guarded, ServiceReply::Ready).await.is_err()
+                || wire::send(&mut guarded, host).await.is_err()
+            {
+                return Ended::PeerDisconnected;
+            }
+            let _ = tx.finish();
+            return Ended::StreamClosed;
+        }
+
+        let key = tokio::time::timeout(wire::RPC_TIMEOUT, read_bounded(rx, &[32])).await;
+        let Ok(Ok(key)) = key else {
+            return Ended::BadRequest;
+        };
+        let key = key.try_into().expect("bounded to 32 bytes");
+        let Ok(prepared) = ssh::Prepared::new(dir, &key).await else {
+            unavailable(tx).await;
+            return Ended::Refused(WireRefusal::TargetUnavailable);
+        };
+        let stream = match session.start_now(|| prepared.start(dir)) {
+            Ok(Ok((stream, child))) => {
+                *sshd = Some(child);
+                stream
+            }
+            Ok(Err(_)) => {
+                unavailable(tx).await;
+                return Ended::Refused(WireRefusal::TargetUnavailable);
+            }
+            Err(_) => return denied(tx).await,
+        };
+        let mut target = session.guard(stream);
+        #[cfg(windows)]
+        if ssh::worker_ready(&mut target).await.is_err() {
+            unavailable(tx).await;
+            return Ended::Refused(WireRefusal::TargetUnavailable);
+        }
+        let mut guarded = session.guard(&mut *tx);
+        if wire::send(&mut guarded, ServiceReply::Ready).await.is_err() {
+            return Ended::PeerDisconnected;
+        }
+        connected();
+        let result = tcp::bridge_with(rx, &mut guarded, &mut target, tcp::MAX_FRAME).await;
+        finish_tunnel(result, tx, tcp::MAX_FRAME).await
     }
 
     async fn serve_service(
@@ -946,7 +1070,17 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
         addr: EndpointAddr,
         req: PrivateRequest,
     ) -> Result<ServiceStream, PairError> {
-        self.open_request(endpoint, addr, &req.encode()).await
+        self.open_request(endpoint, addr, &req.encode(), None).await
+    }
+
+    pub(super) async fn open_ssh(
+        &self,
+        endpoint: &Endpoint,
+        addr: EndpointAddr,
+        req: ssh::Request,
+    ) -> Result<ServiceStream, PairError> {
+        self.open_request(endpoint, addr, req.header(), Some(req))
+            .await
     }
 
     pub(super) async fn open_ping(
@@ -954,7 +1088,7 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
         endpoint: &Endpoint,
         addr: EndpointAddr,
     ) -> Result<ServiceStream, PairError> {
-        self.open_request(endpoint, addr, &PING_REQUEST).await
+        self.open_request(endpoint, addr, &PING_REQUEST, None).await
     }
 
     async fn open_request(
@@ -962,6 +1096,7 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
         endpoint: &Endpoint,
         mut addr: EndpointAddr,
         request: &[u8],
+        ssh: Option<ssh::Request>,
     ) -> Result<ServiceStream, PairError> {
         self.check_endpoint(endpoint)?;
         let local = |e: &dyn std::fmt::Display| PairError::Local(format!("service: {e}"));
@@ -988,11 +1123,30 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
             crate::wire::frame(&mut tx, request)
                 .await
                 .map_err(|e| local(&e))?;
+            if let Some(ssh::Request::Tunnel(key)) = ssh {
+                wire::frame(&mut tx, &key.0).await.map_err(|e| local(&e))?;
+            }
             let bytes = wire::read_frame_max(&mut rx, max_reply_len())
                 .await
                 .map_err(|e| local(&e))?;
-            serde_json::from_slice::<ServiceReply>(&bytes)
-                .map_err(|e| PairError::Malformed(format!("service reply: {e}")))
+            let reply = serde_json::from_slice::<ServiceReply>(&bytes)
+                .map_err(|e| PairError::Malformed(format!("service reply: {e}")))?;
+            let host = if matches!(ssh, Some(ssh::Request::Info))
+                && matches!(reply, ServiceReply::Ready)
+            {
+                let bytes = wire::read_frame_max(&mut rx, ssh::Host::MAX_REPLY)
+                    .await
+                    .map_err(|e| local(&e))?;
+                let host: ssh::Host = serde_json::from_slice(&bytes)
+                    .map_err(|_| PairError::Malformed("invalid SSH host record".into()))?;
+                if !ssh::Host::valid_user(&host.user) {
+                    return Err(PairError::Malformed("invalid SSH account".into()));
+                }
+                Some(host)
+            } else {
+                None
+            };
+            Ok((reply, host))
         };
         let reply = tokio::select! {
             biased;
@@ -1002,7 +1156,7 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
             }
             r = io => r,
         };
-        let reply = match reply {
+        let (reply, ssh_host) = match reply {
             Ok(r) => r,
             Err(e) => {
                 conn.close(0u32.into(), CLOSE_DONE);
@@ -1015,6 +1169,7 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
             tx,
             rx,
             reply,
+            ssh_host,
             _versions: versions,
         })
     }
@@ -1167,6 +1322,7 @@ pub struct ServiceStream {
     pub tx: SendStream,
     pub rx: RecvStream,
     pub reply: ServiceReply,
+    pub ssh_host: Option<ssh::Host>,
     _versions: Exchange,
 }
 

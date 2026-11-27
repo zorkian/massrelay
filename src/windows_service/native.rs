@@ -428,6 +428,15 @@ fn powershell() -> Result<String> {
     super::plain(&path)
 }
 
+pub fn is_default_shell(shell: &Path) -> bool {
+    shell
+        .canonicalize()
+        .ok()
+        .and_then(|path| super::plain(&path).ok())
+        .zip(powershell().ok())
+        .is_some_and(|(shell, default)| shell.eq_ignore_ascii_case(&default))
+}
+
 // ------------------------------------------------------------------ account
 
 /// The account running this command.
@@ -731,6 +740,19 @@ impl Drop for PrivateFile {
         // SAFETY: Windows allocated this descriptor and all opens have returned.
         unsafe { LocalFree(self.0.lpSecurityDescriptor) };
     }
+}
+
+/// Validate the directory whose children inherit the permissions for ephemeral SSH files.
+pub fn ssh_private_dir(path: &Path) -> Result<()> {
+    let path = std::path::absolute(path)?;
+    for part in path.ancestors().filter(|part| part.parent().is_some()) {
+        let metadata = fs::symlink_metadata(part)?;
+        ensure!(
+            metadata.is_dir() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "the MassRelay SSH directory must have a path without reparse points"
+        );
+    }
+    ensure_trusted(&super::plain(&path)?, Role::Private, &Account::current()?)
 }
 
 /// Create the control marker with its own ACL before writing the control key.

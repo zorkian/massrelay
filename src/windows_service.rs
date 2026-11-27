@@ -32,8 +32,8 @@ use sha2::{Digest, Sha256};
 mod native;
 #[cfg(windows)]
 pub use native::{
-    Managed, control, install, managed, private_audit, private_marker, serve, serving,
-    until_stopped,
+    Managed, control, install, is_default_shell, managed, private_audit, private_marker, serve,
+    serving, ssh_private_dir, until_stopped,
 };
 
 #[derive(clap::Args)]
@@ -80,7 +80,7 @@ fn is_profile_service(command: &str, dir: &str, name: &str) -> bool {
 }
 
 /// Quote one argument for a service command line.
-fn quote(text: &str) -> Result<String> {
+pub(crate) fn quote(text: &str) -> Result<String> {
     ensure!(
         !text.is_empty() && !text.contains('"') && !text.chars().any(char::is_control),
         "this path cannot be written in a service command line: {text:?}"
@@ -96,7 +96,7 @@ fn quote(text: &str) -> Result<String> {
 }
 
 /// A canonical path as the drive-letter path the service manager and the user both read.
-fn plain(path: &Path) -> Result<String> {
+pub(crate) fn plain(path: &Path) -> Result<String> {
     let text = path
         .to_str()
         .with_context(|| format!("path is not Unicode: {}", path.display()))?;

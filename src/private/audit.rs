@@ -781,6 +781,7 @@ pub fn operation(r: &ControlRequest) -> (&'static str, Option<&str>, Option<Serv
             ("clear_exclusion", Some(peer), Some(*service))
         }
         ControlRequest::Shell { peer, .. } => ("shell", Some(peer), Some(Service::Shell)),
+        ControlRequest::Ssh { peer, .. } => ("ssh", Some(peer), Some(Service::Shell)),
         ControlRequest::Connect { peer, service, .. } => ("connect", Some(peer), Some(*service)),
         ControlRequest::Expose { peer, service, .. } => ("expose", Some(peer), Some(*service)),
         ControlRequest::Update(UpdateRequest::Identify) => ("update_identify", None, None),

@@ -59,6 +59,13 @@ jobs:
         if: runner.os == 'Windows'
         timeout-minutes: 3
         run: cargo +stable test --locked --release conpty -- --ignored --test-threads=1
+      - name: Test Windows SSH through MassRelay
+        if: runner.os == 'Windows'
+        timeout-minutes: 3
+        run: |
+          & "$env:WINDIR/System32/OpenSSH/ssh.exe" -V
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +stable test --locked --release windows_ssh_uses_the_shell_grant -- --ignored --test-threads=1
       - name: Test Windows background service
         if: runner.os == 'Windows'
         timeout-minutes: 10

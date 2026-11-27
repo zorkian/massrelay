@@ -523,7 +523,11 @@ fn interrupted(swapped: bool) -> (Fake, PathBuf, tempfile::TempDir) {
 }
 
 fn saved(root: &Path) -> PathBuf {
-    root.join("bin").join(STAGING).join("previous")
+    root.join("bin").join(STAGING).join(if cfg!(windows) {
+        "previous.exe"
+    } else {
+        "previous"
+    })
 }
 
 /// Under every kind of service manager the idle runtime ends itself and the candidate takes

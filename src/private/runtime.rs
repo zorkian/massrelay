@@ -160,6 +160,7 @@ use super::pairing::{self, Decision, Owner, PairError, PairingState, Refusal, pa
 use super::service::{
     CLOSE_AUTHORITY_ENDED, CLOSE_DONE, Node, PrivateRequest, ServiceStream, max_payload_frame,
 };
+use super::ssh;
 use super::versions::{Observation, Observations, PeerVersions};
 
 /// The private runtime's local control channel.
@@ -250,6 +251,12 @@ pub enum ControlRequest {
         lifetime_port: u16,
         lifetime_key: [u8; 32],
     },
+    Ssh {
+        peer: String,
+        client_key: Option<crate::mailbox::Bytes<32>>,
+        lifetime_port: u16,
+        lifetime_key: [u8; 32],
+    },
     /// Grant `service` (a port) to `peer` while the lifetime socket stays
     /// open, forwarding to `target` (`None`: loopback on the same port).
     Expose {
@@ -331,6 +338,7 @@ pub enum ControlReply {
     },
     Shell,
     Connected,
+    SshHost(ssh::Host),
     PingStarted,
     PingSample(Option<u64>),
     PingSampleWithRoute {
@@ -915,12 +923,32 @@ async fn serve_control<M: Mailbox + Send + Sync + 'static>(
                 &shared,
                 socket,
                 &peer,
-                PrivateRequest {
+                OutboundRequest::Service(PrivateRequest {
                     service: Service::Shell,
                     terminal: Some((cols, rows)),
                     elevated,
-                },
+                }),
                 lifetime,
+            )
+            .await
+        }
+        ControlRequest::Ssh {
+            peer,
+            client_key,
+            lifetime_port,
+            lifetime_key,
+        } => {
+            let lifetime = local::lifetime_connect(lifetime_port, &lifetime_key).await;
+            if lifetime.is_err() {
+                audit("failed", Some("lifetime_channel_failed"));
+            }
+            let request = client_key.map_or(ssh::Request::Info, ssh::Request::Tunnel);
+            outbound(
+                &shared,
+                socket,
+                &peer,
+                OutboundRequest::Ssh(request),
+                lifetime?,
             )
             .await
         }
@@ -947,11 +975,11 @@ async fn serve_control<M: Mailbox + Send + Sync + 'static>(
                 &shared,
                 socket,
                 &peer,
-                PrivateRequest {
+                OutboundRequest::Service(PrivateRequest {
                     service,
                     terminal: None,
                     elevated: false,
-                },
+                }),
                 lifetime,
             )
             .await
@@ -1097,6 +1125,7 @@ fn manage<M: Mailbox + Send + Sync + 'static>(
             ControlRequest::Ping { .. }
             | ControlRequest::Rename { .. }
             | ControlRequest::Shell { .. }
+            | ControlRequest::Ssh { .. }
             | ControlRequest::Connect { .. }
             | ControlRequest::Expose { .. }
             | ControlRequest::Update(_) => {
@@ -1332,6 +1361,11 @@ async fn ping_peer<M: Mailbox + Send + Sync + 'static>(
     result
 }
 
+enum OutboundRequest {
+    Service(PrivateRequest),
+    Ssh(ssh::Request),
+}
+
 /// Open a service on a peer for a local command and attach it. The
 /// command's lifetime socket ends the session at once, at any point: during
 /// setup, while a reply or data write is backed up, and during the final
@@ -1341,7 +1375,7 @@ async fn outbound<M: Mailbox + Send + Sync + 'static>(
     shared: &Shared<M>,
     mut socket: TcpStream,
     selector: &str,
-    req: PrivateRequest,
+    req: OutboundRequest,
     mut lifetime: TcpStream,
 ) -> Result<()> {
     // Resolves (and stays resolved when polled again) once the command's
@@ -1362,7 +1396,10 @@ async fn outbound<M: Mailbox + Send + Sync + 'static>(
         std::task::Poll::Ready(())
     });
     let log = shared.node.log();
-    let service = req.service;
+    let service = match req {
+        OutboundRequest::Service(req) => req.service,
+        OutboundRequest::Ssh(_) => Service::Shell,
+    };
     let track = log.outbound(service);
     // Each failure carries its fixed log reason and the text for the command.
     let setup = async {
@@ -1375,7 +1412,12 @@ async fn outbound<M: Mailbox + Send + Sync + 'static>(
             .map_err(|e| ("unknown_peer", e))?;
         track.peer(log, &key);
         let addr = peer_address(shared, &key).map_err(|e| ("setup_failed", e.to_string()))?;
-        let opened = shared.node.open_service(&shared.endpoint, addr, req).await;
+        let opened = match req {
+            OutboundRequest::Service(req) => {
+                shared.node.open_service(&shared.endpoint, addr, req).await
+            }
+            OutboundRequest::Ssh(req) => shared.node.open_ssh(&shared.endpoint, addr, req).await,
+        };
         // The exchange may have learned a decision or paired.
         audit::observe(&shared.node, false);
         opened.map_err(|e| (audit::pair_error_reason(&e), format!("{e:?}")))
@@ -1415,12 +1457,24 @@ async fn outbound<M: Mailbox + Send + Sync + 'static>(
             return Ok(());
         }
     };
-    let ready = match service {
-        Service::Shell => ControlReply::Shell,
-        _ => ControlReply::Connected,
+    let is_shell = matches!(
+        req,
+        OutboundRequest::Service(PrivateRequest {
+            service: Service::Shell,
+            ..
+        })
+    );
+    let ready = match stream.ssh_host {
+        Some(host) => ControlReply::SshHost(host),
+        None if is_shell => ControlReply::Shell,
+        None => ControlReply::Connected,
     };
+    let info_only = matches!(ready, ControlReply::SshHost(_));
     track.connected(Some(&stream.conn));
-    let max_frame = max_payload_frame(service);
+    let max_frame = match req {
+        OutboundRequest::Service(_) => max_payload_frame(service),
+        OutboundRequest::Ssh(_) => crate::tcp::MAX_FRAME,
+    };
     let ServiceStream {
         conn,
         auth,
@@ -1431,6 +1485,11 @@ async fn outbound<M: Mailbox + Send + Sync + 'static>(
     let sent = tokio::select! {
         biased;
         _ = &mut local_closed => Ok(false),
+        why = auth.done(), if matches!(req, OutboundRequest::Ssh(_)) => {
+            conn.close(0u32.into(), CLOSE_AUTHORITY_ENDED);
+            track.end(if why == Refusal::ConnectionClosed { "peer_disconnected" } else { "authorization_ended" }, None);
+            return Ok(());
+        }
         r = wire::send(&mut socket, ready) => r.map(|()| true),
     };
     match sent {
@@ -1446,6 +1505,11 @@ async fn outbound<M: Mailbox + Send + Sync + 'static>(
             return Err(e);
         }
     }
+    if info_only {
+        conn.close(0u32.into(), CLOSE_DONE);
+        track.end("stream_closed", None);
+        return Ok(());
+    }
     // Resolves only when this device ends the authorization (the
     // connection's own end is reported by the copy or delivery).
     let stopped = async {
@@ -1455,7 +1519,7 @@ async fn outbound<M: Mailbox + Send + Sync + 'static>(
         conn.close(0u32.into(), CLOSE_AUTHORITY_ENDED);
     };
     let (mut local_rx, mut local_tx) = socket.into_split();
-    if service == Service::Shell {
+    if is_shell {
         let reason = tokio::select! {
             biased;
             _ = shared.node.watch_routes(&conn) => unreachable!("route watcher stays pending"),

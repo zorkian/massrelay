@@ -231,6 +231,21 @@ pub enum Command {
         #[arg(long)]
         elevated: bool,
     },
+    /// Open stock SSH to a paired peer using its existing shell grant.
+    #[cfg(any(unix, windows))]
+    Ssh {
+        #[arg(long)]
+        replace_host_key: Option<String>,
+        peer: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Replace this device's SSH host key and print its new fingerprint.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    SshRotateHostKey,
+    #[cfg(any(unix, windows))]
+    #[command(hide = true)]
+    SshProxy { peer: String, client_key: String },
     /// Connect to a peer's shell or forwarded port.
     Connect {
         peer: Option<String>,
@@ -381,6 +396,29 @@ pub async fn execute(state_dir: &Path, command: Command) -> Result<i32> {
         }
         Command::Shell { peer, elevated } => {
             return runtime::shell(&dir, peer_key(&dir, &peer).await?, elevated).await;
+        }
+        #[cfg(any(unix, windows))]
+        Command::Ssh {
+            peer,
+            replace_host_key,
+            command,
+        } => {
+            return super::ssh::launch_ssh(
+                &dir,
+                peer_key(&dir, &peer).await?,
+                replace_host_key.as_deref(),
+                command,
+            )
+            .await;
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        Command::SshRotateHostKey => {
+            ensure!(profile_exists(state_dir), "no private MassRelay profile");
+            println!("{}", super::ssh::rotate_host_key(&dir).await?);
+        }
+        #[cfg(any(unix, windows))]
+        Command::SshProxy { peer, client_key } => {
+            super::ssh::proxy(&dir, peer, &client_key).await?;
         }
         Command::Connect {
             peer,

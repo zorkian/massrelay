@@ -204,6 +204,17 @@ enum Command {
 }
 
 fn main() {
+    #[cfg(windows)]
+    {
+        let mut arguments = std::env::args_os().skip(1);
+        if arguments
+            .next()
+            .is_some_and(|argument| argument == private::ssh::WORKER_ARG)
+            && arguments.next().is_none()
+        {
+            std::process::exit(i32::from(private::ssh::run_worker().is_err()));
+        }
+    }
     let cli =
         Cli::from_arg_matches(&grouped_cli().get_matches()).unwrap_or_else(|error| error.exit());
     #[cfg(windows)]
@@ -269,10 +280,10 @@ fn grouped_cli() -> clap::Command {
             "Find and pair devices",
             &["peers", "approve", "decline", "revoke"],
         ),
-        ("Connect to a peer", &["shell", "connect", "ping"]),
+        ("Connect to a peer", &["shell", "ssh", "connect", "ping"]),
         (
             "Share services from this device",
-            &["enable", "disable", "list", "expose"],
+            &["enable", "disable", "list", "expose", "ssh-rotate-host-key"],
         ),
         (
             "Operate a relay",

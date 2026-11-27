@@ -44,6 +44,7 @@ pub mod pty;
 mod routes;
 pub mod runtime;
 pub mod service;
+pub(crate) mod ssh;
 pub mod store;
 mod versions;
 

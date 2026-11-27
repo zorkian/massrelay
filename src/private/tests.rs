@@ -5177,6 +5177,396 @@ mod runtime {
         (alice, bob, ra, rb)
     }
 
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Windows OpenSSH and a previously built massrelay executable"]
+    async fn windows_ssh_uses_the_shell_grant_and_cuts_live_transports() {
+        use crate::private::cli;
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::process::Command;
+
+        tokio::time::timeout(T * 3, async {
+            let n = net();
+            let alice = create(&n, &format!("alice/{}", cli::DIR_NAME), Clock::System);
+            let bob = join(&n, &alice, &format!("bob/{}", cli::DIR_NAME), Clock::System);
+            let (a, b) = tokio::join!(endpoint(&alice.secret), endpoint(&bob.secret));
+            let addresses = Arc::new(BTreeMap::from([(alice.ep, addr(&a)), (bob.ep, addr(&b))]));
+            let config = |member: &Member| {
+                let mut config = Config::new(&member.path);
+                let addresses = addresses.clone();
+                config.addresses = Arc::new(move |key| addresses.get(key).cloned());
+                config.sync_every = None;
+                config
+            };
+            let (ra, rb) = tokio::join!(
+                Runtime::start(config(&alice), n.mailbox.clone(), Clock::System, a),
+                Runtime::start(config(&bob), n.mailbox.clone(), Clock::System, b),
+            );
+            let (ra, rb) = (ra.unwrap(), rb.unwrap());
+            cmd(&alice, approve(&bob, "bob")).await;
+            cmd(&bob, approve(&alice, "alice")).await;
+
+            let binary = std::env::current_exe()
+                .unwrap()
+                .with_file_name("../massrelay.exe")
+                .canonicalize()
+                .unwrap();
+            let ssh = || {
+                let mut child = Command::new(&binary);
+                child
+                    .arg("--state-dir")
+                    .arg(alice.path.parent().unwrap())
+                    .args(["ssh", &key(&bob)])
+                    .kill_on_drop(true);
+                child
+            };
+            let denied = ssh().arg("echo no-grant").output().await.unwrap();
+            assert!(!denied.status.success(), "{denied:?}");
+            assert!(!bob.path.join("ssh-host-ed25519-win32").exists());
+
+            let enable = ControlRequest::Enable {
+                peer: "alice".into(),
+                service: Service::Shell,
+            };
+            assert_eq!(cmd(&bob, enable).await, ControlReply::Changed(true));
+            let result = ssh().arg("echo ready & exit /b 7").output().await.unwrap();
+            assert_eq!(result.status.code(), Some(7), "{result:?}");
+            assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "ready");
+
+            let mut live = ssh()
+                .arg("echo opened&set /p massrelay_wait=")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut output = BufReader::new(live.stdout.take().unwrap());
+            let mut line = String::new();
+            output.read_line(&mut line).await.unwrap();
+            assert_eq!(line.trim(), "opened");
+            assert!(live.try_wait().unwrap().is_none());
+            let disable = ControlRequest::Disable {
+                peer: "alice".into(),
+                service: Service::Shell,
+            };
+            assert_eq!(cmd(&bob, disable).await, ControlReply::Changed(true));
+            let status = tokio::time::timeout(Duration::from_secs(10), live.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(status.code(), Some(255));
+            let denied = ssh().arg("echo after-cutoff").output().await.unwrap();
+            assert!(!denied.status.success(), "{denied:?}");
+            assert!(String::from_utf8_lossy(&denied.stderr).contains("not authorized"));
+            let (sa, sb) = tokio::join!(ra.stop(), rb.stop());
+            assert!(sa.owner_released && sb.owner_released, "{sa:?} {sb:?}");
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires unprivileged system OpenSSH and a previously built massrelay binary"]
+    async fn private_ssh_uses_the_shell_grant_and_cuts_live_transports() {
+        check_private_ssh(None).await;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires system OpenSSH, a built binary, and a disposable loopback relay"]
+    async fn private_ssh_works_over_a_relay_only_path() {
+        use iroh_relay::server::{RelayConfig, Server, ServerConfig};
+
+        let mut config = ServerConfig::default();
+        config.relay = Some(RelayConfig::new(([127, 0, 0, 1], 0)));
+        let relay = Server::spawn(config).await.unwrap();
+        let url = format!("http://{}", relay.http_addr().unwrap())
+            .parse()
+            .unwrap();
+        check_private_ssh(Some(url)).await;
+        relay.shutdown().await.unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn check_private_ssh(relay: Option<iroh::RelayUrl>) {
+        use crate::private::{cli, ssh};
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::process::Command;
+
+        tokio::time::timeout(T * 3, async {
+            let n = net();
+            for executable in ["/usr/bin/ssh", "/usr/bin/ssh-keygen", "/usr/bin/sftp"] {
+                assert!(
+                    std::fs::metadata(executable).is_ok_and(|meta| {
+                        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+                    }),
+                    "native SSH fixture requires {executable}"
+                );
+            }
+            let capability = tempfile::tempdir_in(&n.root).unwrap();
+            let prepared = ssh::Prepared::new(capability.path(), &[7; 32])
+                .await
+                .expect("native SSH fixture requires a regular account and system OpenSSH server");
+            prepared.check_config(capability.path()).await.unwrap();
+            drop(prepared);
+
+            let book = Book::default();
+            let alice = create(&n, &format!("alice/{}", cli::DIR_NAME), Clock::System);
+            let bob = join(&n, &alice, &format!("bob/{}", cli::DIR_NAME), Clock::System);
+            let start = |member: &Member| {
+                let secret = member.secret.to_bytes();
+                let path = member.path.clone();
+                let mailbox = n.mailbox.clone();
+                let book = book.clone();
+                let relay = relay.clone();
+                async move {
+                    let (e, address) = if let Some(url) = relay {
+                        let e = Endpoint::builder(presets::Minimal)
+                            .secret_key(SecretKey::from_bytes(&secret))
+                            .alpns(vec![SERVICE_ALPN.to_vec()])
+                            .clear_ip_transports()
+                            .relay_mode(RelayMode::custom([url.clone()]))
+                            .bind()
+                            .await
+                            .unwrap();
+                        assert!(
+                            e.bound_sockets().is_empty(),
+                            "relay-only test has no direct socket"
+                        );
+                        tokio::time::timeout(T, e.online()).await.unwrap();
+                        let address = EndpointAddr::new(e.id()).with_relay_url(url);
+                        (e, address)
+                    } else {
+                        let e = endpoint(&EndpointSecret::from_bytes(&secret)).await;
+                        let address = addr(&e);
+                        (e, address)
+                    };
+                    book.lock().unwrap().insert(*e.id().as_bytes(), address);
+                    let mut config = Config::new(&path);
+                    config.sync_every = None;
+                    config.addresses = Arc::new(move |key| book.lock().unwrap().get(key).cloned());
+                    Runtime::start(config, mailbox, Clock::System, e)
+                        .await
+                        .unwrap()
+                }
+            };
+            let (ra, rb) = tokio::join!(start(&alice), start(&bob));
+            cmd(&alice, approve(&bob, "bob")).await;
+            cmd(&bob, approve(&alice, "alice")).await;
+            let state = alice.path.parent().unwrap();
+            let binary = std::env::current_exe()
+                .unwrap()
+                .ancestors()
+                .skip(1)
+                .map(|dir| dir.join("massrelay"))
+                .find(|path| path.is_file())
+                .expect("build massrelay before running the SSH fixture");
+            let massrelay = || {
+                let mut child = Command::new(&binary);
+                child.arg("--state-dir").arg(state).kill_on_drop(true);
+                child
+            };
+            let proxy = || {
+                let mut child = massrelay();
+                child.args(["ssh-proxy", &key(&bob), &hex(&[7; 32])]);
+                child
+            };
+            let ssh = || {
+                let mut child = massrelay();
+                child.args(["ssh", &key(&bob), "id", "-u"]);
+                child
+            };
+
+            // A TCP grant alone opens neither the host-info nor SSH tunnel request.
+            let enable = |service| ControlRequest::Enable {
+                peer: "alice".into(),
+                service,
+            };
+            assert_eq!(
+                cmd(&bob, enable(tcp(22))).await,
+                ControlReply::Changed(true)
+            );
+            for result in [
+                ssh().output().await.unwrap(),
+                proxy().output().await.unwrap(),
+            ] {
+                assert!(!result.status.success());
+                assert!(
+                    String::from_utf8_lossy(&result.stderr).contains("not authorized"),
+                    "{result:?}"
+                );
+            }
+            assert!(!bob.path.join("ssh-host-ed25519").exists());
+
+            // An effective default shell grant admits the stock OpenSSH client.
+            let default = ControlRequest::SetDefault {
+                service: Service::Shell,
+                enabled: true,
+            };
+            assert_eq!(cmd(&bob, default).await, ControlReply::Changed(true));
+            let result = ssh().output().await.unwrap();
+            assert!(result.status.success(), "{result:?}");
+            let local_uid = Command::new("/usr/bin/id")
+                .arg("-u")
+                .output()
+                .await
+                .unwrap();
+            assert_eq!(result.stdout, local_uid.stdout);
+
+            // Use an SSH Include as a stock caller can. Both launches have
+            // independent client keys and the same authenticated host pin.
+            let included = n.root.join("ssh-alias");
+            let config = n.root.join("ssh-config");
+            let launch = ssh::Launch::prepare(&alice.path, key(&bob), None, &binary)
+                .await
+                .unwrap();
+            std::fs::write(&included, &launch.config).unwrap();
+            std::fs::write(&config, format!("Include \"{}\"\n", included.display())).unwrap();
+            let mut live = Command::new("/usr/bin/ssh")
+                .arg("-F")
+                .arg(&config)
+                .args([&launch.alias, "echo opened; exec /bin/cat"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut output = BufReader::new(live.stdout.take().unwrap());
+            let mut line = String::new();
+            output.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "opened\n");
+
+            let transfer = ssh::Launch::prepare(&alice.path, key(&bob), None, &binary)
+                .await
+                .unwrap();
+            let transfer_config = n.root.join("sftp-config");
+            std::fs::write(&transfer_config, &transfer.config).unwrap();
+            let source = n.root.join("payload");
+            let copy = n.root.join("copy");
+            std::fs::write(&source, b"massrelay fixture").unwrap();
+            let mut sftp = Command::new("/usr/bin/sftp")
+                .arg("-F")
+                .arg(&transfer_config)
+                .args(["-b", "-", &transfer.alias])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            sftp.stdin
+                .take()
+                .unwrap()
+                .write_all(
+                    format!("get \"{}\" \"{}\"\n", source.display(), copy.display()).as_bytes(),
+                )
+                .await
+                .unwrap();
+            let transferred = sftp.wait_with_output().await.unwrap();
+            assert!(transferred.status.success(), "{transferred:?}");
+            assert_eq!(std::fs::read(copy).unwrap(), b"massrelay fixture");
+
+            let identity = |config: &str| {
+                config
+                    .lines()
+                    .find(|line| line.starts_with("IdentityFile "))
+                    .unwrap()
+                    .to_owned()
+            };
+            let wrong_identity = n.root.join("wrong-identity");
+            std::fs::write(
+                &wrong_identity,
+                launch
+                    .config
+                    .replace(&identity(&launch.config), &identity(&transfer.config)),
+            )
+            .unwrap();
+            let denied = Command::new("/usr/bin/ssh")
+                .arg("-F")
+                .arg(wrong_identity)
+                .args([&launch.alias, "true"])
+                .kill_on_drop(true)
+                .output()
+                .await
+                .unwrap();
+            assert!(!denied.status.success());
+            assert!(
+                String::from_utf8_lossy(&denied.stderr).contains("Permission denied (publickey)")
+            );
+
+            // Changing the destination key also fails at the OpenSSH layer
+            // when a previously prepared config has the old host key.
+            let fingerprint = ssh::rotate_host_key(&bob.path).await.unwrap();
+            let wrong_host = Command::new("/usr/bin/ssh")
+                .arg("-F")
+                .arg(&config)
+                .args([&launch.alias, "true"])
+                .kill_on_drop(true)
+                .output()
+                .await
+                .unwrap();
+            assert!(!wrong_host.status.success());
+            assert!(
+                String::from_utf8_lossy(&wrong_host.stderr)
+                    .contains("Host key verification failed")
+            );
+            let changed = ssh().output().await.unwrap();
+            assert!(!changed.status.success());
+            assert!(String::from_utf8_lossy(&changed.stderr).contains("SSH host key changed"));
+            let replaced = massrelay()
+                .args([
+                    "ssh",
+                    "--replace-host-key",
+                    &fingerprint,
+                    &key(&bob),
+                    "true",
+                ])
+                .output()
+                .await
+                .unwrap();
+            assert!(replaced.status.success(), "{replaced:?}");
+
+            // Leave a second server at the banner, before authentication.
+            let mut preauth = proxy()
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut banner = BufReader::new(preauth.stdout.take().unwrap());
+            line.clear();
+            banner.read_line(&mut line).await.unwrap();
+            assert!(line.starts_with("SSH-2.0-"));
+            let disable = ControlRequest::Disable {
+                peer: "alice".into(),
+                service: Service::Shell,
+            };
+            assert_eq!(cmd(&bob, disable).await, ControlReply::Changed(true));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                assert!(!live.wait().await.unwrap().success());
+                assert!(!preauth.wait().await.unwrap().success());
+            })
+            .await
+            .unwrap();
+            let blocked = proxy().output().await.unwrap();
+            assert!(!blocked.status.success());
+            assert!(String::from_utf8_lossy(&blocked.stderr).contains("not authorized"));
+            let (sa, sb) = tokio::join!(ra.stop(), rb.stop());
+            assert!(
+                sa.owner_released
+                    && sb.owner_released
+                    && sa.aborted.is_empty()
+                    && sb.aborted.is_empty(),
+                "{sa:?} {sb:?}"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
     /// Start a runtime from owned values, as a service manager starts a service again.
     async fn start(
         path: &std::path::Path,
