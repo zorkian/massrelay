@@ -1,5 +1,8 @@
 # MassRelay
 
+> [!WARNING]
+> **Alpha software.** MassRelay has yet to undergo in-depth security threat modeling. We recommend against using it at this stage.
+
 Open a shell on your home workstation from your laptop, or reach a development service on another machine without opening a port on your router. MassRelay connects your devices in a small network and lets each device decide who can use its shell and TCP or UDP services.
 
 Connections go directly between devices when possible and fall back to a relay when needed. Either way, shell and port traffic is end-to-end encrypted. The same binary runs on your devices and can host a relay on Linux or macOS.
