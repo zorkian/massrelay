@@ -5173,6 +5173,7 @@ mod runtime {
         let alice = create(&n, "alice", Clock::System);
         let bob = join(&n, &alice, "bob", Clock::System);
         let carol = join(&n, &alice, "carol", Clock::System);
+        sync(&[&bob]);
         let book = Book::default();
         let ra = run(&alice, &book, n.mailbox.clone(), None).await;
         let rb = run(&bob, &book, n.mailbox.clone(), None).await;
@@ -5228,6 +5229,58 @@ mod runtime {
         )
         .unwrap();
         assert_eq!(r, ControlReply::Connected);
+
+        // Renaming the remote peer on the granting device preserves both
+        // its authorization on this connection and its persistent grant.
+        let rename = |peer: &str, alias: &str| ControlRequest::Rename {
+            peer: peer.into(),
+            alias: alias.into(),
+        };
+        assert!(matches!(
+            cmd(&bob, approve(&carol, "carol")).await,
+            ControlReply::Approved { fresh: true, .. }
+        ));
+        let before = crate::private::pairing::read_state(&bob.dev).unwrap();
+        let mut expected = before.peer(&alice.ep).unwrap().clone();
+        assert!(expected.pairing.is_some());
+        for unavailable in ["carol".to_owned(), key(&carol)] {
+            assert!(matches!(
+                cmd(&bob, rename("alice", &unavailable)).await,
+                ControlReply::Error(_)
+            ));
+        }
+        assert_eq!(
+            cmd(&bob, rename("alice", "workstation")).await,
+            ControlReply::Changed(true)
+        );
+        assert_eq!(
+            cmd(&bob, rename(&key(&alice), "workstation")).await,
+            ControlReply::Changed(false)
+        );
+        let after = crate::private::pairing::read_state(&bob.dev).unwrap();
+        expected.alias = "workstation".into();
+        assert_eq!(after.peer(&alice.ep), Some(&expected));
+        assert_eq!(after.peer(&carol.ep), before.peer(&carol.ep));
+        let enable_port = |peer: &str| ControlRequest::Enable {
+            peer: peer.into(),
+            service: tcp(port),
+        };
+        assert!(matches!(
+            cmd(&bob, enable_port("alice")).await,
+            ControlReply::Error(_)
+        ));
+        assert_eq!(
+            cmd(&bob, enable_port("workstation")).await,
+            ControlReply::Changed(false)
+        );
+        let ControlReply::Status(status) = cmd(&bob, ControlRequest::Status).await else {
+            panic!("status");
+        };
+        assert!(status.grants.contains(&(key(&alice), tcp(port))));
+        let peer = status.peers.iter().find(|p| p.key == key(&alice)).unwrap();
+        assert_eq!(peer.alias.as_deref(), Some("workstation"));
+        assert!(peer.paired);
+
         wire::frame(&mut sock, b"\x01hello").await.unwrap();
         wire::frame(&mut sock, &[crate::tunnel::EOF]).await.unwrap();
         assert_eq!(drain(&mut sock).await, (b"bye:hello".to_vec(), None));
@@ -5313,6 +5366,17 @@ mod runtime {
         let ended = async { while wire::read_frame(&mut sh).await.is_ok() {} };
         tokio::time::timeout(T, ended).await.unwrap();
         drop(sh);
+        let log = events(&bob);
+        for (event, alias) in [
+            ("approval_granted", "alice"),
+            ("peer_alias_renamed", "workstation"),
+            ("disconnected", "workstation"),
+        ] {
+            assert!(
+                find(&log, &[("event", event), ("peer_name", alias)]).is_some(),
+                "missing {event} for {alias}"
+            );
+        }
         assert_eq!(
             ra.stop().await,
             Stopped {

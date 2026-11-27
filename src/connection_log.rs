@@ -205,6 +205,10 @@ impl<'a> Event<'a> {
 }
 
 impl Session<'_> {
+    pub(crate) fn peer_id(&self) -> Option<EndpointId> {
+        self.peer_id
+    }
+
     pub(crate) fn service_details(&self) -> Option<(u64, Direction, Service)> {
         Some((self.id, self.direction, self.service?))
     }

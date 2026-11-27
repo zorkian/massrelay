@@ -116,10 +116,10 @@ use crate::{terminal, tunnel};
 
 use super::audit::{self, DeviceLog};
 use super::binding::EndpointKey;
-use super::codec::{hex, unhex};
+use super::codec::hex;
 use super::mailbox::Mailbox;
 use super::membership::{Clock, Device, MemberView};
-use super::pairing::{self, Decision, Owner, PairError, PairingState, Refusal};
+use super::pairing::{self, Decision, Owner, PairError, PairingState, Refusal, parse_key};
 use super::service::{
     CLOSE_AUTHORITY_ENDED, CLOSE_DONE, Node, PrivateRequest, ServiceStream, max_payload_frame,
 };
@@ -155,6 +155,10 @@ pub enum ControlRequest {
         peer: String,
         alias: String,
         reapprove: bool,
+    },
+    Rename {
+        peer: String,
+        alias: String,
     },
     Decline {
         peer: String,
@@ -386,32 +390,6 @@ pub fn offline_status<M: Mailbox>(device: &Device<M>) -> Result<StatusView, Pair
         halt,
         &PeerVersions::read(device.store().dir()),
     ))
-}
-
-/// An endpoint key written as 64 hex digits or in Iroh's own form.
-fn parse_key(s: &str) -> Option<EndpointKey> {
-    if s.len() == 64
-        && let Some(b) = unhex(s)
-    {
-        return b.try_into().ok();
-    }
-    s.parse::<EndpointId>().ok().map(|id| *id.as_bytes())
-}
-
-/// Resolve a selector to a key: an endpoint key, or an alias this device
-/// pinned. Roster names are never consulted.
-fn resolve(st: &PairingState, selector: &str) -> Result<EndpointKey, String> {
-    if let Some(key) = parse_key(selector) {
-        return Ok(key);
-    }
-    let mut hits = st.peers.iter().filter(|p| p.alias == selector);
-    match (hits.next(), hits.next()) {
-        (Some(p), None) => Ok(p.endpoint),
-        (None, _) => Err(format!(
-            "no peer pinned as {selector:?} on this device; name it by endpoint key"
-        )),
-        _ => Err(format!("{selector:?} names more than one pinned peer")),
-    }
 }
 
 // ------------------------------------------------------------------- runtime
@@ -869,8 +847,13 @@ fn manage<M: Mailbox + Send + Sync + 'static>(
     let node = &shared.node;
     let err = |e: PairError| format!("{e:?}");
     let run = || -> Result<ControlReply, String> {
+        if let ControlRequest::Rename { peer, alias } = &request {
+            return Ok(ControlReply::Changed(
+                node.rename(peer, alias).map_err(err)?,
+            ));
+        }
         let st = node.pairing_state().map_err(err)?;
-        let peer = |s: &str| resolve(&st, s);
+        let peer = |s: &str| st.resolve_selector(s);
         Ok(match request {
             ControlRequest::Status | ControlRequest::Peers => {
                 let members = node.member_view().map_err(err)?;
@@ -906,9 +889,6 @@ fn manage<M: Mailbox + Send + Sync + 'static>(
                 alias,
                 reapprove,
             } => {
-                if parse_key(&alias).is_some() {
-                    return Err("an alias must not look like an endpoint key".into());
-                }
                 let key = peer(&p)?;
                 let a = node.approve(&alias, &key, reapprove).map_err(err)?;
                 ControlReply::Approved {
@@ -943,6 +923,7 @@ fn manage<M: Mailbox + Send + Sync + 'static>(
                 ControlReply::Changed(node.clear_exclusion(&peer(&p)?, service).map_err(err)?)
             }
             ControlRequest::Ping { .. }
+            | ControlRequest::Rename { .. }
             | ControlRequest::Shell { .. }
             | ControlRequest::Connect { .. }
             | ControlRequest::Expose { .. } => {
@@ -967,7 +948,7 @@ async fn hold_exposure<M: Mailbox + Send + Sync + 'static>(
     let node = shared.node.clone();
     let made = tokio::task::spawn_blocking(move || {
         let st = node.pairing_state().map_err(|e| format!("{e:?}"))?;
-        let key = resolve(&st, &selector)?;
+        let key = st.resolve_selector(&selector)?;
         node.expose(&key, service, target)
             .map_err(|e| format!("{e:?}"))
     })
@@ -988,7 +969,7 @@ async fn hold_exposure<M: Mailbox + Send + Sync + 'static>(
         }
     };
     let peer = exposure.peer;
-    let alias = exposure.alias.clone();
+    let alias = log.alias(&peer).unwrap_or_else(|| exposure.alias.clone());
     let ready = ControlReply::Exposed {
         key: hex(&peer),
         alias: alias.clone(),
@@ -1007,6 +988,7 @@ async fn hold_exposure<M: Mailbox + Send + Sync + 'static>(
     };
     // Withdraws exactly this exposure and ends its sessions.
     drop(exposure);
+    let alias = log.alias(&peer).unwrap_or(alias);
     log.exposure("exposure_ended", &peer, &alias, service);
     let ended = ended?;
 
@@ -1121,7 +1103,9 @@ async fn outbound<M: Mailbox + Send + Sync + 'static>(
             .node
             .pairing_state()
             .map_err(|e| ("setup_failed", format!("{e:?}")))?;
-        let key = resolve(&st, selector).map_err(|e| ("unknown_peer", e))?;
+        let key = st
+            .resolve_selector(selector)
+            .map_err(|e| ("unknown_peer", e))?;
         track.peer(log, &key);
         let addr = peer_address(shared, &key).map_err(|e| ("setup_failed", e.to_string()))?;
         let opened = shared.node.open_service(&shared.endpoint, addr, req).await;
@@ -1460,8 +1444,11 @@ mod tests {
         let key = [7u8; 32];
         let mut st = PairingState::default();
         // A bare key always resolves, pinned or not.
-        assert_eq!(resolve(&st, &hex(&key)), Ok(key));
-        assert!(resolve(&st, "bob").is_err(), "unknown names never resolve");
+        assert_eq!(st.resolve_selector(&hex(&key)), Ok(key));
+        assert!(
+            st.resolve_selector("bob").is_err(),
+            "unknown names never resolve"
+        );
         st.peers.push(pairing::PeerRecord {
             endpoint: key,
             alias: "bob".into(),
@@ -1471,8 +1458,8 @@ mod tests {
             remote_order: 0,
             pairing: None,
         });
-        assert_eq!(resolve(&st, "bob"), Ok(key));
-        assert!(resolve(&st, &"z".repeat(64)).is_err());
+        assert_eq!(st.resolve_selector("bob"), Ok(key));
+        assert!(st.resolve_selector(&"z".repeat(64)).is_err());
         assert!(parse_key(&hex(&[1; 31])).is_none());
     }
 }

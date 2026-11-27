@@ -432,6 +432,10 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
         self.peers().approve(alias, peer, reapprove)
     }
 
+    pub fn rename(&self, selector: &str, alias: &str) -> Result<bool, PairError> {
+        self.peers().rename(selector, alias)
+    }
+
     pub fn decline(&self, peer: &EndpointKey) -> Result<(), PairError> {
         self.peers().decline(peer)
     }

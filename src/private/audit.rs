@@ -258,7 +258,7 @@ impl DeviceLog {
     }
 
     /// The local alias pinned to `key`, from the last snapshot.
-    fn alias(&self, key: &EndpointKey) -> Option<String> {
+    pub(super) fn alias(&self, key: &EndpointKey) -> Option<String> {
         lock(&self.seen)
             .as_ref()
             .and_then(|s| s.peers.get(key))
@@ -505,6 +505,9 @@ fn changes(own: Option<&EndpointKey>, before: &Snapshot, after: &Snapshot) -> Ve
         }
         let (b, a) = (before.peers.get(&key), after.peers.get(&key));
         if let Some(a) = a {
+            if b.is_some_and(|b| b.alias != a.alias) {
+                out.push(change("peer_alias_renamed", peer, None));
+            }
             let local_changed =
                 b.is_none_or(|b| (b.local, b.local_order) != (a.local, a.local_order));
             if local_changed {
@@ -627,6 +630,14 @@ impl<'a> Tracked<'a> {
         lock(&self.inner).session.set_service(service);
     }
 
+    fn refresh_alias(&self, session: &mut Session<'_>) {
+        if let Some(peer) = session.peer_id()
+            && let Some(alias) = self.log.alias(peer.as_bytes())
+        {
+            session.identify(peer, Some(alias));
+        }
+    }
+
     /// The service is running.
     pub fn connected(&self, connection: Option<&Connection>) {
         let mut t = lock(&self.inner);
@@ -643,6 +654,7 @@ impl<'a> Tracked<'a> {
                     },
                 );
             }
+            self.refresh_alias(&mut t.session);
             t.session.connected();
         }
     }
@@ -659,6 +671,7 @@ impl<'a> Tracked<'a> {
             if let Some((id, _, _)) = t.session.service_details() {
                 lock(&self.log.active).remove(&id);
             }
+            self.refresh_alias(&mut t.session);
             t.session.end(reason, exit_code);
         }
     }
@@ -748,6 +761,7 @@ pub fn operation(r: &ControlRequest) -> (&'static str, Option<&str>, Option<Serv
         ControlRequest::Ping { peer, .. } => ("ping", Some(peer), None),
         ControlRequest::Invite => ("issue_invite", None, None),
         ControlRequest::Approve { peer, .. } => ("approve", Some(peer), None),
+        ControlRequest::Rename { peer, .. } => ("rename", Some(peer), None),
         ControlRequest::Decline { peer } => ("decline", Some(peer), None),
         ControlRequest::Revoke { peer } => ("revoke", Some(peer), None),
         ControlRequest::Enable { peer, service } => ("enable", Some(peer), Some(*service)),

@@ -168,6 +168,12 @@ pub enum Command {
         #[arg(long)]
         reapprove: bool,
     },
+    /// Rename a peer's local alias on this device.
+    Rename {
+        /// Existing local alias or exact endpoint ID.
+        peer: String,
+        new_name: String,
+    },
     /// Decline a peer, ending any pairing with it.
     Decline { peer: String },
     /// Cut a peer off locally now, then remove it from the network.
@@ -293,6 +299,21 @@ pub async fn execute(state_dir: &Path, command: Command) -> Result<i32> {
             let note = if fresh { "" } else { " (unchanged)" };
             println!("Approved {key} as {}{note}", crate::visible(&alias));
             eprintln!("Pairing completes on the next connection with that device.");
+        }
+        Command::Rename { peer, new_name } => {
+            let request = ControlRequest::Rename {
+                peer,
+                alias: new_name.clone(),
+            };
+            let ControlReply::Changed(changed) = control(&dir, request).await? else {
+                bail!("unexpected rename reply");
+            };
+            let alias = crate::visible(&new_name);
+            if changed {
+                println!("Renamed peer to {alias} on this device.");
+            } else {
+                println!("Peer is already named {alias} on this device.");
+            }
         }
         Command::Decline { peer } => {
             let peer = peer_key(&dir, &peer).await?;

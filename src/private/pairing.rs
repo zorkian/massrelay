@@ -121,7 +121,7 @@ use crate::wire::{self, Service};
 
 use super::PROTOCOL;
 use super::binding::EndpointKey;
-use super::codec::{Dec, DecodeError, Enc, Hash, hash, hex, random};
+use super::codec::{Dec, DecodeError, Enc, Hash, hash, hex, random, unhex};
 use super::mailbox::Mailbox;
 use super::membership::{Advance, Device, Gate, MemberView, OpSummary, Settle, Stop};
 use super::store::Guard;
@@ -311,6 +311,35 @@ impl PairingState {
 
     fn peer_mut(&mut self, ep: &EndpointKey) -> Option<&mut PeerRecord> {
         self.peers.iter_mut().find(|p| &p.endpoint == ep)
+    }
+
+    /// Resolve an exact endpoint key or a locally pinned alias.
+    pub(super) fn resolve_selector(&self, selector: &str) -> Result<EndpointKey, String> {
+        if let Some(key) = parse_key(selector) {
+            return Ok(key);
+        }
+        let mut hits = self.peers.iter().filter(|p| p.alias == selector);
+        match (hits.next(), hits.next()) {
+            (Some(p), None) => Ok(p.endpoint),
+            (None, _) => Err(format!(
+                "no peer pinned as {selector:?} on this device; name it by endpoint key"
+            )),
+            _ => Err(format!("{selector:?} names more than one pinned peer")),
+        }
+    }
+
+    fn check_alias_binding(&self, alias: &str, peer: &EndpointKey) -> Result<(), PairError> {
+        if let Some(other) = self
+            .peers
+            .iter()
+            .find(|p| p.alias == alias && &p.endpoint != peer)
+        {
+            return Err(PairError::Alias(format!(
+                "alias {alias:?} is bound to {}",
+                hex(&other.endpoint)
+            )));
+        }
+        Ok(())
     }
 
     fn excluded(&self, ep: &EndpointKey, service: Service) -> bool {
@@ -1219,18 +1248,21 @@ impl<'d, 'o, M: Mailbox> Peers<'d, 'o, M> {
         Ok(f())
     }
 
-    fn scoped(view: &MemberView, st: &mut PairingState) -> Result<(), PairError> {
+    fn group_scope(view: &MemberView, st: &PairingState) -> Result<Hash, PairError> {
         if view.terminal {
             return Err(Refusal::Terminal.into());
         }
         let tag = view
             .group_tag
             .ok_or(Refusal::NotMember("this device is not a current member"))?;
-        match st.group_tag {
-            None => st.group_tag = Some(tag),
-            Some(t) if t == tag => {}
-            Some(_) => return Err(Refusal::WrongGroup.into()),
+        if st.group_tag.is_some_and(|current| current != tag) {
+            return Err(Refusal::WrongGroup.into());
         }
+        Ok(tag)
+    }
+
+    fn scoped(view: &MemberView, st: &mut PairingState) -> Result<(), PairError> {
+        st.group_tag = Some(Self::group_scope(view, st)?);
         st.pending_grants
             .retain(|(peer, _)| view.ineligible(peer).is_none());
         Ok(())
@@ -1318,16 +1350,7 @@ impl<'d, 'o, M: Mailbox> Peers<'d, 'o, M> {
             if let Some(why) = view.ineligible(peer) {
                 return Err(Refusal::NotMember(why).into());
             }
-            if let Some(other) = st
-                .peers
-                .iter()
-                .find(|p| p.alias == alias && &p.endpoint != peer)
-            {
-                return Err(PairError::Alias(format!(
-                    "alias {alias:?} is bound to {}",
-                    hex(&other.endpoint)
-                )));
-            }
+            st.check_alias_binding(alias, peer)?;
             let fresh = Decision::Approve { approval: random() };
             match st.peer_mut(peer) {
                 None => {
@@ -1359,6 +1382,36 @@ impl<'d, 'o, M: Mailbox> Peers<'d, 'o, M> {
                     ))
                 }
             }
+        })
+    }
+
+    /// Change an existing pin under the owner gate. Resolve the selector
+    /// under the same locks as the write so concurrent renames cannot
+    /// redirect a selector between lookup and update.
+    pub fn rename(&self, selector: &str, alias: &str) -> Result<bool, PairError> {
+        check_alias(alias)?;
+        let _reg = self.running()?;
+        let store = self.device.store();
+        let g = store.lock()?;
+        let view = self.device.member_view(&g)?;
+        // This change only updates the label, so it skips the decision
+        // transition's grant pruning and session invalidation.
+        store.update_aux(&g, AUX_NAME, PAIRING_FORMAT, |st: &mut PairingState| {
+            Self::group_scope(&view, st)?;
+            let key = st.resolve_selector(selector).map_err(PairError::Alias)?;
+            if let Some(why) = view.ineligible(&key) {
+                return Err(Refusal::NotMember(why).into());
+            }
+            st.check_alias_binding(alias, &key)?;
+            let peer = st.peer_mut(&key).ok_or_else(|| {
+                PairError::Alias("this endpoint has no local alias to rename".into())
+            })?;
+            if peer.alias == alias {
+                return Ok(false);
+            }
+            peer.alias = alias.to_owned();
+            super::fault::fail("pairing_save")?;
+            Ok(true)
         })
     }
 
@@ -2222,6 +2275,16 @@ impl Ending {
     }
 }
 
+/// An endpoint key written as 64 hex digits or in Iroh's own form.
+pub(super) fn parse_key(s: &str) -> Option<EndpointKey> {
+    if s.len() == 64
+        && let Some(b) = unhex(s)
+    {
+        return b.try_into().ok();
+    }
+    s.parse::<EndpointId>().ok().map(|id| *id.as_bytes())
+}
+
 fn check_alias(alias: &str) -> Result<(), PairError> {
     if alias.is_empty()
         || alias.len() > MAX_ALIAS
@@ -2229,6 +2292,11 @@ fn check_alias(alias: &str) -> Result<(), PairError> {
     {
         return Err(PairError::Alias(
             "alias must be 1 to 64 characters without spaces or controls".into(),
+        ));
+    }
+    if parse_key(alias).is_some() {
+        return Err(PairError::Alias(
+            "an alias must not look like an endpoint key".into(),
         ));
     }
     Ok(())
