@@ -40,7 +40,7 @@ try {
 
 ## Open your first remote shell
 
-Get a **relay locator** from your relay operator, or [set up your own relay](docs/private-discovery-setup.md). Then connect two devices.
+Get a **relay locator** from your relay operator. To host your own relay on Linux or macOS, start with `massrelay relay-init --help`.
 
 1. On your **workstation**, run `massrelay create` and paste the locator. Save the invite it prints, then run `massrelay run`. Keep it running while the laptop joins.
 2. Send the invite to your **laptop** through a trusted channel. Run `massrelay join`, paste the invite, then run `massrelay run`. An invite works once and expires in ten minutes. From an enrolled device that's running, use `massrelay invite` to make another.
@@ -122,9 +122,9 @@ The relay also hosts an encrypted mailbox for membership and invites. It can see
 
 Run `massrelay update` from a local terminal or SSH session. It downloads and checks the latest release, waits for active MassRelay sessions to finish, then restarts the installed service. If the new daemon fails to start, the updater restores the previous binary when it can do so safely.
 
-The command needs a release it can download without a GitHub account. To bring an older installation up to a version that supports `update`, rerun the installer and restart the service. See [how updating works](docs/updating.md) for installation requirements and interrupted updates.
+The command needs a release it can download without a GitHub account. To bring an older installation up to a version that supports `update`, rerun the installer and restart the service. If an update was interrupted, rerun `massrelay update` to resume recovery.
 
-If you're upgrading from relay-managed membership in v0.4.0 or earlier, [create a new encrypted network](docs/private-discovery-setup.md).
+If you're upgrading from relay-managed membership in v0.4.0 or earlier, create a new network using the setup above.
 
 ## Build from source
 
