@@ -245,9 +245,12 @@ try {
     if ($ConPty) {
         $tests = & cargo +stable test --locked --release --no-run --message-format=json |
             ForEach-Object { $_ | ConvertFrom-Json } |
-            Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.executable } |
-            Select-Object -Last 1 -ExpandProperty executable
-        Assert ([bool]$tests) 'Could not find the unit-test executable.'
+            Where-Object {
+                $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.executable -and
+                $_.target.name -eq 'massrelay' -and $_.target.kind -contains 'bin'
+            } |
+            Select-Object -ExpandProperty executable
+        Assert (@($tests).Count -eq 1) 'Expected one MassRelay unit-test executable.'
         $probe = "MassRelayConPtyProbe-$($id.Substring(0, 8))"
         $probeExe = Join-Path $root 'probe.exe'
         $done = Join-Path $root 'probe.result'
