@@ -527,6 +527,7 @@ pub enum AdmissionError {
 pub enum JoinError {
     NoPendingJoin,
     Waiting,
+    InviteUsed,
     ReplyUndecryptable,
     Malformed(String),
     /// Receipt, binding or Welcome signature rejected (unconfirmed fault).
@@ -1147,7 +1148,22 @@ impl<M: Mailbox> Device<M> {
         check_name_arg(name)?;
         let token = InviteToken::decode(invite)
             .map_err(|e| Error::Join(JoinError::Malformed(format!("invite: {e:?}"))))?;
-        let (store, g) = Store::create(dir, &State::new(endpoint.public()))?;
+        let (store, g) = if super::store::initialized(dir) {
+            let store = Store::open(dir)?;
+            let guard = store.lock()?;
+            let state: State = store.load(&guard)?;
+            if state.endpoint != endpoint.public()
+                || state.net.is_some()
+                || state.terminal.is_some()
+                || state.halt.is_some()
+                || state.pending_join.is_some()
+            {
+                return Err(Error::Busy("profile already initialized".into()));
+            }
+            (store, guard)
+        } else {
+            Store::create(dir, &State::new(endpoint.public()))?
+        };
         let file = store.new_mls_file(&g, "join")?;
         let now = clock.now();
         let (mls_key, kp_bytes, kp_ref) = store.with_mls(&g, &file, true, |p, _| {
@@ -3405,6 +3421,7 @@ impl<M: Mailbox> Device<M> {
         let (reply, _slot_bytes) = match self.check_reply(pj, token, bytes) {
             Ok(c) => c,
             Err(Error::Join(JoinError::Halted(why))) => return self.halt_join(pj, token, &why),
+            Err(Error::Join(JoinError::InviteUsed)) => return self.discard_used_invite(pj),
             Err(e) => return self.join_failed(pj, e),
         };
         let g = self.store.lock()?;
@@ -3433,6 +3450,20 @@ impl<M: Mailbox> Device<M> {
             Ok::<_, Error>(())
         })?;
         Err(e)
+    }
+
+    fn discard_used_invite(&self, pj: &PendingJoin) -> Result<(), Error> {
+        let g = self.store.lock()?;
+        // Clear only the exact pending attempt that read the verified receipt.
+        self.store.update(&g, |st: &mut State| {
+            if let Some(e) = join_install_blocked(st, pj) {
+                return Err(e);
+            }
+            st.pending_join = None;
+            Ok(())
+        })?;
+        self.store.delete_mls(&g, &pj.mls_file)?;
+        Err(JoinError::InviteUsed.into())
     }
 
     /// Checks that need no profile state: reply, receipt bindings and the
@@ -3469,9 +3500,12 @@ impl<M: Mailbox> Device<M> {
         {
             return Err(mismatch("receipt names another issuer or invite"));
         }
-        if r.request_digest != transcript.digest()
-            || r.joiner_endpoint != transcript.joiner_endpoint
-        {
+        let same_request = r.request_digest == transcript.digest();
+        let same_joiner = r.joiner_endpoint == transcript.joiner_endpoint;
+        if !same_request && !same_joiner {
+            return Err(JoinError::InviteUsed.into());
+        }
+        if !same_request || !same_joiner {
             return Err(mismatch("receipt is for another request"));
         }
         if r.key_package_ref != pj.key_package_ref {

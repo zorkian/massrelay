@@ -292,8 +292,9 @@ def _exercise(binary, root, processes):
     resumed = cli("b", "join", check=False)
     assert resumed.returncode == 1 and "already a member" in resumed.stderr
     # A used invite admits nobody else.
-    reused = cli("x", "join", "--bind", "127.0.0.1:0", data=invite + "\n", check=False)
+    reused = cli("c", "join", "--bind", "127.0.0.1:0", data=invite + "\n", check=False)
     assert reused.returncode == 1 and "used by another device" in reused.stderr, reused
+    assert "Membership: not joined" in status("c")
     run_b = run("b")
     eventually(lambda: members("a") == {b} and members("b") == {a}, "a and b see each other")
 

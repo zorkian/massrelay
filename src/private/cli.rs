@@ -772,14 +772,24 @@ async fn join(
         check_device_name(name).map_err(|error| anyhow!("{error}"))?;
     }
     let owner = claim(dir)?;
-    let profile = if store::initialized(dir) {
+    let saved = if store::initialized(dir) {
         let path = dir.to_path_buf();
         let st = blocking(move || Device::open(&path, Offline, Clock::System)?.state())
             .await?
             .map_err(membership)?;
-        let Some(pending) = st.pending_join else {
-            bail!("this device is already a member; run 'massrelay run'");
-        };
+        ensure!(
+            st.net.is_none(),
+            "this device is already a member; run 'massrelay run'"
+        );
+        ensure!(
+            st.terminal.is_none() && st.halt.is_none(),
+            "this device already has a membership profile; run 'massrelay status'"
+        );
+        Some((load(dir)?, st.pending_join))
+    } else {
+        None
+    };
+    let profile = if let Some((profile, Some(pending))) = saved {
         if let Some(text) = argument {
             let (_, bytes) = InviteEnvelope::open(&text)?;
             ensure!(
@@ -788,17 +798,22 @@ async fn join(
                  an invite to resume it"
             );
         }
-        load(dir)?
+        profile
     } else {
         let text = match argument {
             Some(text) => text,
             None => read_invite()?,
         };
         let (locator, bytes) = InviteEnvelope::open(&text)?;
-        let (profile, fresh) = setup_profile(dir, &locator)?;
+        let (profile, save) = if let Some((mut profile, None)) = saved {
+            profile.locator = locator.clone();
+            (profile, true)
+        } else {
+            setup_profile(dir, &locator)?
+        };
         let name = name.unwrap_or_else(|| default_name(profile.secret().public()));
         check_relay(&locator, bind).await?;
-        if fresh {
+        if save {
             crate::storage::save(dir, PROFILE_FILE, &profile)?;
         }
         let (path, key) = (dir.to_path_buf(), profile.key.0);
@@ -893,9 +908,8 @@ async fn wait_for_reply(device: Arc<Device<RelayMailbox>>) -> Result<()> {
             match blocking(move || d.complete_join()).await? {
                 Ok(()) => return Ok(()),
                 Err(MembershipError::Join(JoinError::Waiting)) => {}
-                Err(MembershipError::Join(JoinError::Mismatch(why))) => bail!(
-                    "this invite's reply admits another request ({why}): the invite was used by \
-                     another device; ask for a new one"
+                Err(MembershipError::Join(JoinError::InviteUsed)) => bail!(
+                    "this invite was used by another device; run 'massrelay join' with a fresh invite"
                 ),
                 Err(MembershipError::Mailbox(e)) => {
                     note(format!("the reply could not be read ({e:?}); retrying"))
@@ -1092,6 +1106,10 @@ async fn status(dir: &Path) -> Result<()> {
             if running { "running" } else { "not running" }
         );
         println!("Membership: this device was removed");
+        return Ok(());
+    }
+    if st.net.is_none() {
+        println!("Membership: not joined; run 'massrelay join' with a fresh invite");
         return Ok(());
     }
     let view = current_view(dir).await?;

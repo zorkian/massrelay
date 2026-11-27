@@ -1352,19 +1352,12 @@ fn joiner_verifies_reply_receipt_slot_and_welcome() {
     );
     alice.dev.dispatch_replies().unwrap();
     // Mallory holds the same invite secret but not the selected request.
-    assert!(matches!(
+    assert_eq!(
         mallory.m.dev.complete_join(),
-        Err(Error::Join(JoinError::Mismatch(_)))
-    ));
-    assert!(
-        mallory
-            .m
-            .state()
-            .pending_join
-            .unwrap()
-            .last_failure
-            .is_some()
+        Err(Error::Join(JoinError::InviteUsed))
     );
+    assert!(mallory.m.state().pending_join.is_none());
+    assert!(mls_files(&mallory.m).is_empty());
 
     let sealed = n
         .mailbox
@@ -4024,10 +4017,10 @@ mod service {
             ))),
             "{pass:?}"
         );
-        assert!(matches!(
+        assert_eq!(
             carol.m.dev.complete_join(),
-            Err(Error::Join(JoinError::Mismatch(_)))
-        ));
+            Err(Error::Join(JoinError::InviteUsed))
+        );
         assert_eq!(node.roster().unwrap().len(), 2);
     }
 
