@@ -1,6 +1,7 @@
 use std::io::{self, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt;
+#[cfg(not(target_os = "macos"))]
 use std::os::unix::net::UnixStream as StdStream;
 use std::path::Path;
 use std::process::Stdio;
@@ -8,7 +9,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use tempfile::{NamedTempFile, TempDir};
-use tokio::net::UnixStream;
+#[cfg(target_os = "macos")]
+use tokio::net::TcpStream as LocalStream;
+#[cfg(not(target_os = "macos"))]
+use tokio::net::UnixStream as LocalStream;
 use tokio::process::{Child, Command};
 
 use crate::mailbox::Bytes;
@@ -99,6 +103,25 @@ pub(in crate::private) async fn host_info(dir: &Path) -> Result<Host> {
 pub(in crate::private) struct Prepared {
     files: TempDir,
     user: String,
+    #[cfg(target_os = "macos")]
+    pair: (LocalStream, std::net::TcpStream),
+}
+
+#[cfg(any(test, target_os = "macos"))]
+async fn audit_socket_pair() -> Result<(tokio::net::TcpStream, std::net::TcpStream)> {
+    // Apple sshd needs an IP address for its audit session. The listener
+    // exists only while we connect our own socket and close it before spawn.
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+    let local = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
+    let (remote, peer) = listener.accept().await?;
+    drop(listener);
+    ensure!(
+        peer == local.local_addr()?,
+        "unexpected connection while preparing the OpenSSH audit socket"
+    );
+    let remote = remote.into_std()?;
+    remote.set_nonblocking(false)?;
+    Ok((local, remote))
 }
 
 impl Prepared {
@@ -113,7 +136,14 @@ impl Prepared {
             keys::public_line(key) + "\n",
         )
         .await?;
-        Ok(Self { files, user })
+        #[cfg(target_os = "macos")]
+        let pair = tokio::time::timeout(Duration::from_secs(2), audit_socket_pair()).await??;
+        Ok(Self {
+            files,
+            user,
+            #[cfg(target_os = "macos")]
+            pair,
+        })
     }
 
     fn command(&self, dir: &Path) -> Command {
@@ -188,17 +218,22 @@ impl Prepared {
 
     // This runs under SessionHandle's startup lock. The daemon side is
     // asynchronous. OpenSSH gets blocking descriptors for its own side.
-    pub(in crate::private) fn start(self, dir: &Path) -> Result<(UnixStream, Sshd)> {
-        let (local, remote) = StdStream::pair()?;
-        local.set_nonblocking(true)?;
-        let local = UnixStream::from_std(local)?;
+    pub(in crate::private) fn start(self, dir: &Path) -> Result<(LocalStream, Sshd)> {
+        #[cfg(not(target_os = "macos"))]
+        let (local, remote) = {
+            let (local, remote) = StdStream::pair()?;
+            local.set_nonblocking(true)?;
+            (LocalStream::from_std(local)?, remote)
+        };
         let stderr = if cfg!(test) {
             Stdio::inherit()
         } else {
             Stdio::null()
         };
-        let child = self
-            .command(dir)
+        let mut command = self.command(dir);
+        #[cfg(target_os = "macos")]
+        let (local, remote) = self.pair;
+        let child = command
             .arg("-i")
             .stdin(OwnedFd::from(remote.try_clone()?))
             .stdout(OwnedFd::from(remote))
@@ -231,4 +266,20 @@ impl Sshd {
             let _ = self.child.kill().await;
         }
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn ssh_audit_socket_only_accepts_the_connected_peer_after_preparation() {
+    let (local, remote) = audit_socket_pair().await.unwrap();
+    assert_eq!(remote.peer_addr().unwrap(), local.local_addr().unwrap());
+    let address = remote.local_addr().unwrap();
+    assert!(address.ip().is_loopback());
+    assert_eq!(
+        tokio::net::TcpStream::connect(address)
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::ConnectionRefused
+    );
 }
