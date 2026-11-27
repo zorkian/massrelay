@@ -117,6 +117,12 @@
 //! PTY reaper that cannot reap its shell. In either case the `Node` is
 //! kept until it finishes (or the process exits) and `Stopped` says so.
 //!
+//! # OpenSSH client entries
+//!
+//! While the profile holds `ssh-client.conf`, a background task keeps OpenSSH
+//! entries there for the paired peers this device confirmed (`ssh::managed`).
+//! Control mutations and membership passes wake it.
+//!
 //! # Event log
 //!
 //! The runtime appends device events (start and stop, every inbound and
@@ -543,6 +549,8 @@ pub struct Config {
     pub log_file: Option<PathBuf>,
     /// How long an update's admission hold lasts without its commit.
     pub hold_lease: Duration,
+    /// Upkeep of the opt-in OpenSSH client entries.
+    pub ssh: ssh::Settings,
 }
 
 impl Config {
@@ -554,6 +562,7 @@ impl Config {
             addresses: Arc::new(|key| EndpointId::from_bytes(key).ok().map(EndpointAddr::new)),
             log_file: None,
             hold_lease: HOLD_LEASE,
+            ssh: ssh::Settings::default(),
         }
     }
 }
@@ -566,6 +575,8 @@ struct Shared<M: Mailbox> {
     hold_lease: Duration,
     /// Signalled when an update retired this runtime.
     retired: Arc<tokio::sync::Notify>,
+    /// Signalled when this device's peers may have changed.
+    peers_changed: Arc<tokio::sync::Notify>,
 }
 
 /// A running private profile. Drop stops admission and retires sessions
@@ -636,6 +647,7 @@ impl<M: Mailbox + Send + Sync + 'static> Runtime<M> {
             last_sync: Mutex::new(None),
             hold_lease: config.hold_lease,
             retired: retired.clone(),
+            peers_changed: Arc::default(),
         });
         let mut tasks = vec![];
 
@@ -708,11 +720,26 @@ impl<M: Mailbox + Send + Sync + 'static> Runtime<M> {
                                 Err(e) => format!("membership pass failed: {e}"),
                             };
                             *shared.last_sync.lock().expect("sync note") = Some(note);
+                            shared.peers_changed.notify_one();
                         }
                     }
                 }
             };
             tasks.push(("membership", tokio::spawn(sync)));
+        }
+
+        #[cfg(any(unix, windows))]
+        {
+            let entries = ssh::maintain(
+                shared.node.clone(),
+                shared.endpoint.clone(),
+                shared.addresses.clone(),
+                config.dir.clone(),
+                config.ssh,
+                shared.peers_changed.clone(),
+                stopped(stopping.clone()),
+            );
+            tasks.push(("ssh", tokio::spawn(entries)));
         }
 
         log.started();
@@ -1020,6 +1047,7 @@ async fn serve_control<M: Mailbox + Send + Sync + 'static>(
                 let reply = manage(&shared2, request);
                 if changes {
                     audit::observe(&shared2.node, true);
+                    shared2.peers_changed.notify_one();
                 }
                 reply
             })
@@ -1287,8 +1315,9 @@ async fn hold_exposure<M: Mailbox + Send + Sync + 'static>(
     Ok(())
 }
 
-fn peer_address<M: Mailbox>(shared: &Shared<M>, key: &EndpointKey) -> Result<EndpointAddr> {
-    let addr = (shared.addresses)(key).context("no address is known for this peer")?;
+/// The address to dial for `key`, which must name exactly that endpoint.
+pub(super) fn peer_address(addresses: &Addresses, key: &EndpointKey) -> Result<EndpointAddr> {
+    let addr = addresses(key).context("no address is known for this peer")?;
     ensure!(
         addr.id.as_bytes() == key,
         "the peer's address names a different endpoint"
@@ -1312,7 +1341,7 @@ async fn ping_peer<M: Mailbox + Send + Sync + 'static>(
         .pairing_state()
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
     let key = state.resolve_selector(peer).map_err(anyhow::Error::msg)?;
-    let addr = peer_address(shared, &key)?;
+    let addr = peer_address(&shared.addresses, &key)?;
     let opened = timeout(
         wire::RPC_TIMEOUT * 2,
         shared.node.open_ping(&shared.endpoint, addr),
@@ -1411,7 +1440,8 @@ async fn outbound<M: Mailbox + Send + Sync + 'static>(
             .resolve_selector(selector)
             .map_err(|e| ("unknown_peer", e))?;
         track.peer(log, &key);
-        let addr = peer_address(shared, &key).map_err(|e| ("setup_failed", e.to_string()))?;
+        let addr =
+            peer_address(&shared.addresses, &key).map_err(|e| ("setup_failed", e.to_string()))?;
         let opened = match req {
             OutboundRequest::Service(req) => {
                 shared.node.open_service(&shared.endpoint, addr, req).await

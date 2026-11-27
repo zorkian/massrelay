@@ -5182,6 +5182,7 @@ mod runtime {
     #[ignore = "requires Windows OpenSSH and a previously built massrelay executable"]
     async fn windows_ssh_uses_the_shell_grant_and_cuts_live_transports() {
         use crate::private::cli;
+        use std::io::Write as _;
         use std::process::Stdio;
         use tokio::io::{AsyncBufReadExt, BufReader};
         use tokio::process::Command;
@@ -5192,11 +5193,16 @@ mod runtime {
             let bob = join(&n, &alice, &format!("bob/{}", cli::DIR_NAME), Clock::System);
             let (a, b) = tokio::join!(endpoint(&alice.secret), endpoint(&bob.secret));
             let addresses = Arc::new(BTreeMap::from([(alice.ep, addr(&a)), (bob.ep, addr(&b))]));
+            let binary = crate::private::ssh::worker_executable().unwrap();
             let config = |member: &Member| {
                 let mut config = Config::new(&member.path);
                 let addresses = addresses.clone();
                 config.addresses = Arc::new(move |key| addresses.get(key).cloned());
                 config.sync_every = None;
+                config.ssh.program = Some(binary.clone());
+                config.ssh.check_every = Duration::from_millis(100);
+                config.ssh.refresh_every = Duration::from_secs(2);
+                config.ssh.retry_after = Duration::from_millis(250);
                 config
             };
             let (ra, rb) = tokio::join!(
@@ -5207,7 +5213,6 @@ mod runtime {
             cmd(&alice, approve(&bob, "bob")).await;
             cmd(&bob, approve(&alice, "alice")).await;
 
-            let binary = crate::private::ssh::worker_executable().unwrap();
             let ssh = || {
                 let mut child = Command::new(&binary);
                 child
@@ -5229,6 +5234,40 @@ mod runtime {
             let result = ssh().arg("echo ready & exit /b 7").output().await.unwrap();
             assert_eq!(result.status.code(), Some(7), "{result:?}");
             assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "ready");
+            let managed_config = alice.path.join(crate::ssh_install::CLIENT_CONFIG);
+            let mut saved = crate::windows_service::private_marker(&alice.path).unwrap();
+            saved
+                .write_all(br#"{"namespace":1,"names":{},"hosts":{}}"#)
+                .unwrap();
+            saved
+                .persist(alice.path.join(crate::ssh_install::CLIENT_STATE))
+                .unwrap();
+            crate::windows_service::private_marker(&alice.path)
+                .unwrap()
+                .persist(&managed_config)
+                .unwrap();
+            tokio::time::timeout(T, async {
+                while !std::fs::read_to_string(&managed_config)
+                    .is_ok_and(|contents| contents.contains("Host massrelay-bob mr-bob\n"))
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .expect("the managed Windows SSH aliases should appear after grant confirmation");
+            let stock = crate::private::ssh::openssh("ssh").unwrap();
+            for alias in ["massrelay-bob", "mr-bob"] {
+                let result = Command::new(&stock)
+                    .arg("-F")
+                    .arg(&managed_config)
+                    .args([alias, "echo managed&exit /b 7"])
+                    .kill_on_drop(true)
+                    .output()
+                    .await
+                    .unwrap();
+                assert_eq!(result.status.code(), Some(7), "{result:?}");
+                assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "managed");
+            }
 
             let mut live = ssh()
                 .arg("echo opened&set /p massrelay_wait=")
@@ -5353,13 +5392,7 @@ mod runtime {
             cmd(&alice, approve(&bob, "bob")).await;
             cmd(&bob, approve(&alice, "alice")).await;
             let state = alice.path.parent().unwrap();
-            let binary = std::env::current_exe()
-                .unwrap()
-                .ancestors()
-                .skip(1)
-                .map(|dir| dir.join("massrelay"))
-                .find(|path| path.is_file())
-                .expect("build massrelay before running the SSH fixture");
+            let binary = built_massrelay();
             let massrelay = || {
                 let mut child = Command::new(&binary);
                 child.arg("--state-dir").arg(state).kill_on_drop(true);
@@ -5561,6 +5594,238 @@ mod runtime {
         })
         .await
         .unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn built_massrelay() -> PathBuf {
+        std::env::current_exe()
+            .unwrap()
+            .ancestors()
+            .skip(1)
+            .map(|dir| dir.join("massrelay"))
+            .find(|path| path.is_file())
+            .expect("build massrelay before running the SSH fixture")
+    }
+
+    /// Wait until `ready` yields a value.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn eventually<T>(what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
+        let found = async {
+            loop {
+                if let Some(found) = ready() {
+                    return found;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(T, found)
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting until {what}"))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires system OpenSSH and a previously built massrelay binary"]
+    async fn private_ssh_managed_entries_follow_authenticated_access() {
+        use crate::private::cli;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        use tokio::process::Command;
+
+        let n = net();
+        let book = Book::default();
+        let alice = create(&n, &format!("alice/{}", cli::DIR_NAME), Clock::System);
+        let bob = join(&n, &alice, &format!("bob/{}", cli::DIR_NAME), Clock::System);
+        let binary = built_massrelay();
+        let launch = async |member: &Member| {
+            let e = endpoint(&member.secret).await;
+            book.lock().unwrap().insert(member.ep, addr(&e));
+            let addresses = book.clone();
+            let mut config = Config::new(&member.path);
+            config.sync_every = None;
+            config.addresses = Arc::new(move |k| addresses.lock().unwrap().get(k).cloned());
+            config.ssh.check_every = Duration::from_millis(100);
+            config.ssh.retry_after = Duration::from_millis(100);
+            config.ssh.refresh_every = Duration::from_millis(400);
+            config.ssh.probe_deadline = Duration::from_secs(2);
+            config.ssh.program = Some(binary.clone());
+            Runtime::start(config, n.mailbox.clone(), Clock::System, e)
+                .await
+                .unwrap()
+        };
+        let ra = launch(&alice).await;
+        let rb = launch(&bob).await;
+        let shell = |enable: bool| {
+            let peer = "alice".into();
+            let service = Service::Shell;
+            if enable {
+                ControlRequest::Enable { peer, service }
+            } else {
+                ControlRequest::Disable { peer, service }
+            }
+        };
+        cmd(&alice, approve(&bob, "Lab!")).await;
+        cmd(&bob, approve(&alice, "alice")).await;
+        assert_eq!(cmd(&bob, shell(true)).await, ControlReply::Changed(true));
+
+        // Without the installer's file nothing is asked of the peer or written.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let config = alice.path.join("ssh-client.conf");
+        let saved = alice.path.join("ssh-client.json");
+        let identity = alice.path.join(format!("ssh-client-key-{}", key(&bob)));
+        assert!(!config.exists() && !saved.exists() && !identity.exists());
+        assert!(!bob.path.join("ssh-host-ed25519").exists());
+
+        // The file appearing under a running runtime opts the profile in.
+        let opt_in = || {
+            if !saved.exists() {
+                std::fs::write(&saved, br#"{"namespace":1,"names":{},"hosts":{}}"#).unwrap();
+            }
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&config)
+                .unwrap();
+        };
+        opt_in();
+        let text = || std::fs::read_to_string(&config).unwrap();
+        let listed = || Some(text()).filter(|text| text.contains("Host massrelay-lab mr-lab\n"));
+        let removed = || text().is_empty().then_some(());
+        let first = eventually("the peer is confirmed", listed).await;
+        assert_eq!(
+            std::fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let private_key = std::fs::read(&identity).unwrap();
+
+        // Stock OpenSSH reaches the peer through an Include of the managed file.
+        let included = n.root.join("ssh-config");
+        let fallback_hosts = n.root.join("fallback-hosts");
+        std::fs::write(&fallback_hosts, b"").unwrap();
+        std::fs::write(
+            &included,
+            format!(
+                "Include \"{}\"\nHost *\n    KnownHostsCommand /bin/cat \"{}\"\n",
+                config.display(),
+                fallback_hosts.display(),
+            ),
+        )
+        .unwrap();
+        let ssh = async |alias: &str| {
+            Command::new("/usr/bin/ssh")
+                .arg("-F")
+                .arg(&included)
+                .args([alias, "id", "-u"])
+                .kill_on_drop(true)
+                .output()
+                .await
+                .unwrap()
+        };
+        let uid = Command::new("/usr/bin/id")
+            .arg("-u")
+            .output()
+            .await
+            .unwrap();
+        for alias in ["massrelay-lab", "mr-lab"] {
+            let result = tokio::time::timeout(T, ssh(alias)).await.unwrap();
+            assert!(result.status.success(), "{result:?}");
+            assert_eq!(result.stdout, uid.stdout);
+        }
+
+        // A changed host key stays untrusted until `massrelay ssh` replaces the pin.
+        let hosts = alice.path.join(format!("ssh-client-hosts-{}", key(&bob)));
+        let pinned = std::fs::read_to_string(&hosts).unwrap();
+        let fingerprint = crate::private::ssh::rotate_host_key(&bob.path)
+            .await
+            .unwrap();
+        let alternate = Command::new("/usr/bin/ssh-keygen")
+            .args(["-y", "-f"])
+            .arg(bob.path.join("ssh-host-ed25519"))
+            .output()
+            .await
+            .unwrap();
+        assert!(alternate.status.success(), "{alternate:?}");
+        std::fs::write(
+            &fallback_hosts,
+            format!(
+                "massrelay-lab {}",
+                String::from_utf8(alternate.stdout).unwrap()
+            ),
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(std::fs::read_to_string(&hosts).unwrap(), pinned);
+        let rejected = tokio::time::timeout(T, ssh("mr-lab")).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains("Host key verification failed"),
+            "{rejected:?}"
+        );
+        crate::private::ssh::Launch::prepare(&alice.path, key(&bob), Some(&fingerprint), &binary)
+            .await
+            .unwrap();
+        eventually("the replaced pin is used", || {
+            (std::fs::read_to_string(&hosts).unwrap() != pinned).then_some(())
+        })
+        .await;
+        let replaced = tokio::time::timeout(T, ssh("mr-lab")).await.unwrap();
+        assert!(replaced.status.success(), "{replaced:?}");
+
+        // An authenticated denial removes the entry; the grant brings back the same one.
+        assert_eq!(cmd(&bob, shell(false)).await, ControlReply::Changed(true));
+        eventually("the denied entry is removed", removed).await;
+        assert_eq!(cmd(&bob, shell(true)).await, ControlReply::Changed(true));
+        assert_eq!(eventually("access returns", listed).await, first);
+        assert_eq!(std::fs::read(&identity).unwrap(), private_key);
+
+        // An unreachable peer keeps its last confirmed entry, for seven days.
+        assert!(rb.stop().await.owner_released);
+        let record = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(&saved).unwrap()).unwrap()
+        };
+        let confirmed = record()["hosts"][key(&bob)]["confirmed"].clone();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(text(), first);
+        assert_eq!(record()["hosts"][key(&bob)]["confirmed"], confirmed);
+        let age = |days: u64| {
+            let mut aged = record();
+            aged["hosts"][key(&bob)]["confirmed"] =
+                (crate::storage::now() - days * 24 * 3600).into();
+            std::fs::write(&saved, serde_json::to_vec(&aged).unwrap()).unwrap();
+        };
+        age(6);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(text(), first);
+        age(8);
+        eventually("the expired entry is removed", removed).await;
+        assert_eq!(record()["names"]["lab"], serde_json::json!(key(&bob)));
+
+        // The peer declining is a denial proved on the exchange itself.
+        let rb = launch(&bob).await;
+        eventually("the peer is confirmed again", listed).await;
+        let decline = ControlRequest::Decline {
+            peer: "alice".into(),
+        };
+        assert_eq!(cmd(&bob, decline).await, ControlReply::Done);
+        eventually("the declined entry is removed", removed).await;
+        cmd(&bob, approve(&alice, "alice")).await;
+        assert_eq!(cmd(&bob, shell(true)).await, ControlReply::Changed(true));
+        eventually("the new approval is confirmed", listed).await;
+
+        // A local cutoff removes the entry without the peer, and a later approval of
+        // the same label does not move its alias.
+        assert!(rb.stop().await.owner_released);
+        let cutoff = ControlRequest::Revoke { peer: key(&bob) };
+        assert!(matches!(
+            cmd(&alice, cutoff).await,
+            ControlReply::CutOff { .. }
+        ));
+        eventually("the cut off entry is removed", removed).await;
+
+        // Removing the file opts out, and the runtime does not bring it back.
+        std::fs::remove_file(&config).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!config.exists());
+        assert!(ra.stop().await.owner_released);
     }
 
     /// Start a runtime from owned values, as a service manager starts a service again.

@@ -2,19 +2,20 @@
 # Native acceptance for 'massrelay update' against the systemd user manager.
 #
 #     cargo build
-#     tests/update-systemd.sh target/debug/massrelay
+#     MASSRELAY_DISPOSABLE_SSH_HOME=1 tests/update-systemd.sh target/debug/massrelay
 #
-# Everything is disposable: a temporary state directory with an offline fixture profile, a
-# temporary copy of the program, and that profile's own unit (massrelay-client-<hash>.service),
-# all removed on exit. No other unit and no existing profile is touched. The release download
-# is not exercised; the exchange, the manager's restart policy and the rollback are, with a
-# real runtime process under the real manager.
+# Run under a disposable OS account, since install writes to its OpenSSH configuration.
+# The fixture removes its state, executable, and systemd unit on exit. It exercises the
+# exchange, the manager's restart policy and rollback with a real runtime and manager.
 set -eu
 
 fail() {
     printf '%s\n' "$*" >&2
     exit 1
 }
+
+[ "${MASSRELAY_DISPOSABLE_SSH_HOME:-}" = 1 ] ||
+    fail 'Run with a disposable OS account and set MASSRELAY_DISPOSABLE_SSH_HOME=1; install modifies its SSH config.'
 
 binary=${1:-target/debug/massrelay}
 [ -x "$binary" ] || fail "Build massrelay first: $binary is not an executable."

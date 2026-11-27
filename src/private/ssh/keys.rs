@@ -5,7 +5,7 @@ use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use tokio::process::Command;
 
-pub(super) fn openssh(name: &str) -> Result<std::path::PathBuf> {
+pub(crate) fn openssh(name: &str) -> Result<std::path::PathBuf> {
     #[cfg(unix)]
     let path = Path::new("/usr/bin").join(name);
     #[cfg(windows)]
@@ -52,6 +52,49 @@ pub(super) async fn generate(path: &Path) -> Result<[u8; 32]> {
         .context("start OpenSSH key generation")?;
     ensure!(status.success(), "OpenSSH key generation failed");
     public_key(path).await
+}
+
+/// The public key of the private key `dir/name`, which is generated if it is missing.
+pub(super) async fn persistent(dir: &Path, name: &str) -> Result<[u8; 32]> {
+    let path = dir.join(name);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            ensure!(metadata.is_file(), "{name} is not a regular file");
+            #[cfg(windows)]
+            crate::windows_service::ssh_files::check_managed_file(&path)?;
+            return public_key(&path).await;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("inspect {name}")),
+    }
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("ssh-keygen-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let staging = builder.tempdir_in(dir)?;
+    let generated = staging.path().join("key");
+    let key = generate(&generated).await?;
+    // Windows flushes only through a handle with write access.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&generated)?
+        .sync_all()?;
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        let mut protected = crate::windows_service::private_marker(dir)?;
+        protected.write_all(&std::fs::read(&generated)?)?;
+        protected.as_file().sync_all()?;
+        protected.persist_noclobber(&path)?;
+    }
+    #[cfg(unix)]
+    std::fs::rename(&generated, &path).with_context(|| format!("save {name}"))?;
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(key)
 }
 
 pub(super) async fn public_key(path: &Path) -> Result<[u8; 32]> {

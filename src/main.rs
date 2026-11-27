@@ -21,6 +21,8 @@ mod private_relay;
 mod slot_store;
 #[allow(dead_code)]
 mod slot_wire;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+mod ssh_install;
 mod storage;
 mod tcp;
 mod terminal;
@@ -338,10 +340,13 @@ async fn execute(cli: Cli) -> Result<i32> {
         return Ok(0);
     };
     match command {
+        // Only an install changes the account's SSH configuration, once its service runs.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        Command::Install => background_service::install(&dir)?,
+        Command::Install => ssh_install::register(&background_service::install(&dir)?)?,
         #[cfg(windows)]
-        Command::Install(options) => background_service::install(&dir, options)?,
+        Command::Install(options) => {
+            ssh_install::register(&background_service::install(&dir, options)?)?
+        }
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         Command::Start => background_service::control(&dir, ServiceAction::Start)?,
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]

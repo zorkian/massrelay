@@ -1,3 +1,6 @@
+use std::path::PathBuf;
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 use crate::mailbox::Bytes;
@@ -26,6 +29,33 @@ pub(super) fn is_info(header: &[u8]) -> bool {
 
 pub(super) fn is_tunnel(header: &[u8]) -> bool {
     header == TUNNEL
+}
+
+/// How the runtime keeps its OpenSSH client entries (see `managed`).
+#[derive(Clone, Debug)]
+pub struct Settings {
+    /// How often the opt-in file and this device's peers are checked.
+    pub check_every: Duration,
+    /// How long a confirmation is used before the peer is asked again.
+    pub refresh_every: Duration,
+    /// First wait after any other answer; it doubles up to `refresh_every`.
+    pub retry_after: Duration,
+    /// Bound on one request to a peer.
+    pub probe_deadline: Duration,
+    /// Program the entries' `ProxyCommand` runs (`None`: the runtime's own).
+    pub program: Option<PathBuf>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            check_every: Duration::from_secs(5),
+            refresh_every: Duration::from_secs(300),
+            retry_after: Duration::from_secs(30),
+            probe_deadline: crate::wire::RPC_TIMEOUT * 2,
+            program: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,3 +100,11 @@ pub(crate) use windows::{WORKER_ARG, run_worker};
 
 #[cfg(any(unix, windows))]
 mod keys;
+
+#[cfg(any(unix, windows))]
+mod managed;
+#[cfg(any(unix, windows))]
+pub(super) use managed::maintain;
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+pub(crate) use keys::openssh;

@@ -87,6 +87,8 @@ use crate::{
     },
 };
 
+pub mod ssh_files;
+
 const ELEVATE: &str =
     "Windows lets only an elevated PowerShell (Run as administrator) manage services";
 const SERVICE_LOGON_RIGHT: &str = "SeServiceLogonRight";
@@ -101,7 +103,8 @@ const INHERIT_ONLY: u8 = 0x8;
 
 // ------------------------------------------------------------------ install
 
-pub fn install(dir: &Path, options: InstallOptions) -> Result<()> {
+/// Returns the canonical state directory the service was installed for.
+pub fn install(dir: &Path, options: InstallOptions) -> Result<PathBuf> {
     let dir = dir
         .canonicalize()
         .context("resolve the device state directory")?;
@@ -253,7 +256,7 @@ pub fn install(dir: &Path, options: InstallOptions) -> Result<()> {
         Path::new(&dir).join(EVENT_LOG).display()
     );
     println!("Read service diagnostics with 'massrelay logs'.");
-    Ok(())
+    Ok(dir.into())
 }
 
 pub fn control(dir: &Path, action: ServiceAction) -> Result<()> {
@@ -688,9 +691,16 @@ struct PrivateFile(SECURITY_ATTRIBUTES);
 
 impl PrivateFile {
     fn new(account: &Account) -> Result<Self> {
+        Self::inheriting(account, "")
+    }
+
+    /// Owned by the account, whose ordinary token keeps access to what an elevated one
+    /// creates, and open only to it, SYSTEM and administrators. `flags` say what a
+    /// directory's entries pass on.
+    fn inheriting(account: &Account, flags: &str) -> Result<Self> {
+        let sid = &account.sid;
         let sddl = wide(format!(
-            "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{})",
-            account.sid
+            "O:{sid}D:P(A;{flags};FA;;;SY)(A;{flags};FA;;;BA)(A;{flags};FA;;;{sid})"
         ))?;
         let mut descriptor = null_mut();
         // SAFETY: `sddl` is NUL-terminated and the output is writable.
@@ -778,7 +788,17 @@ pub fn private_audit(path: &Path) -> Result<File> {
         metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
         "the audit log must be a regular file"
     );
-    let permissions = read_security(path, |owner, dacl, descriptor| {
+    let permissions = handle_security(path, &file)?;
+    ensure!(
+        super::untrusted(&permissions, Role::Private, &account.sid).is_none(),
+        "the audit log has unsafe permissions; restrict access before restarting MassRelay"
+    );
+    Ok(file)
+}
+
+/// The permissions of an open file.
+fn handle_security(path: &Path, file: &File) -> Result<Security> {
+    read_security(path, |owner, dacl, descriptor| {
         // SAFETY: the handle is live and the outputs are writable.
         unsafe {
             GetSecurityInfo(
@@ -792,12 +812,7 @@ pub fn private_audit(path: &Path) -> Result<File> {
                 descriptor,
             )
         }
-    })?;
-    ensure!(
-        super::untrusted(&permissions, Role::Private, &account.sid).is_none(),
-        "the audit log has unsafe permissions; restrict access before restarting MassRelay"
-    );
-    Ok(file)
+    })
 }
 
 fn security(path: &Path) -> Result<Security> {

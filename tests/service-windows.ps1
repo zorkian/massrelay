@@ -11,9 +11,10 @@ password:
   -Password               The account's existing password, on a machine you keep:
                           ./tests/service-windows.ps1 -Password (Read-Host -AsSecureString)
 
-Run it from an elevated PowerShell in the repository, after 'cargo build --release'. It
-registers a service for a throwaway state directory under the user profile and removes it.
-With -Password the account keeps the "Log on as a service" right the install granted.
+Run it from an elevated PowerShell under a disposable account, after 'cargo build --release'.
+Outside GitHub Actions, set MASSRELAY_DISPOSABLE_SSH_HOME=1 to confirm the account is disposable.
+Install edits that account's OpenSSH configuration and may grant "Log on as a service".
+The fixture removes its service and throwaway state directory on exit.
 
 -ConPty also launches PowerShell through ConPTY under a service logon (session 0,
 no interactive console) by registering a test executable as a throwaway service.
@@ -31,6 +32,9 @@ Set-StrictMode -Version Latest
 
 if (-not $IsWindows) {
     throw 'This fixture needs Windows.'
+}
+if ($env:GITHUB_ACTIONS -ne 'true' -and $env:MASSRELAY_DISPOSABLE_SSH_HOME -ne '1') {
+    throw 'Run with a disposable OS account and set MASSRELAY_DISPOSABLE_SSH_HOME=1; install modifies its SSH config.'
 }
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $administrator = [Security.Principal.WindowsBuiltInRole]::Administrator
@@ -177,6 +181,12 @@ try {
     $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwner
     Assert ($owner.User -eq $user) "The service process belongs to $($owner.User)."
     Assert (Test-Runtime) 'The runtime does not answer local commands under the service.'
+    $sshConfig = Join-Path $env:USERPROFILE '.ssh\config'
+    $sshConfigAfterInstall = [IO.File]::ReadAllText($sshConfig)
+    $includePattern = '(?im)^\s*Include[ \t]+"?massrelay\.d/\*\.conf"?[ \t]*\r?$'
+    Assert ([regex]::Matches($sshConfigAfterInstall, $includePattern).Count -eq 1) 'The installer did not register exactly one OpenSSH Include.'
+    $managedSshConfig = Join-Path $state 'private-experimental-0\ssh-client.conf'
+    Assert (Test-Path -LiteralPath $managedSshConfig -PathType Leaf) 'The installed profile has no managed SSH config.'
     Assert (Get-Acl -LiteralPath $marker).AreAccessRulesProtected 'The control key inherits the directory ACL.'
     $audit = Join-Path $state 'connections.jsonl'
     Assert (Get-Acl -LiteralPath $audit).AreAccessRulesProtected 'The audit log inherits the directory ACL.'
@@ -188,6 +198,7 @@ try {
     # A second install replaces the registration and restarts the one service.
     $again = Invoke-Tool $exe $install $secret
     Assert ($again.ExitCode -eq 0) "The second install failed: $($again.Error)"
+    Assert ([IO.File]::ReadAllText($sshConfig) -ceq $sshConfigAfterInstall) 'Reinstall changed the existing SSH config.'
     Assert (@(Get-TestService).Count -eq 1) 'The second install registered another service.'
     $service = Get-DeviceService $name
     Assert ($service.State -eq 'Running' -and $service.ProcessId -ne $first) 'The second install did not restart the service.'

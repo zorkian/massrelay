@@ -11,6 +11,7 @@ use tokio::time::timeout;
 use crate::mailbox::Bytes;
 use crate::{local, tcp, wire};
 
+use super::super::binding::EndpointKey;
 use super::super::pairing::parse_key;
 use super::super::runtime::{self, ControlReply, ControlRequest};
 use super::{Host, keys};
@@ -52,22 +53,33 @@ pub(in crate::private) async fn proxy(dir: &Path, peer: String, key: &str) -> Re
     tcp::attach(socket).await
 }
 
-fn pin(dir: &Path, peer: &str, key: &[u8; 32], replace: Option<&str>) -> Result<()> {
+fn pin_path(dir: &Path, endpoint: &EndpointKey) -> std::path::PathBuf {
+    dir.join(format!("ssh-pin-{}", super::super::codec::hex(endpoint)))
+}
+
+/// The SSH host key trusted for `endpoint`, if one was ever pinned.
+pub(super) fn pinned(dir: &Path, endpoint: &EndpointKey) -> Result<Option<[u8; 32]>> {
+    match std::fs::read(pin_path(dir, endpoint)) {
+        Ok(bytes) => Ok(Some(
+            bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid SSH host pin"))?,
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(super) fn pin(dir: &Path, peer: &str, key: &[u8; 32], replace: Option<&str>) -> Result<()> {
     let endpoint = parse_key(peer).context("expected an SSH peer endpoint")?;
-    let path = dir.join(format!("ssh-pin-{}", super::super::codec::hex(&endpoint)));
+    let path = pin_path(dir, &endpoint);
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(false);
     #[cfg(unix)]
     options.mode(0o600);
     let lock = options.open(dir.join("ssh-pins.lock"))?;
     FileExt::lock_exclusive(&lock)?;
-    let old = match std::fs::read(&path) {
-        Ok(bytes) => {
-            Some(<[u8; 32]>::try_from(bytes).map_err(|_| anyhow::anyhow!("invalid SSH host pin"))?)
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
+    let old = pinned(dir, &endpoint)?;
     let fingerprint = keys::fingerprint(key);
     if let Some(expected) = replace {
         ensure!(
@@ -133,6 +145,79 @@ fn config_path(path: &Path) -> Result<String> {
     Ok(path)
 }
 
+/// What one `Host` block names.
+pub(super) struct Entry<'a> {
+    /// The `Host` line's patterns.
+    pub managed: bool,
+    pub patterns: &'a str,
+    /// The name the host key is recorded under.
+    pub alias: &'a str,
+    pub user: &'a str,
+    pub identity: &'a Path,
+    pub known_hosts: &'a Path,
+    /// The MassRelay program `ProxyCommand` runs, and its state directory.
+    pub program: &'a Path,
+    pub state: &'a Path,
+    /// The destination's endpoint.
+    pub peer: &'a str,
+    pub client_key: &'a [u8; 32],
+}
+
+/// The `UserKnownHostsFile` line that pins `key` for an entry.
+pub(super) fn known_host(alias: &str, key: &[u8; 32]) -> String {
+    format!("{alias} {}\n", keys::public_line(key))
+}
+
+pub(super) fn render(entry: &Entry<'_>) -> Result<String> {
+    let Entry {
+        patterns,
+        alias,
+        user,
+        ..
+    } = entry;
+    let exe = shell_arg(&path_text(entry.program)?)?;
+    let state = shell_arg(&path_text(entry.state)?)?;
+    let peer = shell_arg(entry.peer)?;
+    let client_key = super::super::codec::hex(entry.client_key);
+    let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let known_hosts_command = if entry.managed {
+        "KnownHostsCommand none\n"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "Host {patterns}\n\
+         HostName {alias}.invalid\n\
+         HostKeyAlias {alias}\n\
+         User {user}\n\
+         BatchMode yes\n\
+         IdentitiesOnly yes\n\
+         IdentityAgent none\n\
+         IdentityFile \"{}\"\n\
+         CertificateFile none\n\
+         PreferredAuthentications publickey\n\
+         PasswordAuthentication no\n\
+         KbdInteractiveAuthentication no\n\
+         ForwardAgent no\n\
+         ForwardX11 no\n\
+         ClearAllForwardings yes\n\
+         PermitLocalCommand no\n\
+         StrictHostKeyChecking yes\n\
+         CheckHostIP no\n\
+         VerifyHostKeyDNS no\n\
+         UpdateHostKeys no\n\
+         HostKeyAlgorithms ssh-ed25519\n\
+         UserKnownHostsFile \"{}\"\n\
+         GlobalKnownHostsFile {null}\n\
+         {known_hosts_command}ControlMaster no\n\
+         ControlPath none\n\
+         ProxyUseFdpass no\n\
+         ProxyCommand {exe} --state-dir {state} ssh-proxy {peer} {client_key}\n",
+        config_path(entry.identity)?,
+        config_path(entry.known_hosts)?,
+    ))
+}
+
 pub(in crate::private) struct Launch {
     files: tempfile::TempDir,
     pub alias: String,
@@ -175,47 +260,23 @@ impl Launch {
         let identity = files.path().join("identity");
         let client_key = keys::generate(&identity).await?;
         let known = files.path().join("known_hosts");
-        tokio::fs::write(&known, format!("{alias} {}\n", keys::public_line(&key.0))).await?;
+        tokio::fs::write(&known, known_host(&alias, &key.0)).await?;
         let state = dir
             .parent()
             .context("missing runtime state directory")?
             .canonicalize()?;
-        let exe = shell_arg(&path_text(proxy_exe)?)?;
-        let state = shell_arg(&path_text(&state)?)?;
-        let peer = shell_arg(&peer)?;
-        let client_key = super::super::codec::hex(&client_key);
-        let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
-        let config = format!(
-            "Host {alias}\n\
-             HostName {alias}.invalid\n\
-             HostKeyAlias {alias}\n\
-             User {user}\n\
-             BatchMode yes\n\
-             IdentitiesOnly yes\n\
-             IdentityAgent none\n\
-             IdentityFile \"{}\"\n\
-             CertificateFile none\n\
-             PreferredAuthentications publickey\n\
-             PasswordAuthentication no\n\
-             KbdInteractiveAuthentication no\n\
-             ForwardAgent no\n\
-             ForwardX11 no\n\
-             ClearAllForwardings yes\n\
-             PermitLocalCommand no\n\
-             StrictHostKeyChecking yes\n\
-             CheckHostIP no\n\
-             VerifyHostKeyDNS no\n\
-             UpdateHostKeys no\n\
-             HostKeyAlgorithms ssh-ed25519\n\
-             UserKnownHostsFile \"{}\"\n\
-             GlobalKnownHostsFile {null}\n\
-             ControlMaster no\n\
-             ControlPath none\n\
-             ProxyUseFdpass no\n\
-             ProxyCommand {exe} --state-dir {state} ssh-proxy {peer} {client_key}\n",
-            config_path(&identity)?,
-            config_path(&known)?,
-        );
+        let config = render(&Entry {
+            managed: false,
+            patterns: &alias,
+            alias: &alias,
+            user: &user,
+            identity: &identity,
+            known_hosts: &known,
+            program: proxy_exe,
+            state: &state,
+            peer: &peer,
+            client_key: &client_key,
+        })?;
         Ok(Self {
             alias,
             config,

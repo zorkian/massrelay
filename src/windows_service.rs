@@ -33,7 +33,7 @@ mod native;
 #[cfg(windows)]
 pub use native::{
     Managed, control, install, is_default_shell, managed, private_audit, private_marker, serve,
-    serving, ssh_private_dir, until_stopped,
+    serving, ssh_files, ssh_private_dir, until_stopped,
 };
 
 #[derive(clap::Args)]

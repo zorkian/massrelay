@@ -19,7 +19,8 @@ pub fn audit_path(dir: &Path) -> Result<PathBuf> {
     Ok(Job::for_profile(dir)?.events)
 }
 
-pub fn install(dir: &Path) -> Result<()> {
+/// Returns the canonical state directory the service was installed for.
+pub fn install(dir: &Path) -> Result<PathBuf> {
     cli::check_enrolled(dir)?;
     let dir = dir
         .canonicalize()
@@ -92,7 +93,7 @@ pub fn install(dir: &Path) -> Result<()> {
     println!("Loaded {} for this login session", job.label);
     println!("Event log       {}", job.events.display());
     println!("Read service diagnostics with 'massrelay logs'.");
-    Ok(())
+    Ok(dir)
 }
 
 pub fn control(dir: &Path, action: ServiceAction) -> Result<()> {
