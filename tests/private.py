@@ -510,6 +510,13 @@ def _exercise(binary, root, processes):
         os.close(held_master)
         stop(held)
 
+    # A newly reported name cannot claim another member's old signed name.
+    cli("c", "rename", "laptop")
+    terminal("c", "alice", True)
+    eventually(lambda: peers("a")[c][0] == "laptop", "old name reported by another peer")
+    ambiguous = cli("a", "enable", "shell", "laptop", check=False)
+    assert ambiguous.returncode == 1 and "names multiple devices" in ambiguous.stderr
+
     # ---------------------------------------------------------------- cutoff
     session = popen("b", "connect", "alice", tcp_service)
     session.stdin.write(b"live\0\xff")

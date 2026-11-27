@@ -1155,7 +1155,7 @@ async fn status(dir: &Path) -> Result<()> {
         .map_err(membership)?;
     let endpoint = hex(profile.secret().public().as_bytes());
     if st.net.is_some() {
-        let name = match versions::local_display_name(dir)? {
+        let name = match versions::local_display_name(dir).ok().flatten() {
             Some(name) => Some(name),
             None => roster_name(&named_roster(dir).await?, &endpoint).map(str::to_owned),
         };
@@ -1312,21 +1312,41 @@ async fn selected_peer(dir: &Path, selector: &str) -> Result<(PeerMatch, Option<
         .filter_map(|p| Some((p.alias.clone()?, *parse_endpoint(&p.key)?.as_bytes())))
         .collect();
     let roster = named_roster(dir).await?;
-    let roster: Vec<_> = view
-        .peers
+    let mut names: Vec<_> = roster
         .iter()
-        .filter_map(|peer| {
-            Some(RosterMember {
-                endpoint: *parse_endpoint(&peer.key)?.as_bytes(),
-                name: peer_name(peer, &roster).map(str::to_owned),
-            })
+        .filter(|member| {
+            let key = hex(&member.endpoint);
+            key == view.endpoint || view.peers.iter().any(|p| p.member && p.key == key)
         })
+        .cloned()
         .collect();
+    // An authenticated report adds a name for its sender. Keep signed names
+    // reserved so a reported name cannot silently move a selector to another peer.
+    names.extend(
+        view.peers
+            .iter()
+            .filter(|peer| peer.member)
+            .filter_map(|peer| {
+                Some(RosterMember {
+                    endpoint: *parse_endpoint(&peer.key)?.as_bytes(),
+                    name: Some(peer.reported_name()?.to_owned()),
+                })
+            }),
+    );
+    if let (Some(endpoint), Ok(Some(name))) = (
+        parse_endpoint(&view.endpoint),
+        versions::local_display_name(dir),
+    ) {
+        names.push(RosterMember {
+            endpoint: *endpoint.as_bytes(),
+            name: Some(name),
+        });
+    }
     let selected = select_peer(
         selector,
         parse_endpoint(selector).map(|key| *key.as_bytes()),
         &aliases,
-        &roster,
+        &names,
     )
     .map_err(|error| match error {
         SelectError::NoMatch => anyhow!("no peer pinned or named {selector:?}"),
@@ -1344,9 +1364,8 @@ async fn selected_peer(dir: &Path, selector: &str) -> Result<(PeerMatch, Option<
         .into_iter()
         .find_map(|(alias, endpoint)| (endpoint == key).then_some(alias))
         .or_else(|| {
-            roster
-                .into_iter()
-                .find_map(|member| (member.endpoint == key).then_some(member.name).flatten())
+            let peer = view.peers.iter().find(|peer| peer.key == hex(&key))?;
+            peer_name(peer, &roster).map(str::to_owned)
         });
     Ok((selected, label))
 }

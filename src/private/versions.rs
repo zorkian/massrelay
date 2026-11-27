@@ -230,12 +230,9 @@ impl PeerVersions {
     }
 
     fn save(&self, cache: &mut Cache) {
-        match crate::storage::save(&self.dir, FILE, &cache.observations) {
-            Ok(()) => cache.last_save = Some(Instant::now()),
-            Err(_) => {
-                cache.last_save = None;
-                diagnostics::quiet(Level::Warning, "could not save peer reports");
-            }
+        cache.last_save = Some(Instant::now());
+        if crate::storage::save(&self.dir, FILE, &cache.observations).is_err() {
+            diagnostics::quiet(Level::Warning, "could not save peer reports");
         }
     }
 }
