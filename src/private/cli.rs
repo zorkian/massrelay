@@ -141,7 +141,9 @@ pub enum Command {
     /// Show this device’s enrollment and runtime.
     Status,
     /// Rename this device or change a peer's local alias.
-    #[command(after_help = "  massrelay rename NEW_NAME       Change this device's display name\n  massrelay rename PEER NEW_NAME  Change a peer's alias on this device")]
+    #[command(
+        after_help = "  massrelay rename NEW_NAME       Change this device's display name\n  massrelay rename PEER NEW_NAME  Change a peer's alias on this device"
+    )]
     Rename {
         /// This device's new name, or the peer's current local alias or exact endpoint ID.
         #[arg(value_name = "NEW_NAME|PEER")]

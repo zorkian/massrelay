@@ -431,6 +431,14 @@ def _exercise(binary, root, processes):
     eventually(lambda: f"bob\t{version}\t20" in status("a"), "inbound peer version")
     eventually(lambda: f"alice\t{version}\t20" in status("b"), "outbound peer version")
     before_rename = peers("a")[b]
+    cli("a", "rename", b, "bob-local")
+    assert peers("a")[b] == [before_rename[0], "bob-local", *before_rename[2:]]
+    assert "Name: workstation\n" in status("a")
+    assert shows_connection("a", "inbound", "bob-local", "shell")
+    assert shell.poll() is None and not process_gone(shell_pid)
+    assert "[audit] peer alias renamed" in cli("a", "logs", check=False).stdout
+    cli("a", "rename", "bob-local", "bob")
+    assert peers("a")[b] == before_rename
     cli("a", "rename", "renamed-workstation")
     assert "Name: renamed-workstation\n" in status("a")
     assert key("a") == a and peers("a")[b] == before_rename
@@ -566,8 +574,14 @@ def _exercise(binary, root, processes):
     if Path("/run/systemd/journal/socket").exists() and shutil.which("journalctl"):
         def diagnostics(state, last):
             audit = ("--log-file", str(root / "laptop-events.jsonl")) if state == "b" else ()
+
+            def after_shutdown():
+                text = cli(state, "logs", *audit).stdout
+                native_lines = [line for line in text.splitlines() if " [audit] " not in line]
+                return text if native_lines and native_lines[-1].endswith(last) else None
+
             return eventually(
-                lambda: (text := cli(state, "logs", *audit).stdout).rstrip().endswith(last) and text,
+                after_shutdown,
                 f"{state} diagnostics end with {last!r}",
             )
 
@@ -593,8 +607,8 @@ def _exercise(binary, root, processes):
             again = run("a")
             try:
                 read_line(follower.stdout, f"massrelay[{again.pid}]: the runtime started")
-                cli("a", "status")
-                read_line(follower.stdout, "[audit] local control status")
+                assert cli("a", "invite", check=False).returncode == 1
+                read_line(follower.stdout, "[audit] local control issue invite")
             finally:
                 finish(again)
         finally:
