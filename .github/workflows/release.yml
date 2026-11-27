@@ -61,6 +61,9 @@ jobs:
         run: |
           /usr/bin/ssh -V
           cargo +stable test --locked --release private_ssh -- --ignored --test-threads=1
+      - name: Compile Windows test executables
+        if: runner.os == 'Windows'
+        run: cargo +stable test --locked --release --no-run
       - name: Test Windows pseudoconsole cutoff and teardown
         if: runner.os == 'Windows'
         timeout-minutes: 3

@@ -466,20 +466,16 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_ssh_worker_executes_with_private_stdio() -> Result<()> {
-        use super::super::{Prepared, ssh_account, system_executable, worker_ready};
-        use anyhow::ensure;
+        use super::super::{
+            Prepared, ssh_account, system_executable, worker_executable, worker_ready,
+        };
         use zeroize::Zeroizing;
 
-        let test_binary = std::env::current_exe()?;
-        let exe = test_binary.with_file_name("../massrelay.exe");
-        if !exe.is_file() {
-            ensure!(
-                std::env::var_os("CI").is_none(),
-                "build massrelay.exe before testing its SSH worker"
-            );
-            return Ok(());
-        }
-        let exe = exe.canonicalize()?;
+        let exe = match worker_executable() {
+            Ok(exe) => exe,
+            Err(_) if std::env::var_os("CI").is_none() => return Ok(()),
+            Err(error) => return Err(error),
+        };
         let mut bootstrap = Zeroizing::new([0; 64]);
         bootstrap[..32].copy_from_slice(&[1; 32]);
         bootstrap[32..].copy_from_slice(&public_key(&private_key(&CLIENT_SEED)?));

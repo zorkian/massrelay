@@ -61,6 +61,8 @@ pub(super) use server::*;
 
 #[cfg(windows)]
 mod windows;
+#[cfg(all(test, windows))]
+pub(super) use windows::worker_executable;
 #[cfg(windows)]
 pub(super) use windows::{Prepared, Sshd, host_info, rotate_host_key, worker_ready};
 #[cfg(windows)]

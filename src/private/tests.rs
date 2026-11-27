@@ -5207,11 +5207,7 @@ mod runtime {
             cmd(&alice, approve(&bob, "bob")).await;
             cmd(&bob, approve(&alice, "alice")).await;
 
-            let binary = std::env::current_exe()
-                .unwrap()
-                .with_file_name("../massrelay.exe")
-                .canonicalize()
-                .unwrap();
+            let binary = crate::private::ssh::worker_executable().unwrap();
             let ssh = || {
                 let mut child = Command::new(&binary);
                 child

@@ -110,6 +110,18 @@ pub(in crate::private) async fn rotate_host_key(dir: &Path) -> Result<String> {
     .await?
 }
 
+#[cfg(test)]
+pub(in crate::private) fn worker_executable() -> Result<PathBuf> {
+    std::env::current_exe()?
+        .ancestors()
+        .skip(1)
+        .map(|dir| dir.join("massrelay.exe"))
+        .find(|path| path.is_file())
+        .context("build massrelay.exe before testing its SSH worker")?
+        .canonicalize()
+        .context("resolve the built SSH worker")
+}
+
 pub(in crate::private) struct Prepared {
     exe: PathBuf,
     bootstrap: Zeroizing<[u8; 64]>,
@@ -121,9 +133,10 @@ impl Prepared {
         let client = *client;
         tokio::task::spawn_blocking(move || {
             ssh_account()?;
+            #[cfg(not(test))]
             let exe = std::env::current_exe()?;
             #[cfg(test)]
-            let exe = exe.with_file_name("../massrelay.exe").canonicalize()?;
+            let exe = worker_executable()?;
             let mut bootstrap = Zeroizing::new([0; 64]);
             bootstrap[..32].copy_from_slice(host_seed(&dir, false)?.as_ref());
             bootstrap[32..].copy_from_slice(&client);
