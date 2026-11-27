@@ -97,12 +97,14 @@
 //! Non-loopback targets exist only on exposures. The experimental
 //! CLI over this runtime is `super::cli`.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
-use iroh::{Endpoint, EndpointAddr, EndpointId};
+use iroh::endpoint::Connection;
+use iroh::{Endpoint, EndpointAddr, EndpointId, TransportAddr};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -148,6 +150,9 @@ pub enum ControlRequest {
     Ping {
         peer: String,
         count: u16,
+        /// Older clients omit this and expect only `PingSample` replies.
+        #[serde(default)]
+        include_route: bool,
     },
     RenameSelf {
         name: String,
@@ -243,12 +248,37 @@ pub enum ControlReply {
     Connected,
     PingStarted,
     PingSample(Option<u64>),
+    PingSampleWithRoute {
+        micros: u64,
+        route: PingRoute,
+    },
     /// The exposure is live; a final `Done` or `Error` follows when it ends.
     Exposed {
         key: String,
         alias: String,
     },
     Error(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PingRoute {
+    Direct(SocketAddr),
+    Relayed,
+    Unknown,
+}
+
+impl PingRoute {
+    fn selected(conn: &Connection) -> Self {
+        let paths = conn.paths();
+        match paths.iter().find(|path| path.is_selected()) {
+            Some(path) => match path.remote_addr() {
+                TransportAddr::Ip(addr) => Self::Direct(*addr),
+                TransportAddr::Relay(_) => Self::Relayed,
+                _ => Self::Unknown,
+            },
+            None => Self::Unknown,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -732,7 +762,11 @@ async fn serve_control<M: Mailbox + Send + Sync + 'static>(
         return wire::send(&mut socket, reply).await;
     }
     match request {
-        ControlRequest::Ping { peer, count } => {
+        ControlRequest::Ping {
+            peer,
+            count,
+            include_route,
+        } => {
             let (mut rx, mut tx) = socket.into_split();
             let mut byte = [0];
             let result = tokio::select! {
@@ -741,7 +775,7 @@ async fn serve_control<M: Mailbox + Send + Sync + 'static>(
                     audit("failed", Some("local_client_closed"));
                     return Ok(());
                 }
-                result = ping_peer(&shared, &peer, count, &mut tx) => result,
+                result = ping_peer(&shared, &peer, count, include_route, &mut tx) => result,
             };
             match result {
                 Ok(()) => {
@@ -1030,6 +1064,7 @@ async fn ping_peer<M: Mailbox + Send + Sync + 'static>(
     shared: &Shared<M>,
     peer: &str,
     count: u16,
+    include_route: bool,
     tx: &mut (impl AsyncWrite + Unpin),
 ) -> Result<()> {
     ensure!(
@@ -1065,7 +1100,16 @@ async fn ping_peer<M: Mailbox + Send + Sync + 'static>(
         for _ in 0..count {
             ticks.tick().await;
             let elapsed = stream.probe().await?.map(|rtt| rtt.as_micros() as u64);
-            wire::send(tx, ControlReply::PingSample(elapsed)).await?;
+            let sample = match elapsed {
+                Some(micros) if include_route => ControlReply::PingSampleWithRoute {
+                    micros,
+                    // Sample the selected transmission path at receipt. Iroh's
+                    // datagram API does not identify the path the reply took.
+                    route: PingRoute::selected(&stream.conn),
+                },
+                _ => ControlReply::PingSample(elapsed),
+            };
+            wire::send(tx, sample).await?;
         }
         Ok(())
     };

@@ -321,6 +321,11 @@ def _exercise(binary, root, processes):
     eventually(lambda: peers("a")[b][5] == "yes", "a paired with b")
     ping = cli("b", "ping", "alice", "-c", "2")
     assert "2 packets transmitted, 2 received" in ping.stdout, ping
+    replies = [line for line in ping.stdout.splitlines() if line.startswith("reply from alice:")]
+    assert len(replies) == 2 and all(
+        re.search(r" ms (?:direct (?:[0-9.]+|\[[0-9a-fA-F:]+\]):\d+|via relay)$", line)
+        for line in replies
+    ), ping.stdout
     alias = cli("a", "approve", b, "--as", b, check=False)
     assert alias.returncode == 1 and "must not look like an endpoint key" in alias.stderr
     unknown = cli("a", "enable", "shell", "carol", check=False)

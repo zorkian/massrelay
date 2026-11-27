@@ -5613,6 +5613,115 @@ mod runtime {
         assert_eq!(hung.gate.entered(), 1, "no call after the cancelled one");
     }
 
+    #[cfg(target_os = "linux")]
+    async fn check_ping_route(relay: Option<iroh::RelayUrl>) {
+        use crate::private::runtime::PingRoute;
+
+        let n = net();
+        let alice = create(&n, "alice", Clock::System);
+        let bob = join(&n, &alice, "bob", Clock::System);
+        let bind = |m: &Member| {
+            let builder = Endpoint::builder(presets::Minimal)
+                .secret_key(SecretKey::from_bytes(&m.secret.to_bytes()))
+                .alpns(vec![SERVICE_ALPN.to_vec()])
+                .clear_ip_transports();
+            match &relay {
+                Some(url) => builder.relay_mode(RelayMode::custom([url.clone()])),
+                None => builder
+                    .relay_mode(RelayMode::Disabled)
+                    .bind_addr("[::1]:0")
+                    .unwrap(),
+            }
+            .bind()
+        };
+        let (a, b) = tokio::try_join!(bind(&alice), bind(&bob)).unwrap();
+        let address = EndpointAddr::new(b.id());
+        let (address, expected) = match relay {
+            Some(url) => {
+                assert!(a.bound_sockets().is_empty() && b.bound_sockets().is_empty());
+                tokio::time::timeout(T, b.online()).await.unwrap();
+                (address.with_relay_url(url), PingRoute::Relayed)
+            }
+            None => {
+                let remote = b.bound_sockets()[0];
+                assert!(remote.is_ipv6());
+                (address.with_ip_addr(remote), PingRoute::Direct(remote))
+            }
+        };
+
+        let mut source = Config::new(&alice.path);
+        source.sync_every = None;
+        source.addresses =
+            Arc::new(move |key| (key == address.id.as_bytes()).then(|| address.clone()));
+        let mut destination = Config::new(&bob.path);
+        destination.sync_every = None;
+        let ra = Runtime::start(source, n.mailbox.clone(), Clock::System, a)
+            .await
+            .unwrap();
+        let rb = Runtime::start(destination, n.mailbox.clone(), Clock::System, b)
+            .await
+            .unwrap();
+        cmd(&alice, approve(&bob, "bob")).await;
+        cmd(&bob, approve(&alice, "alice")).await;
+        tokio::time::timeout(T, async {
+            let (mut socket, reply) = rt::request(
+                &alice.path,
+                ControlRequest::Ping {
+                    peer: "bob".into(),
+                    count: 2,
+                    include_route: true,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(reply, ControlReply::PingStarted);
+            for _ in 0..2 {
+                let sample = wire::recv(&mut socket).await.unwrap();
+                assert!(
+                    matches!(&sample, ControlReply::PingSampleWithRoute { route, .. } if route == &expected),
+                    "{sample:?}"
+                );
+            }
+            assert_eq!(
+                wire::recv::<ControlReply>(&mut socket).await.unwrap(),
+                ControlReply::Done
+            );
+        })
+        .await
+        .unwrap();
+        assert!(ra.stop().await.owner_released);
+        assert!(rb.stop().await.owner_released);
+
+        if let PingRoute::Direct(remote) = expected {
+            let log = std::fs::read_to_string(alice.path.join(crate::private::audit::EVENT_FILE))
+                .unwrap();
+            assert!(!log.contains(&remote.to_string()));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "opens IPv6 loopback UDP and TCP sockets"]
+    async fn ping_reports_the_selected_direct_socket() {
+        check_ping_route(None).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "starts a disposable loopback relay"]
+    async fn ping_reports_the_selected_relay_path() {
+        use iroh_relay::server::{RelayConfig, Server, ServerConfig};
+
+        let mut config = ServerConfig::default();
+        config.relay = Some(RelayConfig::new(([127, 0, 0, 1], 0)));
+        let relay = Server::spawn(config).await.unwrap();
+        let url = format!("http://{}", relay.http_addr().unwrap())
+            .parse()
+            .unwrap();
+        check_ping_route(Some(url)).await;
+        relay.shutdown().await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "opens loopback UDP/TCP sockets and a native PTY"]
     async fn a_departing_command_ends_its_session_at_once() {
@@ -5625,16 +5734,20 @@ mod runtime {
         let rb = run(&bob, &book, n.mailbox.clone(), None).await;
         cmd(&alice, approve(&bob, "bob")).await;
         cmd(&bob, approve(&alice, "alice")).await;
-        let (mut ping, reply) = rt::request(
-            &alice.path,
-            ControlRequest::Ping {
-                peer: "bob".into(),
-                count: 1000,
-            },
+        // A v0.5.3 client omits the route opt-in and still gets legacy samples.
+        let mut ping = crate::local::connect_on(&alice.path, &CONTROL)
+            .await
+            .unwrap();
+        wire::send(
+            &mut ping,
+            serde_json::json!({"Ping": {"peer": "bob", "count": 1000}}),
         )
         .await
         .unwrap();
-        assert_eq!(reply, ControlReply::PingStarted);
+        assert_eq!(
+            wire::recv::<ControlReply>(&mut ping).await.unwrap(),
+            ControlReply::PingStarted
+        );
         assert!(matches!(
             wire::recv(&mut ping).await.unwrap(),
             ControlReply::PingSample(Some(_))

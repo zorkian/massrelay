@@ -61,7 +61,9 @@ use super::membership::{
 };
 use super::pairing::{Owner, PairError};
 use super::relay_mailbox::RelayMailbox;
-use super::runtime::{self, CONTROL, Config, ControlReply, ControlRequest, PeerView, Runtime};
+use super::runtime::{
+    self, CONTROL, Config, ControlReply, ControlRequest, PeerView, PingRoute, Runtime,
+};
 use super::service::SERVICE_ALPN;
 use super::store;
 use super::versions;
@@ -1379,8 +1381,15 @@ async fn peer_key(dir: &Path, selector: &str) -> Result<String> {
 
 async fn ping(dir: &Path, peer: &str, count: u16) -> Result<i32> {
     let key = peer_key(dir, peer).await?;
-    let (mut socket, reply) =
-        runtime::request(dir, ControlRequest::Ping { peer: key, count }).await?;
+    let (mut socket, reply) = runtime::request(
+        dir,
+        ControlRequest::Ping {
+            peer: key,
+            count,
+            include_route: true,
+        },
+    )
+    .await?;
     match reply {
         ControlReply::PingStarted => {}
         ControlReply::Error(e) => bail!("{e}"),
@@ -1400,24 +1409,30 @@ async fn ping(dir: &Path, peer: &str, count: u16) -> Result<i32> {
             r = &mut interrupt => { r?; break; }
             r = wire::recv(&mut socket) => r?,
         };
-        match reply {
-            ControlReply::PingSample(Some(micros)) => {
-                sent += 1;
-                received += 1;
-                let ms = micros as f64 / 1000.0;
-                min = min.min(ms);
-                max = max.max(ms);
-                sum += ms;
-                println!("reply from {peer}: seq={sent} time={ms:.3} ms");
-            }
+        let (micros, route) = match reply {
+            ControlReply::PingSampleWithRoute { micros, route } => (micros, route),
+            ControlReply::PingSample(Some(micros)) => (micros, PingRoute::Unknown),
             ControlReply::PingSample(None) => {
                 sent += 1;
                 println!("request timed out: seq={sent}");
+                continue;
             }
             ControlReply::Done => break,
             ControlReply::Error(e) => bail!("{e}"),
             _ => bail!("unexpected ping reply"),
-        }
+        };
+        sent += 1;
+        received += 1;
+        let ms = micros as f64 / 1000.0;
+        min = min.min(ms);
+        max = max.max(ms);
+        sum += ms;
+        let route = match route {
+            PingRoute::Direct(addr) => format!("direct {addr}"),
+            PingRoute::Relayed => "via relay".into(),
+            PingRoute::Unknown => "unknown".into(),
+        };
+        println!("reply from {peer}: seq={sent} time={ms:.3} ms {route}");
     }
     println!("--- {peer} ping statistics ---");
     let loss = if sent > 0 {

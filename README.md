@@ -104,6 +104,8 @@ On Windows, open an elevated PowerShell under the same account that enrolled the
 | `massrelay ping PEER` | Round-trip time and packet loss to a mutually approved peer. Use `-c` to change the probe count. |
 | `massrelay logs` | Recent runtime diagnostics, approvals, grants, and connections. Add `--follow` for live output. |
 
+Each successful `ping` reply shows the path the connection had selected for sending when the reply arrived. It shows `direct` with the remote socket address, `via relay`, or `unknown` if the path is unavailable (including with an older daemon). Individual probe and reply packets may travel over other paths.
+
 Diagnostics come from the operating system. Entries marked `[audit]` come from MassRelay's local connection log. If you ran the daemon with a custom `--log-file PATH`, pass that path to `massrelay logs --log-file PATH`.
 
 Use `massrelay rename NEW_NAME` to change how this device introduces itself to peers. They learn the new name the next time you connect after mutual approval. Use `massrelay rename PEER NEW_NAME` to change a local alias using the peer's current alias or exact endpoint ID. Both forms preserve permissions and live connections.
