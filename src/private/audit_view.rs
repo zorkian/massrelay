@@ -6,7 +6,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, ensure};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Local, SecondsFormat};
 use serde::Deserialize;
 
 use crate::connection_log::Direction;
@@ -55,6 +55,7 @@ impl Tail {
             }
             Err(error) => return Err(error.into()),
         };
+        self.required = false;
         let metadata = file.metadata()?;
         ensure!(metadata.is_file(), "expected a regular file");
         let end = metadata.len();
@@ -222,10 +223,16 @@ fn words(token: &str) -> Option<String> {
 
 fn render(line: &[u8]) -> Option<String> {
     let record: Record<'_> = serde_json::from_slice(line).ok()?;
+    if record.event == "local_control"
+        && (record.outcome == Some("requested")
+            || matches!(record.operation, Some("status" | "list_peers")))
+    {
+        return None;
+    }
     let time = DateTime::parse_from_rfc3339(record.timestamp)
         .ok()?
-        .with_timezone(&Utc)
-        .to_rfc3339_opts(SecondsFormat::Millis, true);
+        .with_timezone(&Local)
+        .to_rfc3339_opts(SecondsFormat::Millis, false);
     let event = words(record.event)?;
     let mut line = format!("{time} [audit] {event}");
     if let Some(operation) = record.operation.and_then(words) {

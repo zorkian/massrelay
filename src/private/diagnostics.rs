@@ -264,16 +264,11 @@ pub async fn show(state_dir: &Path, follow: bool, log_file: Option<&Path>) -> Re
             .map(|path| Tail::new(path, false))
             .collect(),
     };
-    let mut had_audit = false;
+    let mut audit_lines = Vec::new();
     let mut audit_error = None;
     for audit in &mut audits {
         match audit.read(RECENT) {
-            Ok(lines) => {
-                had_audit |= !lines.is_empty();
-                if !write_lines(&lines)? {
-                    return Ok(0);
-                }
-            }
+            Ok(lines) => audit_lines.extend(lines),
             Err(error) => {
                 // Collect other sources and still show their history.
                 if let Some(previous) = audit_error.replace(error) {
@@ -283,30 +278,41 @@ pub async fn show(state_dir: &Path, follow: bool, log_file: Option<&Path>) -> Re
         }
     }
     if follow && audit_error.is_none() {
-        return native::follow(&profile, until_done(&mut audits)).await;
+        return native::follow(&profile, &audit_lines, until_done(&mut audits)).await;
     }
-    let lines = match native::recent(&profile) {
-        Ok(lines) => lines,
-        Err(error) => {
-            if let Some(audit_error) = audit_error {
-                print(&format!("{audit_error:#}"));
-            }
-            return Err(error);
-        }
-    };
-    if lines.is_empty() && !had_audit && audit_error.is_none() {
+    let history = native::recent(&profile);
+    if history.is_err()
+        && let Some(audit_error) = &audit_error
+    {
+        print(&format!("{audit_error:#}"));
+    }
+    if history.as_ref().is_ok_and(Vec::is_empty) && audit_lines.is_empty() && audit_error.is_none()
+    {
         eprintln!("{NONE_YET}");
     }
-    if !write_lines(&lines)? {
+    if !write_history(history, &audit_lines)? {
         return Ok(0);
     }
     audit_error.map_or(Ok(0), Err)
 }
 
+/// Keep recent activity visible at the end of the output. Show the audit
+/// even if the system's log reader could not provide its history.
+fn write_history(native: Result<Vec<String>>, audit: &[String]) -> Result<bool> {
+    if let Ok(lines) = &native
+        && !write_lines(lines)?
+    {
+        return Ok(false);
+    }
+    let written = write_lines(audit)?;
+    native.map(|_| written)
+}
+
 async fn until_done(audits: &mut [Tail]) -> Result<i32> {
     tokio::select! {
-        result = follow_audits(audits) => result,
+        biased;
         result = crate::shutdown() => result.map(|()| 0).map_err(Into::into),
+        result = follow_audits(audits) => result,
     }
 }
 
@@ -379,6 +385,7 @@ async fn stream_tool(command: Command, stop: impl Future<Output = Result<i32>>) 
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
+        .process_group(0)
         .kill_on_drop(true)
         .spawn()
         .map_err(|error| tool_error(command.as_std(), error))?;
@@ -399,8 +406,9 @@ async fn stream_tool(command: Command, stop: impl Future<Output = Result<i32>>) 
         Ok(0)
     };
     let result = tokio::select! {
-        result = stream => result,
+        biased;
         result = stop => result,
+        result = stream => result,
     };
     // kill() also waits. It succeeds when the stream already waited for the tool.
     let stopped = child.kill().await;
@@ -537,19 +545,48 @@ mod native {
         let mut command = Command::new("journalctl");
         command
             .args(["--quiet", "--no-pager", "--output=short-iso"])
-            .arg(format!("--lines={RECENT}"))
             .arg(format!("{PROFILE_FIELD}={profile}"));
         command
     }
 
     pub fn recent(profile: &str) -> Result<Vec<String>> {
-        let text = super::capture(&mut journalctl(profile))?;
+        let text = super::capture(journalctl(profile).arg(format!("--lines={RECENT}")))?;
         Ok(text.lines().map(str::to_owned).collect())
     }
 
-    pub async fn follow(profile: &str, stop: impl Future<Output = Result<i32>>) -> Result<i32> {
+    pub async fn follow(
+        profile: &str,
+        audit: &[String],
+        stop: impl Future<Output = Result<i32>>,
+    ) -> Result<i32> {
+        let mut cursor = None;
+        let history = super::capture(
+            journalctl(profile).args([format!("--lines={RECENT}"), "--show-cursor".into()]),
+        )
+        .map(|text| {
+            text.lines()
+                .filter_map(|line| {
+                    if let Some(value) = line.strip_prefix("-- cursor: ") {
+                        cursor = Some(value.to_owned());
+                        None
+                    } else {
+                        Some(line.to_owned())
+                    }
+                })
+                .collect()
+        });
+        if !super::write_history(history, audit)? {
+            return Ok(0);
+        }
         let mut command = journalctl(profile);
         command.arg("--follow");
+        if let Some(cursor) = cursor {
+            command
+                .arg("--lines=all")
+                .arg(format!("--after-cursor={cursor}"));
+        } else {
+            command.arg("--lines=0");
+        }
         super::stream_tool(command, stop).await
     }
 }
@@ -630,8 +667,12 @@ mod native {
             .collect())
     }
 
-    pub async fn follow(profile: &str, stop: impl Future<Output = Result<i32>>) -> Result<i32> {
-        if !super::write_lines(&recent(profile)?)? {
+    pub async fn follow(
+        profile: &str,
+        audit: &[String],
+        stop: impl Future<Output = Result<i32>>,
+    ) -> Result<i32> {
+        if !super::write_history(recent(profile), audit)? {
             return Ok(0);
         }
         super::stream_tool(log("stream", profile), stop).await
@@ -643,6 +684,7 @@ mod native {
 #[cfg(windows)]
 mod native {
     use std::io;
+    use std::os::windows::process::CommandExt;
     use std::path::PathBuf;
     use std::process::Command;
     use std::time::Duration;
@@ -654,6 +696,8 @@ mod native {
         DeregisterEventSource, EVENTLOG_ERROR_TYPE, EVENTLOG_INFORMATION_TYPE,
         EVENTLOG_WARNING_TYPE, RegisterEventSourceW, ReportEventW,
     };
+
+    use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 
     use super::{Level, RECENT, WindowsEvent};
 
@@ -744,6 +788,7 @@ mod native {
             .unwrap_or_else(|| "wevtutil.exe".into());
         let mut command = Command::new(tool);
         command
+            .creation_flags(CREATE_NEW_PROCESS_GROUP)
             .args(["qe", "Application", "/f:xml", "/rd:true"])
             .arg(format!("/c:{newest}"))
             .arg(format!("/q:*[System[Provider[@Name='{SOURCE}']]]"));
@@ -780,24 +825,35 @@ mod native {
         Ok(lines(&recent_events(profile)?))
     }
 
-    pub async fn follow(profile: &str, stop: impl Future<Output = Result<i32>>) -> Result<i32> {
+    pub async fn follow(
+        profile: &str,
+        audit: &[String],
+        stop: impl Future<Output = Result<i32>>,
+    ) -> Result<i32> {
         tokio::select! {
-            result = follow_events(profile) => result,
+            biased;
             result = stop => result,
+            result = follow_events(profile, audit) => result,
         }
     }
 
-    async fn follow_events(profile: &str) -> Result<i32> {
-        let mut events = recent_events(profile)?;
+    async fn follow_events(profile: &str, audit: &[String]) -> Result<i32> {
         let mut last = 0;
+        let history = recent_events(profile).map(|events| {
+            last = events.last().map_or(0, |event| event.record);
+            lines(&events)
+        });
+        if !super::write_history(history, audit)? {
+            return Ok(0);
+        }
         loop {
+            tokio::time::sleep(POLL).await;
+            let mut events = query(profile, RECENT)?;
+            events.retain(|event| event.record > last);
             last = events.last().map_or(last, |event| event.record);
             if !super::write_lines(&lines(&events))? {
                 return Ok(0);
             }
-            tokio::time::sleep(POLL).await;
-            events = query(profile, RECENT)?;
-            events.retain(|event| event.record > last);
         }
     }
 }
@@ -837,8 +893,12 @@ mod native {
         bail!("MassRelay keeps no diagnostics log on this platform")
     }
 
-    pub async fn follow(profile: &str, _stop: impl Future<Output = Result<i32>>) -> Result<i32> {
-        recent(profile).map(|_| 0)
+    pub async fn follow(
+        profile: &str,
+        audit: &[String],
+        _stop: impl Future<Output = Result<i32>>,
+    ) -> Result<i32> {
+        super::write_history(recent(profile), audit).map(|_| 0)
     }
 }
 

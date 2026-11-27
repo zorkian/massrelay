@@ -67,6 +67,11 @@ fn reads_profile_history_and_escapes_private_audit_fields() {
         "event": "connection_failed", "direction": "outbound", "service": "tcp:4000",
         "peer_name": "laptop", "reason": "service_not_enabled",
     }));
+    for _ in 0..201 {
+        fixture.append(
+            json!({ "event": "local_control", "operation": "status", "outcome": "allowed" }),
+        );
+    }
     let output = fixture.command().output().unwrap();
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -84,7 +89,9 @@ fn reads_profile_history_and_escapes_private_audit_fields() {
         stdout.contains(&format!("MASSRELAY_PROFILE={}", &profile[..16])),
         "{stdout}"
     );
-    assert!(stdout.contains("the runtime started"), "{stdout}");
+    let native = stdout.find("the runtime started").unwrap();
+    let audit = stdout.find("[audit]").unwrap();
+    assert!(native < audit, "{stdout}");
     assert!(
         stdout.contains(r#"[audit] approval granted peer "laptop\n\u{1b}[31m\u{202e}""#),
         "{stdout}"
@@ -111,8 +118,13 @@ fn reads_profile_history_and_escapes_private_audit_fields() {
 #[tokio::test]
 async fn follows_native_output_and_an_audit_created_after_start() {
     let fixture = Fixture::new(
-        "[ \"$6\" = --follow ] || exit 2\nprintf 'the runtime started %s\\n' \"$$\"\nexec /bin/sleep 10",
+        r#"case " $* " in
+*" --show-cursor "*) printf '%s\n' 'native history' '-- cursor: proof';;
+*" --follow --lines=all --after-cursor=proof "*) printf 'native live %s\n' "$$"; exec /bin/sleep 10;;
+*) exit 2;;
+esac"#,
     );
+    fixture.append(json!({ "event": "approval_granted" }));
     let mut command = tokio::process::Command::from(fixture.command());
     let mut process = command
         .arg("--follow")
@@ -122,8 +134,14 @@ async fn follows_native_output_and_an_audit_created_after_start() {
         .unwrap();
     let mut stdout = BufReader::new(process.stdout.take().unwrap()).lines();
     let native_pid = tokio::time::timeout(Duration::from_secs(5), async {
+        assert_eq!(
+            stdout.next_line().await.unwrap().as_deref(),
+            Some("native history")
+        );
+        let audit = stdout.next_line().await.unwrap().unwrap();
+        assert!(audit.ends_with("[audit] approval granted"), "{audit}");
         let native = stdout.next_line().await.unwrap().unwrap();
-        let native_pid = native.strip_prefix("the runtime started ").unwrap();
+        let native_pid = native.strip_prefix("native live ").unwrap();
         fixture
             .append(json!({ "event": "connected", "direction": "outbound", "service": "shell" }));
         let live = stdout.next_line().await.unwrap().unwrap();
@@ -141,6 +159,42 @@ async fn follows_native_output_and_an_audit_created_after_start() {
         .unwrap();
     assert!(status.success(), "{status}");
     assert!(!Path::new("/proc").join(native_pid.to_string()).exists());
+}
+
+#[tokio::test]
+async fn ctrl_c_stops_following_and_reaps_the_native_reader() {
+    let fixture = Fixture::new(
+        r#"case " $* " in
+*" --follow "*) printf '%s\n' "$$"; exec /bin/sleep 10;;
+esac"#,
+    );
+    let mut process = tokio::process::Command::from(fixture.command())
+        .arg("--follow")
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(process.stdout.take().unwrap()).lines();
+    let native_pid = tokio::time::timeout(Duration::from_secs(5), stdout.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let group = format!("-{}", process.id().unwrap());
+    assert!(
+        Command::new("kill")
+            .args(["-INT", "--", &group])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let status = tokio::time::timeout(Duration::from_secs(5), process.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.success(), "{status}");
+    assert!(!Path::new("/proc").join(native_pid).exists());
 }
 
 #[test]
