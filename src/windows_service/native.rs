@@ -28,9 +28,10 @@ use windows_sys::Win32::{
         CloseHandle, ERROR_ACCESS_DENIED, ERROR_CALL_NOT_IMPLEMENTED,
         ERROR_FAILED_SERVICE_CONTROLLER_CONNECT, ERROR_LOGON_FAILURE,
         ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_CANNOT_ACCEPT_CTRL,
-        ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_LOGON_FAILED, ERROR_SERVICE_NOT_ACTIVE,
-        ERROR_SERVICE_SPECIFIC_ERROR, GENERIC_READ, GENERIC_WRITE, GetLastError,
-        INVALID_HANDLE_VALUE, LocalFree, NO_ERROR, NTSTATUS, STATUS_OBJECT_NAME_NOT_FOUND,
+        ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_LOGON_FAILED, ERROR_SERVICE_MARKED_FOR_DELETE,
+        ERROR_SERVICE_NOT_ACTIVE, ERROR_SERVICE_SPECIFIC_ERROR, ERROR_SHARING_VIOLATION,
+        GENERIC_READ, GENERIC_WRITE, GetLastError, INVALID_HANDLE_VALUE, LocalFree, NO_ERROR,
+        NTSTATUS, STATUS_OBJECT_NAME_NOT_FOUND,
     },
     Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
@@ -100,14 +101,47 @@ const POLL: Duration = Duration::from_millis(200);
 const START_WAIT: Duration = Duration::from_secs(60);
 /// Longer than the runtime's own ordered stop, which is bounded in several steps.
 const STOP_WAIT: Duration = Duration::from_secs(90);
+/// How long a deleted service's entry is waited for, once it has stopped.
+const REMOVAL_WAIT: Duration = Duration::from_secs(10);
 /// What the service tells the service manager to expect of a pending start or stop.
 const PENDING_HINT_MS: u32 = 60_000;
 const INHERIT_ONLY: u8 = 0x8;
 
 // ------------------------------------------------------------------ install
 
-/// Returns the canonical state directory the service was installed for.
-pub fn install(dir: &Path, options: InstallOptions) -> Result<PathBuf> {
+/// Everything `install` settles before it asks for a password or changes anything.
+struct Prepared {
+    dir: String,
+    shell: String,
+    account: Account,
+    name: String,
+    command: String,
+    manager: Handle,
+    wide_name: Vec<u16>,
+    existing: Option<Handle>,
+    /// The existing service's configuration, and whether it was running.
+    previous: Option<(Config, bool)>,
+    /// Whether the account lacks the right to log on as a service.
+    grant: bool,
+}
+
+impl Prepared {
+    fn approval(&self) -> super::Approval {
+        super::Approval {
+            dir: self.dir.clone(),
+            name: self.name.clone(),
+            account: self.account.name(),
+            command: self.command.clone(),
+            existing: self
+                .previous
+                .as_ref()
+                .map(|(config, running)| (config.registration(), *running)),
+            grant: self.grant,
+        }
+    }
+}
+
+fn prepare(dir: &Path, options: &InstallOptions) -> Result<Prepared> {
     let dir = dir
         .canonicalize()
         .context("resolve the device state directory")?;
@@ -134,7 +168,6 @@ pub fn install(dir: &Path, options: InstallOptions) -> Result<PathBuf> {
     ensure_trusted(&shell, Role::Program, &account)?;
     ensure_trusted(&dir, Role::Holder, &account)?;
     check_private_profile(&Path::new(&dir).join(cli::DIR_NAME), &account)?;
-    cli::check_enrolled(Path::new(&dir))?;
 
     let name = super::service_name(&dir);
     let command = super::command_line(&binary, &dir, &name, &shell)?;
@@ -166,14 +199,73 @@ pub fn install(dir: &Path, options: InstallOptions) -> Result<PathBuf> {
         }
         None => None,
     };
-    if !previous.as_ref().is_some_and(|(_, running)| *running) {
-        let _lock =
-            cli::claim_owner(Path::new(&dir)).context("stop the foreground massrelay run first")?;
-    }
+    let grant = !Policy::open()?.may_log_on_as_service(&account)?;
+    Ok(Prepared {
+        dir,
+        shell,
+        account,
+        name,
+        command,
+        manager,
+        wide_name,
+        existing,
+        previous,
+        grant,
+    })
+}
 
-    let password = password(&account, options.password_stdin)?;
+/// What `install` would register and start. Changes nothing, and so leaves to `apply` the
+/// account's password, which this does not ask for, and the checks that open the profile's
+/// files for writing.
+pub fn plan_install(dir: &Path, options: InstallOptions) -> Result<super::InstallPlan> {
+    let shown = prepare(dir, &options)?.approval();
+    Ok(super::InstallPlan { options, shown })
+}
+
+impl super::InstallPlan {
+    /// Register and start the service, if what an install would replace and do is still as it
+    /// was shown. Returns the canonical state directory the service was installed for.
+    pub fn apply(self) -> Result<PathBuf> {
+        let confirmed = || {
+            let prepared = prepare(Path::new(&self.shown.dir), &self.options)?;
+            self.confirm(&prepared.approval())?;
+            Ok::<_, anyhow::Error>(prepared)
+        };
+        let prepared = confirmed()?;
+        // Only now that the profile is known to be private is its store opened.
+        cli::check_enrolled(Path::new(&prepared.dir))?;
+        if !prepared
+            .previous
+            .as_ref()
+            .is_some_and(|(_, running)| *running)
+        {
+            let _lock = cli::claim_owner(Path::new(&prepared.dir))
+                .context("stop the foreground massrelay run first")?;
+        }
+        let password = password(&prepared.account, self.options.password_stdin)?;
+        // No handle is kept while the password is waited for, and what is there is looked at
+        // again right before the first change.
+        drop(prepared);
+        register(&self, confirmed()?, password)
+    }
+}
+
+fn register(plan: &super::InstallPlan, prepared: Prepared, password: Secret) -> Result<PathBuf> {
+    let Prepared {
+        dir,
+        shell,
+        account,
+        name,
+        command,
+        manager,
+        wide_name,
+        existing,
+        previous,
+        ..
+    } = prepared;
+
     let policy = Policy::open()?;
-    let granted = !policy.may_log_on_as_service(&account)?;
+    let granted = plan.grant(!policy.may_log_on_as_service(&account)?)?;
     if granted {
         policy
             .set_service_logon(&account, true)
@@ -300,6 +392,141 @@ pub fn control(dir: &Path, action: ServiceAction) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------- uninstall
+
+/// This profile's service as it is registered now, checked for removal.
+struct Installed {
+    dir: String,
+    name: String,
+    manager: Handle,
+    /// The registration, and the service opened to stop and delete it.
+    service: Option<(super::Registration, Handle)>,
+}
+
+fn installed(dir: &Path) -> Result<Installed> {
+    let dir = dir
+        .canonicalize()
+        .context("resolve the device state directory")?;
+    let dir = super::plain(&dir)?;
+    let name = super::service_name(&dir);
+    let manager = manager(SC_MANAGER_CONNECT)?;
+    let access = SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | SERVICE_STOP | super::DELETE;
+    let service = match open(&manager, &wide(&name)?, access)? {
+        Some(service) => {
+            let config = config(&service)?;
+            let account = Account::current()?;
+            let status = process_status(&service)?;
+            let shell_host = env::var(crate::private::HOST_ENV)
+                .ok()
+                .and_then(|value| value.parse().ok());
+            super::check_removable(
+                &super::Registered {
+                    command: &config.command,
+                    // An account that cannot be resolved is not shown to be this one.
+                    own_account: service_account_sid(&config.account)
+                        .is_ok_and(|sid| sid == account.sid),
+                    process: Some(status.dwProcessId).filter(|&process| process != 0),
+                },
+                &dir,
+                &name,
+                shell_host,
+                update_queued(Path::new(&dir))?,
+            )?;
+            Some((config.registration(), service))
+        }
+        None => None,
+    };
+    Ok(Installed {
+        dir,
+        name,
+        manager,
+        service,
+    })
+}
+
+/// Whether a queued update, or its helper, holds the profile's update lock.
+fn update_queued(dir: &Path) -> Result<bool> {
+    match File::open(dir.join(super::UPDATE_LOCK)) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) => Ok(true),
+        Err(error) => Err(error).context("check for a queued update"),
+    }
+}
+
+/// The service there is to delete for this profile. Makes the checks removal makes, including
+/// that this process may stop and delete the service, and changes nothing.
+pub fn plan_uninstall(dir: &Path) -> Result<super::UninstallPlan> {
+    let Installed {
+        dir, name, service, ..
+    } = installed(dir)?;
+    Ok(super::UninstallPlan {
+        dir,
+        name,
+        shown: service.map(|(registration, _)| registration),
+    })
+}
+
+impl super::UninstallPlan {
+    /// Delete this profile's service and stop it, if it is still registered as it was shown.
+    /// The profile, its keys, its logs and the account's rights are kept: nothing records
+    /// whether an install granted the right to log on as a service. A plan that showed no
+    /// service succeeds while there is still none.
+    pub fn apply(self) -> Result<()> {
+        use std::io::Write as _;
+
+        let Installed {
+            name,
+            manager,
+            service,
+            ..
+        } = installed(Path::new(&self.dir))?;
+        // What is confirmed is removed through the very handle it was read from.
+        let done = match self.confirm(&name, service)? {
+            Some(service) => {
+                super::unregister(&service)?;
+                // The entry goes once every handle to it is closed.
+                drop(service);
+                let wide_name = wide(&name)?;
+                let deadline = Instant::now() + REMOVAL_WAIT;
+                loop {
+                    if open(&manager, &wide_name, SERVICE_QUERY_STATUS)?.is_none() {
+                        break format!("Removed {name}");
+                    }
+                    if Instant::now() >= deadline {
+                        break format!(
+                            "Stopped {name} and marked it for deletion. Windows removes it once \
+                             other programs, such as the Services console, close it"
+                        );
+                    }
+                    thread::sleep(POLL);
+                }
+            }
+            None => self.to_string(),
+        };
+        // The terminal may be gone, which must not turn a finished removal into a panic.
+        let _ = writeln!(io::stdout(), "{done}");
+        Ok(())
+    }
+}
+
+impl super::Unregister for Handle {
+    fn delete(&self) -> Result<()> {
+        // SAFETY: the handle is an open service handle with delete access.
+        if unsafe { DeleteService(self.0) } != 0 {
+            return Ok(());
+        }
+        match last_error() {
+            ERROR_SERVICE_MARKED_FOR_DELETE => Ok(()),
+            code => Err(denied(code, "delete the service")),
+        }
+    }
+
+    fn stop(&self) -> Result<()> {
+        stop(self)
+    }
+}
+
 /// An installed service, for `massrelay update`.
 pub struct Managed {
     dir: String,
@@ -384,23 +611,7 @@ impl crate::update::Service for Managed {
     /// is not replaced or started while it lasts.
     fn state(&self) -> Result<crate::update::Manager> {
         use crate::update::Manager;
-        let service = self.open(SERVICE_QUERY_STATUS)?;
-        let mut status = SERVICE_STATUS_PROCESS::default();
-        let mut needed = 0;
-        // SAFETY: the handle is open and the buffer is this structure, writable for its size.
-        ensure!(
-            unsafe {
-                QueryServiceStatusEx(
-                    service.0,
-                    SC_STATUS_PROCESS_INFO,
-                    (&raw mut status).cast(),
-                    size_of::<SERVICE_STATUS_PROCESS>() as u32,
-                    &mut needed,
-                )
-            } != 0,
-            "read the service status: {}",
-            io::Error::last_os_error()
-        );
+        let status = process_status(&self.open(SERVICE_QUERY_STATUS)?)?;
         Ok(match status.dwCurrentState {
             SERVICE_RUNNING if status.dwProcessId != 0 => Manager::Running(status.dwProcessId),
             SERVICE_STOPPED => Manager::Stopped,
@@ -1154,6 +1365,16 @@ struct Config {
     account: String,
 }
 
+impl Config {
+    fn registration(&self) -> super::Registration {
+        super::Registration {
+            command: self.command.clone(),
+            account: self.account.clone(),
+            start: self.start,
+        }
+    }
+}
+
 fn denied(code: u32, action: &str) -> anyhow::Error {
     if code == ERROR_ACCESS_DENIED {
         anyhow!(ELEVATE)
@@ -1305,6 +1526,27 @@ fn state(service: &Handle) -> Result<SERVICE_STATUS> {
     // SAFETY: the handle is open and `status` is writable.
     ensure!(
         unsafe { QueryServiceStatus(service.0, &mut status) } != 0,
+        "read the service status: {}",
+        io::Error::last_os_error()
+    );
+    Ok(status)
+}
+
+/// The service's status, with the ID of its process.
+fn process_status(service: &Handle) -> Result<SERVICE_STATUS_PROCESS> {
+    let mut status = SERVICE_STATUS_PROCESS::default();
+    let mut needed = 0;
+    // SAFETY: the handle is open and the buffer is this structure, writable for its size.
+    ensure!(
+        unsafe {
+            QueryServiceStatusEx(
+                service.0,
+                SC_STATUS_PROCESS_INFO,
+                (&raw mut status).cast(),
+                size_of::<SERVICE_STATUS_PROCESS>() as u32,
+                &mut needed,
+            )
+        } != 0,
         "read the service status: {}",
         io::Error::last_os_error()
     );

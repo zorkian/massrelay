@@ -70,6 +70,9 @@ pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_
 /// Set in every shell a runtime serves to that runtime's process ID, so a command can tell
 /// that it runs inside one of this device's own shell sessions.
 pub const HOST_ENV: &str = "MASSRELAY_SHELL_HOST";
+/// Set by OpenSSH in a login to the ends of its connection. A command run in a login that a
+/// runtime tunnels is recognized by it.
+pub const SSH_ENV: &str = "SSH_CONNECTION";
 /// Invite reservation window.
 pub const INVITE_WINDOW_SECS: u64 = 600;
 /// Tolerated backwards issuer clock step. Within it, the high-water mark is

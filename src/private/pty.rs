@@ -71,7 +71,7 @@ pub(crate) use windows::{TestInput, spawn};
 pub use other::{Pty, Teardown, spawn};
 
 #[cfg(windows)]
-pub(super) mod windows;
+mod windows;
 
 #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 fn other(e: impl std::fmt::Display) -> io::Error {

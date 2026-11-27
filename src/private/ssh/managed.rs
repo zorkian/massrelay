@@ -5,6 +5,11 @@
 //! `Host massrelay-<peer> mr-<peer>` block there for each peer this device confirmed. It
 //! never writes outside the private profile.
 //!
+//! `ssh-client-published.sha256` beside it records what was last published there: the
+//! SHA-256 in lowercase hexadecimal and a newline. An uninstall removes a configuration
+//! only while it matches, so one a person changed is kept. The record is removed before the
+//! configuration changes and written after, so an interruption leaves none.
+//!
 //! Confirmed means the peer, locally approved and eligible, answered the authenticated SSH
 //! host-record request. An entry is removed when the peer's authenticated answer denies
 //! access, when this device ends the approval it was confirmed under (decline, cutoff,
@@ -26,6 +31,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use iroh::Endpoint;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use tokio::sync::Notify;
 use tokio::task::{Id, JoinSet};
@@ -46,6 +52,8 @@ use super::{Host, Request, Settings, client, keys};
 
 /// Its presence opts the profile in. The installer creates it.
 const CONFIG_FILE: &str = "ssh-client.conf";
+/// The record of what was last published as `CONFIG_FILE`.
+const RECORD_FILE: &str = "ssh-client-published.sha256";
 const STATE_FILE: &str = "ssh-client.json";
 const KEY_PREFIX: &str = "ssh-client-key-";
 const HOSTS_PREFIX: &str = "ssh-client-hosts-";
@@ -255,8 +263,20 @@ fn eligible<M: Mailbox + Send + Sync + 'static>(node: &Node<M>) -> Result<Peers>
         .collect())
 }
 
-/// Whether the profile holds a configuration file that is safe to replace.
+/// `present`, first replacing on Windows a configuration whose access list is not private.
 fn opted_in(dir: &Path) -> Result<bool> {
+    let present = present(dir)?;
+    #[cfg(windows)]
+    if present
+        && crate::windows_service::ssh_files::check_managed_file(&dir.join(CONFIG_FILE)).is_err()
+    {
+        write_config(dir, staged(dir, b"")?, b"")?;
+    }
+    Ok(present)
+}
+
+/// Whether the profile holds a configuration file that is safe to replace. Writes nothing.
+fn present(dir: &Path) -> Result<bool> {
     let metadata = match fs::symlink_metadata(dir.join(CONFIG_FILE)) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -274,12 +294,7 @@ fn opted_in(dir: &Path) -> Result<bool> {
         );
     }
     #[cfg(windows)]
-    {
-        crate::windows_service::ssh_private_dir(dir)?;
-        if crate::windows_service::ssh_files::check_managed_file(&dir.join(CONFIG_FILE)).is_err() {
-            publish_file(dir, staged(dir, b"")?, CONFIG_FILE)?;
-        }
-    }
+    crate::windows_service::ssh_private_dir(dir)?;
     Ok(true)
 }
 
@@ -317,6 +332,44 @@ fn replace(dir: &Path, name: &str, content: &[u8]) -> Result<()> {
         return Ok(());
     }
     publish_file(dir, staged(dir, content)?, name)
+}
+
+/// Publish `content` as the configuration and record it, unless the file was removed.
+fn publish_config(dir: &Path, content: &[u8]) -> Result<()> {
+    if unchanged(&dir.join(CONFIG_FILE), content) {
+        #[cfg(windows)]
+        if crate::windows_service::ssh_files::check_managed_file(&dir.join(CONFIG_FILE)).is_err() {
+            return write_config(dir, staged(dir, content)?, content);
+        }
+        // Also without a change: an interrupted publication left no record.
+        return record(dir, content);
+    }
+    let file = staged(dir, content)?;
+    // Never bring back a file that was removed to opt out.
+    if present(dir)? {
+        write_config(dir, file, content)?;
+    }
+    Ok(())
+}
+
+/// Replace the configuration with `file`, which holds `content`. Between the two records
+/// there is none, so none ever describes anything but the last bytes published.
+fn write_config(dir: &Path, file: NamedTempFile, content: &[u8]) -> Result<()> {
+    match fs::remove_file(dir.join(RECORD_FILE)) {
+        Ok(()) => {
+            #[cfg(unix)]
+            fs::File::open(dir)?.sync_all()?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("remove the SSH configuration record"),
+    }
+    publish_file(dir, file, CONFIG_FILE)?;
+    record(dir, content)
+}
+
+fn record(dir: &Path, content: &[u8]) -> Result<()> {
+    let digest = format!("{:x}\n", Sha256::digest(content));
+    replace(dir, RECORD_FILE, digest.as_bytes())
 }
 
 /// The absolute paths the generated entries name.
@@ -429,7 +482,7 @@ fn publish(
     let mut saved = match read() {
         Ok(saved) => saved,
         Err(error) => {
-            replace(dir, CONFIG_FILE, b"")?;
+            publish_config(dir, b"")?;
             return Err(error.context("SSH alias reservations unavailable"));
         }
     };
@@ -458,13 +511,7 @@ fn publish(
             config.push_str(block);
         }
     }
-    if !unchanged(&dir.join(CONFIG_FILE), config.as_bytes()) {
-        let file = staged(dir, config.as_bytes())?;
-        // Never bring back a file that was removed to opt out.
-        if opted_in(dir)? {
-            publish_file(dir, file, CONFIG_FILE)?;
-        }
-    }
+    publish_config(dir, config.as_bytes())?;
     Ok(omitted)
 }
 
@@ -516,10 +563,18 @@ async fn accept(dir: PathBuf, key: EndpointKey, host: Host, at: u64) -> Result<P
     crate::windows_service::ssh_private_dir(&dir)?;
     let id = hex(&key);
     let (path, peer) = (dir.clone(), id.clone());
-    tokio::task::spawn_blocking(move || client::pin(&path, &peer, &host.key.0, None)).await??;
+    let (user, record) = (host.user.clone(), host);
+    let migrated =
+        tokio::task::spawn_blocking(move || client::pin(&path, &peer, &record, None)).await??;
+    if migrated {
+        diagnostics::event(
+            Level::Info,
+            "a peer's system SSH host key replaced the one pinned for its former SSH server",
+        );
+    }
     let client_key = keys::persistent(&dir, &format!("{KEY_PREFIX}{id}")).await?;
     Ok(Probe::Confirmed {
-        user: host.user,
+        user,
         client_key: Bytes(client_key),
         at,
     })
@@ -607,7 +662,7 @@ pub(in crate::private) async fn maintain<M: Mailbox + Send + Sync + 'static>(
     while !node.stopping() {
         let pass = async {
             let path = dir.clone();
-            if !tokio::task::spawn_blocking(move || opted_in(&path)).await?? {
+            if !tokio::task::spawn_blocking(move || present(&path)).await?? {
                 return Ok(None);
             }
             let paths = paths.clone().map_err(anyhow::Error::msg)?;
@@ -615,9 +670,14 @@ pub(in crate::private) async fn maintain<M: Mailbox + Send + Sync + 'static>(
             let peers = tokio::task::spawn_blocking(move || eligible(&current)).await??;
             let (path, view, new) = (dir.clone(), peers.clone(), answers.clone());
             let now = crate::storage::now();
-            let omitted =
-                tokio::task::spawn_blocking(move || publish(&path, &paths, &view, &new, now))
-                    .await??;
+            // The profile stays owned while it is written, even if a stop gives up
+            // waiting: an uninstall changes these files only once it owns the profile.
+            let owner = node.clone();
+            let omitted = tokio::task::spawn_blocking(move || {
+                let _owner = owner;
+                publish(&path, &paths, &view, &new, now)
+            })
+            .await??;
             Ok::<_, anyhow::Error>(Some((peers, omitted)))
         }
         .await;
@@ -887,6 +947,7 @@ mod tests {
 
         publish(&answers).unwrap();
         assert!(!config.exists() && !dir.join(STATE_FILE).exists());
+        assert!(!dir.join(RECORD_FILE).exists());
 
         let target = root.path().join("elsewhere");
         fs::write(&target, "keep").unwrap();
@@ -913,8 +974,38 @@ mod tests {
         let text = fs::read_to_string(&config).unwrap();
         assert!(text.contains("Host massrelay-one mr-one\n"));
         assert!(!text.contains("mr-two"));
+
+        // The record is of exactly what was published, and is private.
+        let record = dir.join(RECORD_FILE);
+        let recorded = || {
+            let expected = format!("{:x}\n", Sha256::digest(fs::read(&config).unwrap()));
+            assert_eq!(fs::read_to_string(&record).unwrap(), expected);
+            let metadata = fs::metadata(&record).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        };
+        recorded();
+        // One that is missing or stale is renewed although the configuration is current.
+        fs::remove_file(&record).unwrap();
+        publish(&answers).unwrap();
+        recorded();
+        fs::write(&record, "stale\n").unwrap();
+        publish(&answers).unwrap();
+        recorded();
+        // A change someone made is replaced, as before, and the record follows.
+        fs::write(&config, "Host mine\n").unwrap();
+        publish(&answers).unwrap();
+        assert_eq!(fs::read_to_string(&config).unwrap(), text);
+        recorded();
+        // Without a way to withdraw the old record, the configuration is not changed.
+        fs::remove_file(&record).unwrap();
+        fs::create_dir(&record).unwrap();
+        assert!(publish(&answer(ONE, 1, Probe::Denied)).is_err());
+        assert_eq!(fs::read_to_string(&config).unwrap(), text);
+        fs::remove_dir(&record).unwrap();
+
         publish(&answer(ONE, 1, Probe::Denied)).unwrap();
         assert_eq!(fs::read(&config).unwrap(), b"");
+        recorded();
 
         // Bad or lost reservations withdraw entries without assigning their names again.
         publish(&answers).unwrap();

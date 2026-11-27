@@ -51,7 +51,7 @@ install -m 755 "$binary" "$bin/massrelay"
 MASSRELAY_FIXTURE_STATE_DIR="$state" \
     cargo test --locked --offline write_an_offline_fixture_profile -- --ignored >/dev/null
 
-"$bin/massrelay" --state-dir "$state" install
+"$bin/massrelay" --state-dir "$state" install --yes
 [ -f "$units/$unit" ] || fail "The disposable service was not installed as $unit."
 
 MASSRELAY_ACCEPTANCE_STATE_DIR="$state" MASSRELAY_ACCEPTANCE_PROGRAM="$bin/massrelay" \

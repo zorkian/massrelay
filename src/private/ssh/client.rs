@@ -53,13 +53,17 @@ pub(in crate::private) async fn proxy(dir: &Path, peer: String, key: &str) -> Re
     tcp::attach(socket).await
 }
 
-fn pin_path(dir: &Path, endpoint: &EndpointKey) -> std::path::PathBuf {
-    dir.join(format!("ssh-pin-{}", super::super::codec::hex(endpoint)))
+/// The key pinned for a peer's system SSH server.
+const SYSTEM_PIN: &str = "ssh-system-pin-";
+/// The key pinned for the SSH server of MassRelay's own that a former peer runs.
+const FORMER_PIN: &str = "ssh-pin-";
+
+fn pin_path(dir: &Path, kind: &str, endpoint: &EndpointKey) -> std::path::PathBuf {
+    dir.join(format!("{kind}{}", super::super::codec::hex(endpoint)))
 }
 
-/// The SSH host key trusted for `endpoint`, if one was ever pinned.
-pub(super) fn pinned(dir: &Path, endpoint: &EndpointKey) -> Result<Option<[u8; 32]>> {
-    match std::fs::read(pin_path(dir, endpoint)) {
+fn read_pin(path: &Path) -> Result<Option<[u8; 32]>> {
+    match std::fs::read(path) {
         Ok(bytes) => Ok(Some(
             bytes
                 .try_into()
@@ -70,37 +74,76 @@ pub(super) fn pinned(dir: &Path, endpoint: &EndpointKey) -> Result<Option<[u8; 3
     }
 }
 
-pub(super) fn pin(dir: &Path, peer: &str, key: &[u8; 32], replace: Option<&str>) -> Result<()> {
+/// The SSH host key trusted for `endpoint`, if one was ever pinned.
+pub(super) fn pinned(dir: &Path, endpoint: &EndpointKey) -> Result<Option<[u8; 32]>> {
+    match read_pin(&pin_path(dir, SYSTEM_PIN, endpoint))? {
+        Some(key) => Ok(Some(key)),
+        None => read_pin(&pin_path(dir, FORMER_PIN, endpoint)),
+    }
+}
+
+/// Trust the host record `host`, which `peer` sent on an authorized connection, if it
+/// agrees with what is pinned or `replace` names its fingerprint.
+///
+/// A peer's move from MassRelay's own SSH server to its system server changes the key once:
+/// the first system record replaces a former pin. From then on only the system pin counts,
+/// so a record of the former kind has to match it too. Returns whether a former pin of
+/// another key was replaced that way.
+pub(super) fn pin(dir: &Path, peer: &str, host: &Host, replace: Option<&str>) -> Result<bool> {
     let endpoint = parse_key(peer).context("expected an SSH peer endpoint")?;
-    let path = pin_path(dir, &endpoint);
+    let key = host.key.0;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(false);
     #[cfg(unix)]
     options.mode(0o600);
     let lock = options.open(dir.join("ssh-pins.lock"))?;
     FileExt::lock_exclusive(&lock)?;
-    let old = pinned(dir, &endpoint)?;
-    let fingerprint = keys::fingerprint(key);
+    let system_path = pin_path(dir, SYSTEM_PIN, &endpoint);
+    let former_path = pin_path(dir, FORMER_PIN, &endpoint);
+    let system = read_pin(&system_path)?;
+    let former = read_pin(&former_path)?;
+    let fingerprint = keys::fingerprint(&key);
     if let Some(expected) = replace {
         ensure!(
             expected == fingerprint,
             "the authenticated SSH host key is {fingerprint}"
         );
     }
-    match old {
-        Some(old) if old == *key => return Ok(()),
-        Some(old) if replace.is_none() => bail!(
+    let trusted = system.or(if host.system { None } else { former });
+    if let Some(old) = trusted.filter(|old| *old != key && replace.is_none()) {
+        bail!(
             "SSH host key changed from {} to {fingerprint}; verify the new fingerprint before using --replace-host-key",
             keys::fingerprint(&old)
-        ),
-        _ => {}
+        );
     }
-    let mut updated = tempfile::NamedTempFile::new_in(dir)?;
-    updated.write_all(key)?;
-    updated.as_file().sync_all()?;
-    updated.persist(path)?;
+    // The pin to write, and the one that must not outlive it.
+    let (path, current, other) = if host.system {
+        (&system_path, system, &former_path)
+    } else if trusted == Some(key) {
+        return Ok(false);
+    } else {
+        (&former_path, former, &system_path)
+    };
+    if current != Some(key) {
+        let mut updated = tempfile::NamedTempFile::new_in(dir)?;
+        updated.write_all(&key)?;
+        updated.as_file().sync_all()?;
+        updated.persist(path)?;
+        sync_directory(dir)?;
+    }
+    match std::fs::remove_file(other) {
+        Ok(()) => sync_directory(dir)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("remove the replaced SSH host pin"),
+    }
+    Ok(host.system && system.is_none() && former.is_some_and(|old| old != key))
+}
+
+fn sync_directory(dir: &Path) -> Result<()> {
     #[cfg(unix)]
     std::fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
     Ok(())
 }
 
@@ -180,6 +223,12 @@ pub(super) fn render(entry: &Entry<'_>) -> Result<String> {
     let peer = shell_arg(entry.peer)?;
     let client_key = super::super::codec::hex(entry.client_key);
     let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    // Only letters, digits and `_.-@` go unquoted: see `Host::valid_user`.
+    let user = if user.contains([' ', '\\']) {
+        format!("\"{user}\"")
+    } else {
+        (*user).to_owned()
+    };
     let known_hosts_command = if entry.managed {
         "KnownHostsCommand none\n"
     } else {
@@ -232,13 +281,20 @@ impl Launch {
         proxy_exe: &Path,
     ) -> Result<Self> {
         let (_, reply, _) = connect(dir, peer.clone(), None).await?;
-        let ControlReply::SshHost(Host { user, key }) = reply else {
+        let ControlReply::SshHost(host) = reply else {
             bail!("unexpected SSH host reply");
         };
-        ensure!(Host::valid_user(&user), "invalid SSH account");
+        ensure!(Host::valid_user(&host.user), "invalid SSH account");
         #[cfg(windows)]
         crate::windows_service::ssh_private_dir(dir)?;
-        pin(dir, &peer, &key.0, replace)?;
+        if pin(dir, &peer, &host, replace)? {
+            eprintln!(
+                "massrelay: this peer now uses its system SSH server; its host key {} \
+                 replaces the one pinned for MassRelay's former SSH server",
+                keys::fingerprint(&host.key.0)
+            );
+        }
+        let Host { user, key, .. } = host;
 
         // OpenSSH's config parser also expands tokens in path options.
         // The temporary credential paths use only characters safe there.
@@ -328,4 +384,62 @@ pub(in crate::private) async fn launch_ssh(
         Ok(status.code().unwrap_or(1))
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::private::codec::hex;
+
+    #[test]
+    fn a_former_pin_gives_way_once_and_a_system_pin_only_when_told() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let dir = dir.path();
+        let endpoint = [7; 32];
+        let peer = hex(&endpoint);
+        let host = |key, system| Host {
+            user: "user".into(),
+            key: Bytes([key; 32]),
+            system,
+        };
+        let trusted = || pinned(dir, &endpoint).unwrap().map(|key| key[0]);
+        let former = pin_path(dir, FORMER_PIN, &endpoint);
+        let system = pin_path(dir, SYSTEM_PIN, &endpoint);
+
+        // A former peer is pinned and held to its key as before.
+        assert!(!pin(dir, &peer, &host(1, false), None)?);
+        assert!(!pin(dir, &peer, &host(1, false), None)?);
+        assert!(pin(dir, &peer, &host(2, false), None).is_err());
+        assert_eq!(trusted(), Some(1));
+        let wrong = keys::fingerprint(&[9; 32]);
+        assert!(pin(dir, &peer, &host(2, true), Some(&wrong)).is_err());
+        assert_eq!(trusted(), Some(1));
+
+        // Its system server's key replaces that pin, once.
+        assert!(pin(dir, &peer, &host(2, true), None)?);
+        assert_eq!(trusted(), Some(2));
+        assert!(!former.exists() && system.exists());
+        assert!(!pin(dir, &peer, &host(2, true), None)?);
+        // Neither another system key nor the former server is believed from then on.
+        for changed in [host(3, true), host(1, false)] {
+            let error = pin(dir, &peer, &changed, None).unwrap_err().to_string();
+            assert!(error.contains("SSH host key changed"), "{error}");
+        }
+        assert_eq!(trusted(), Some(2));
+        let fingerprint = keys::fingerprint(&[3; 32]);
+        pin(dir, &peer, &host(3, true), Some(&fingerprint))?;
+        assert_eq!(trusted(), Some(3));
+        // Going back takes the same deliberate step.
+        let fingerprint = keys::fingerprint(&[1; 32]);
+        pin(dir, &peer, &host(1, false), Some(&fingerprint))?;
+        assert_eq!(trusted(), Some(1));
+        assert!(former.exists() && !system.exists());
+
+        // An interrupted replacement leaves both: the system pin counts.
+        std::fs::write(&system, [4; 32])?;
+        assert_eq!(trusted(), Some(4));
+        assert!(!pin(dir, &peer, &host(4, true), None)?);
+        assert!(!former.exists());
+        Ok(())
+    }
 }

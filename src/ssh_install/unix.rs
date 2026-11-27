@@ -23,6 +23,7 @@ use tempfile::NamedTempFile;
 /// More than any SSH configuration holds.
 const LIMIT: u64 = 16 * 1024 * 1024;
 const GROUP_OR_OTHERS_WRITE: u32 = 0o022;
+const GROUP_OR_OTHERS: u32 = 0o077;
 const STICKY: u32 = 0o1000;
 
 /// The account running the install, which is the one its service runs as.
@@ -54,10 +55,7 @@ impl Account {
     pub fn current() -> Result<Self> {
         // SAFETY: these calls have no preconditions and cannot fail.
         let (uid, effective) = unsafe { (libc::getuid(), libc::geteuid()) };
-        ensure!(
-            uid == effective,
-            "run massrelay install as the account itself"
-        );
+        ensure!(uid == effective, "run massrelay as the account itself");
         Ok(Self { uid })
     }
 
@@ -140,6 +138,11 @@ impl Account {
         self.owned_directory(path, GROUP_OR_OTHERS_WRITE)
     }
 
+    /// Either of those, which is not created.
+    pub fn existing_directory(&self, path: &Path) -> Result<()> {
+        self.owned_directory(path, GROUP_OR_OTHERS_WRITE)
+    }
+
     fn owned_directory(&self, path: &Path, forbidden: u32) -> Result<()> {
         let metadata =
             fs::symlink_metadata(path).with_context(|| format!("check {}", path.display()))?;
@@ -161,7 +164,7 @@ impl Account {
         Ok(())
     }
 
-    /// Hold off other installs of this account while its SSH files change.
+    /// Hold off other installs and uninstalls of this account while its SSH files change.
     pub fn lock(&self, path: &Path) -> Result<File> {
         let file = OpenOptions::new()
             .read(true)
@@ -183,7 +186,7 @@ impl Account {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error).with_context(|| format!("check {}", path.display())),
         };
-        // A pipe at the path must not stall the install.
+        // A pipe at the path must not stall the command.
         let flags = libc::O_NONBLOCK | if link { 0 } else { libc::O_NOFOLLOW };
         let file = OpenOptions::new()
             .read(true)
@@ -227,10 +230,21 @@ impl Account {
         self.check(path, found, GROUP_OR_OTHERS_WRITE)
     }
 
+    /// The runtime's record: private to this account.
+    pub fn check_record(&self, path: &Path, found: &Found) -> Result<()> {
+        self.check(path, found, GROUP_OR_OTHERS_WRITE)?;
+        ensure!(
+            found.mode & GROUP_OR_OTHERS == 0,
+            "{} is not private to this account",
+            path.display()
+        );
+        Ok(())
+    }
+
     fn check(&self, path: &Path, found: &Found, forbidden: u32) -> Result<()> {
         if found.link {
             bail!(
-                "{} is a link, which massrelay install does not write through",
+                "{} is a link, which MassRelay does not write through",
                 path.display()
             );
         }
@@ -285,6 +299,18 @@ impl Account {
         sync_parent(path);
         Ok(true)
     }
+
+    /// Delete the file `found` was read from, under the same limits as `replace`. False if
+    /// it is no longer that file with those contents.
+    pub fn remove(&self, path: &Path, found: &Found) -> Result<bool> {
+        self.check(path, found, GROUP_OR_OTHERS_WRITE)?;
+        if self.read(path)?.as_ref() != Some(found) {
+            return Ok(false);
+        }
+        fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+        sync_parent(path);
+        Ok(true)
+    }
 }
 
 fn create_directory(path: &Path) -> Result<()> {
@@ -315,7 +341,7 @@ fn stage(path: &Path, contents: &[u8], mode: u32, group: Option<u32>) -> Result<
 }
 
 fn sync_parent(path: &Path) {
-    // The rename already took effect. Some filesystems reject directory fsync.
+    // The change already took effect. Some filesystems reject directory fsync.
     if let Some(directory) = path.parent() {
         let _ = File::open(directory).and_then(|directory| directory.sync_all());
     }

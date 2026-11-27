@@ -25,7 +25,10 @@ use std::{
 use anyhow::{Context, Result, ensure};
 
 use super::{escape_xml, path_text, stage};
-use crate::{private::HOST_ENV, update::Finished};
+use crate::{
+    private::{HOST_ENV, SSH_ENV},
+    update::Finished,
+};
 
 /// How long launchd is given to forget a job that was removed.
 const REMOVAL_LIMIT: Duration = Duration::from_secs(5);
@@ -183,9 +186,10 @@ impl OneShot<'_> {
         let text = |path| path_text(path).map(escape_xml);
         let (program, dir, log) = (text(self.program)?, text(self.dir)?, text(log)?);
         // A property list can add environment variables but not remove them, and the login
-        // domain may carry the variable that marks a MassRelay shell. The shell removes it
-        // and becomes the program; paths reach it as arguments, never as script text.
-        let script = escape_xml(&format!("unset {HOST_ENV}; exec \"$0\" \"$@\""));
+        // domain may carry the variables that place a command in a session. The shell
+        // removes them and becomes the program; paths reach it as arguments, never as
+        // script text.
+        let script = escape_xml(&format!("unset {HOST_ENV} {SSH_ENV}; exec \"$0\" \"$@\""));
         let label = &self.label;
         Ok(format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -477,8 +481,10 @@ mod tests {
     /// A program that records the shell marker it sees and its arguments.
     fn program(dir: &Path) -> Result<PathBuf> {
         let path = dir.join("massrelay");
-        let script =
-            format!("#!/bin/sh\nprintf '%s\\n' \"${{{HOST_ENV}-removed}}\" \"$@\" > \"$0.seen\"\n");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"${{{HOST_ENV}-removed}}\" \"${{{SSH_ENV}-removed}}\" \
+             \"$@\" > \"$0.seen\"\n"
+        );
         // Written by another process, so that no test thread holds it open for writing when
         // it is run.
         let written = Command::new("/bin/sh")
@@ -556,11 +562,12 @@ mod tests {
         let ran = Command::new(&arguments[0])
             .args(&arguments[1..])
             .env(HOST_ENV, "4242")
+            .env(SSH_ENV, "127.0.0.1 50000 127.0.0.1 22")
             .status()?;
         assert!(ran.success());
         assert_eq!(
             fs::read_to_string(dir.join("massrelay.seen"))?,
-            format!("removed\n--state-dir\n{}\nupdate\n", dir.display())
+            format!("removed\nremoved\n--state-dir\n{}\nupdate\n", dir.display())
         );
 
         // A job that runs, or that launchd describes in no way known to be over, is left

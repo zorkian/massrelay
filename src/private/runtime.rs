@@ -117,7 +117,13 @@
 //! PTY reaper that cannot reap its shell. In either case the `Node` is
 //! kept until it finishes (or the process exits) and `Stopped` says so.
 //!
-//! # OpenSSH client entries
+//! # SSH
+//!
+//! Inbound SSH tunnels reach the installed system SSH server (`ssh::Destination`). Keys an
+//! earlier run authorized there are withdrawn as it starts, and a stop gives those still
+//! waiting for the installer's lock a bounded last chance. A command running in an SSH
+//! login can ask whether this runtime carries its connection (`local_ssh_tunnel`): the
+//! runtime compares the exact numeric ends. The question only reads, and is not logged.
 //!
 //! While the profile holds `ssh-client.conf`, a background task keeps OpenSSH
 //! entries there for the paired peers this device confirmed (`ssh::managed`).
@@ -138,7 +144,8 @@
 //! Non-loopback targets exist only on exposures. The experimental
 //! CLI over this runtime is `super::cli`.
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -179,6 +186,8 @@ pub const CONTROL: Channel = Channel {
 
 /// Bound on joining each task group during `stop`.
 const STOP_WAIT: Duration = Duration::from_secs(10);
+/// Bound on withdrawing the keys of ended SSH tunnels during `stop`.
+const KEY_WAIT: Duration = Duration::from_secs(2);
 pub const MAX_PING_COUNT: u16 = 1000;
 
 // ------------------------------------------------------------------ protocol
@@ -274,6 +283,13 @@ pub enum ControlRequest {
     },
     /// Coordination with `massrelay update`. A runtime that predates it drops the connection.
     Update(UpdateRequest),
+    /// Whether the connection with exactly these ends, which an SSH login names in
+    /// `SSH_CONNECTION`, is one of this runtime's tunnels. A runtime that predates it drops
+    /// the connection.
+    SshTunnel {
+        client: SocketAddrV4,
+        server: SocketAddrV4,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -345,6 +361,8 @@ pub enum ControlReply {
     Shell,
     Connected,
     SshHost(ssh::Host),
+    /// The runtime carrying the SSH connection asked about, if this one does.
+    SshTunnel(Option<Identity>),
     PingStarted,
     PingSample(Option<u64>),
     PingSampleWithRoute {
@@ -636,6 +654,8 @@ impl<M: Mailbox + Send + Sync + 'static> Runtime<M> {
         let (listener, marker) = local::listen_on(&config.dir, &CONTROL)
             .await
             .map_err(|e| local(&e))?;
+        // The profile is ours and nothing is served yet.
+        node.prepare_ssh(config.ssh.lease);
         // The baseline later state events are diffed against.
         audit::observe(&node, true);
         let (stop, stopping) = watch::channel(false);
@@ -813,6 +833,7 @@ impl<M: Mailbox + Send + Sync + 'static> Runtime<M> {
             }
         };
         let _ = timeout(STOP_WAIT, quiet).await;
+        node.close_ssh(KEY_WAIT).await;
         let native_workers = node.native_workers();
         // 6. Only now drop the node, and with it the owner. A node still
         //    needed by a blocked membership call is dropped by that call; one
@@ -888,7 +909,13 @@ async fn serve_control<M: Mailbox + Send + Sync + 'static>(
     // Audited by operation, peer and service only; never the request.
     let (operation, selector, service) = audit::operation(&request);
     let target = selector.and_then(|s| parse_key(s).or_else(|| log.alias_key(s)));
-    let audit = |outcome, reason| log.control(operation, outcome, target, service, reason);
+    // Asking whether a login is carried here only reads, the log included.
+    let recorded = !matches!(request, ControlRequest::SshTunnel { .. });
+    let audit = |outcome, reason| {
+        if recorded {
+            log.control(operation, outcome, target, service, reason);
+        }
+    };
     audit("requested", None);
     socket.set_nodelay(true)?;
     // A command read after stop linearized is refused (status may still be
@@ -1030,6 +1057,11 @@ async fn serve_control<M: Mailbox + Send + Sync + 'static>(
             let reply = ControlReply::Update(reply);
             wire::send(&mut socket, reply).await
         }
+        ControlRequest::SshTunnel { client, server } => {
+            let host = shared.node.has_ssh_tunnel(client, server);
+            let host = host.then(|| identity(&shared)).flatten();
+            wire::send(&mut socket, ControlReply::SshTunnel(host)).await
+        }
         ControlRequest::Update(UpdateRequest::Hold) => hold_admission(&shared, socket).await,
         ControlRequest::Update(UpdateRequest::Commit) => {
             audit("denied", Some("command_rejected"));
@@ -1156,7 +1188,8 @@ fn manage<M: Mailbox + Send + Sync + 'static>(
             | ControlRequest::Ssh { .. }
             | ControlRequest::Connect { .. }
             | ControlRequest::Expose { .. }
-            | ControlRequest::Update(_) => {
+            | ControlRequest::Update(_)
+            | ControlRequest::SshTunnel { .. } => {
                 return Err("not a management command".into());
             }
         })
@@ -1656,6 +1689,81 @@ pub async fn request(dir: &Path, request: ControlRequest) -> Result<(TcpStream, 
     .context("local request timed out")?
 }
 
+/// Whether this process runs in an SSH login that `profile`'s runtime carries, so that
+/// stopping that runtime would end it. `false` without `SSH_CONNECTION`, without a running
+/// runtime, and for a runtime that predates the question (it carries no such login: the
+/// shells of its own SSH server are marked with `HOST_ENV`).
+pub async fn is_local_ssh_tunnel(profile: &Path) -> Result<bool> {
+    Ok(local_ssh_tunnel(profile).await?.is_some())
+}
+
+/// `is_local_ssh_tunnel`, naming the runtime that carries the login.
+pub async fn local_ssh_tunnel(profile: &Path) -> Result<Option<Identity>> {
+    match std::env::var(super::SSH_ENV) {
+        Ok(connection) => ssh_tunnel(profile, &connection).await,
+        Err(_) => Ok(None),
+    }
+}
+
+/// `local_ssh_tunnel` for the `SSH_CONNECTION` value `connection`.
+pub(super) async fn ssh_tunnel(profile: &Path, connection: &str) -> Result<Option<Identity>> {
+    // Nothing else can be a tunnel, so nothing else is sent.
+    let Some((client, server)) = loopback_connection(connection) else {
+        return Ok(None);
+    };
+    if !profile.join(CONTROL.marker).try_exists()? {
+        return Ok(None);
+    }
+    let ended = |kind| {
+        use std::io::ErrorKind::*;
+        matches!(
+            kind,
+            UnexpectedEof | ConnectionReset | ConnectionAborted | BrokenPipe
+        )
+    };
+    timeout(wire::RPC_TIMEOUT, async {
+        let mut socket = match local::connect_on(profile, &CONTROL).await {
+            Ok(socket) => socket,
+            // A marker an ended runtime left behind.
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        wire::send(&mut socket, ControlRequest::SshTunnel { client, server }).await?;
+        // An identity holds a few short fields and one program path.
+        let reply = match wire::read_frame_max(&mut socket, 64 * 1024).await {
+            Ok(reply) => reply,
+            Err(error) if ended(error.kind()) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        match serde_json::from_slice(&reply).context("invalid message")? {
+            ControlReply::SshTunnel(host) => Ok(host),
+            ControlReply::Error(error) => bail!("{error}"),
+            _ => bail!("unexpected SSH tunnel reply"),
+        }
+    })
+    .await
+    .context("local request timed out")?
+}
+
+/// The ends in an `SSH_CONNECTION` between two ports of `127.0.0.1`: client address and
+/// port, then server address and port.
+fn loopback_connection(text: &str) -> Option<(SocketAddrV4, SocketAddrV4)> {
+    let mut fields = text.split(' ');
+    let mut end = || {
+        let address: Ipv4Addr = fields.next()?.parse().ok()?;
+        let port: NonZeroU16 = fields.next()?.parse().ok()?;
+        (address == Ipv4Addr::LOCALHOST).then(|| SocketAddrV4::new(address, port.get()))
+    };
+    let ends = (end()?, end()?);
+    fields.next().is_none().then_some(ends)
+}
+
 /// `request`, with an `Error` reply as an error.
 pub async fn command(dir: &Path, request: ControlRequest) -> Result<ControlReply> {
     match self::request(dir, request).await?.1 {
@@ -1822,5 +1930,29 @@ mod tests {
         assert_eq!(st.resolve_selector("bob"), Ok(key));
         assert!(st.resolve_selector(&"z".repeat(64)).is_err());
         assert!(parse_key(&hex(&[1; 31])).is_none());
+    }
+
+    #[test]
+    fn only_an_exact_numeric_loopback_connection_can_be_a_tunnel() {
+        let end = |port| SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+        assert_eq!(
+            loopback_connection("127.0.0.1 50000 127.0.0.1 22"),
+            Some((end(50000), end(22)))
+        );
+        for other in [
+            "",
+            "127.0.0.1 50000 127.0.0.1",
+            "127.0.0.1 50000 127.0.0.1 22 extra",
+            "127.0.0.1 50000 127.0.0.1 22 ",
+            "127.0.0.1  50000 127.0.0.1 22",
+            "127.0.0.1 0 127.0.0.1 22",
+            "127.0.0.1 65536 127.0.0.1 22",
+            "127.0.0.2 50000 127.0.0.1 22",
+            "127.0.0.1 50000 192.0.2.1 22",
+            "::1 50000 ::1 22",
+            "localhost 50000 localhost 22",
+        ] {
+            assert_eq!(loopback_connection(other), None, "{other:?}");
+        }
     }
 }

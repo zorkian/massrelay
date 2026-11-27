@@ -25,6 +25,7 @@
 
 use std::{
     ffi::{OsStr, OsString},
+    fmt,
     fs::File,
     io::Read,
     path::{Path, PathBuf},
@@ -41,8 +42,8 @@ use tempfile::NamedTempFile;
 mod native;
 #[cfg(windows)]
 pub use native::{
-    Managed, control, install, is_default_shell, managed, private_audit, private_marker, serve,
-    serving, ssh_files, ssh_private_dir, until_stopped, wait_for_activation,
+    Managed, control, is_default_shell, managed, plan_install, plan_uninstall, private_audit,
+    private_marker, serve, serving, ssh_files, ssh_private_dir, until_stopped, wait_for_activation,
 };
 
 #[derive(clap::Args)]
@@ -130,15 +131,19 @@ fn start_logged(
     })
 }
 
-/// The UTF-16 environment block of a queued update: `variables` without the one that names the
-/// runtime serving this shell, each NUL-terminated and sorted by name ignoring case, then one
-/// more NUL.
+/// The UTF-16 environment block of a queued update: `variables` without those that place it
+/// in a session (the runtime serving this shell, the ends of this SSH login), each
+/// NUL-terminated and sorted by name ignoring case, then one more NUL.
 fn environment_block(
     variables: impl Iterator<Item = (OsString, OsString)>,
     encode: impl Fn(&OsStr) -> Vec<u16>,
 ) -> Vec<u16> {
     let mut variables: Vec<_> = variables
-        .filter(|(name, _)| !name.eq_ignore_ascii_case(crate::private::HOST_ENV))
+        .filter(|(name, _)| {
+            [crate::private::HOST_ENV, crate::private::SSH_ENV]
+                .iter()
+                .all(|session| !name.eq_ignore_ascii_case(session))
+        })
         .collect();
     variables.sort_by_cached_key(|(name, _)| name.to_string_lossy().to_uppercase());
     let mut block = Vec::new();
@@ -166,6 +171,189 @@ fn is_profile_service(command: &str, dir: &str, name: &str) -> bool {
     profile_arguments(dir, name).is_ok_and(|arguments| {
         command.starts_with('"') && command.contains(&format!("\" {arguments} "))
     })
+}
+
+/// A registered service, as `uninstall` finds it.
+struct Registered<'a> {
+    command: &'a str,
+    /// Whether it logs on as the account removing it.
+    own_account: bool,
+    /// Its process, while it has one.
+    process: Option<u32>,
+}
+
+/// Refuse to remove anything but this profile's own service, from a command that its end would
+/// not take along, while no update is working on it. `shell_host` is the runtime serving the
+/// MassRelay shell the command says it is in.
+fn check_removable(
+    service: &Registered,
+    dir: &str,
+    name: &str,
+    shell_host: Option<u32>,
+    updating: bool,
+) -> Result<()> {
+    ensure!(
+        is_profile_service(service.command, dir, name),
+        "another service uses the name {name}; nothing was changed"
+    );
+    ensure!(
+        service.own_account,
+        "the service {name} runs under another account; nothing was changed"
+    );
+    ensure!(
+        service.process.is_none() || service.process != shell_host,
+        "this command runs in a MassRelay shell on this device, which ends with the service it \
+         would remove. Nothing was changed. Run 'massrelay uninstall' from an elevated \
+         PowerShell on this device"
+    );
+    ensure!(
+        !updating,
+        "an update of this service is queued or running; nothing was changed. Run 'massrelay \
+         uninstall' once it has finished"
+    );
+    Ok(())
+}
+
+/// What tells one registration of a service from another, as far as the service manager
+/// says: not whether or as which process it runs.
+#[derive(Debug, PartialEq, Eq)]
+struct Registration {
+    command: String,
+    account: String,
+    start: u32,
+}
+
+/// A removal as shown for confirmation, which displays as the changes it would make. Only
+/// Windows makes one, with `plan_uninstall`, and applies it.
+pub struct UninstallPlan {
+    /// The canonical state directory, and the service name `install` gives it.
+    dir: String,
+    name: String,
+    shown: Option<Registration>,
+}
+
+impl UninstallPlan {
+    /// `found` is what is registered under `name` now, inspected for removal, with the means
+    /// to remove it. Hands those back only if this is what was shown.
+    fn confirm<S>(&self, name: &str, found: Option<(Registration, S)>) -> Result<Option<S>> {
+        ensure!(
+            name == self.name && found.as_ref().map(|(found, _)| found) == self.shown.as_ref(),
+            "the background service is no longer as it was shown, so it was not touched. Run \
+             'massrelay uninstall' again"
+        );
+        Ok(found.map(|(_, service)| service))
+    }
+}
+
+impl fmt::Display for UninstallPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        let Self { dir, name, shown } = self;
+        match shown {
+            Some(Registration {
+                command, account, ..
+            }) => write!(
+                formatter,
+                "Delete the Windows service {name}, which runs as {account}, and stop it\n\
+                 Command line: {command}\n\
+                 Keep the device profile, keys and logs in {dir}\n\
+                 Keep the account's right to log on as a service"
+            ),
+            None => write!(
+                formatter,
+                "No Windows service to remove for the profile in {dir}: {name} is not registered"
+            ),
+        }
+    }
+}
+
+/// What a confirmation of an install approves: the registration to be made, and what it was
+/// found over.
+#[derive(Debug, PartialEq, Eq)]
+struct Approval {
+    /// The canonical state directory, and the service name it gets.
+    dir: String,
+    name: String,
+    account: String,
+    command: String,
+    /// The registration to be replaced, and whether it was running.
+    existing: Option<(Registration, bool)>,
+    /// Whether the account has to be allowed to log on as a service.
+    grant: bool,
+}
+
+/// An install as shown for confirmation, which displays as the changes it would make. Only
+/// Windows makes one, with `plan_install`, and applies it.
+pub struct InstallPlan {
+    options: InstallOptions,
+    shown: Approval,
+}
+
+impl InstallPlan {
+    const CHANGED: &str = "the background service, or what an install would do, is no longer \
+        as it was shown, so nothing was installed. Run 'massrelay install' again";
+
+    /// Require what an install would do now to be what was shown.
+    fn confirm(&self, found: &Approval) -> Result<()> {
+        ensure!(*found == self.shown, Self::CHANGED);
+        Ok(())
+    }
+
+    /// Asked where the right would be granted: whether to grant it, which only a plan that
+    /// showed so allows.
+    fn grant(&self, needed: bool) -> Result<bool> {
+        ensure!(!needed || self.shown.grant, Self::CHANGED);
+        Ok(needed)
+    }
+}
+
+impl fmt::Display for InstallPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        let Approval {
+            dir,
+            name,
+            account,
+            command,
+            existing,
+            grant,
+        } = &self.shown;
+        let register = match existing {
+            None => "Register and start",
+            Some((_, false)) => "Reconfigure and start",
+            Some((_, true)) => "Reconfigure and restart",
+        };
+        writeln!(
+            formatter,
+            "{register} the Windows service {name}, which runs as {account} and starts at boot"
+        )?;
+        if *grant {
+            writeln!(formatter, "Allow {account} to log on as a service")?;
+        }
+        write!(
+            formatter,
+            "Command line: {command}\n\
+             Windows needs that account's password, which MassRelay does not save\n\
+             It records events in the profile directory, {dir}"
+        )
+    }
+}
+
+/// What removal asks of the service manager.
+trait Unregister {
+    /// Mark the service for deletion. One that is marked already is left so.
+    fn delete(&self) -> Result<()>;
+    /// Stop it, and wait within a limit until it has stopped.
+    fn stop(&self) -> Result<()>;
+}
+
+/// Delete, then stop. Windows keeps a marked service only until it has stopped, so once the
+/// mark is made the removal holds even if this command ends during the stop, as one reaching
+/// the device through the service would.
+fn unregister(service: &impl Unregister) -> Result<()> {
+    service.delete()?;
+    service.stop().context(
+        "the service is marked for deletion but has not stopped. Windows removes it once it \
+         stops, at the latest when Windows restarts",
+    )
 }
 
 /// Quote one argument for a service command line.
@@ -494,6 +682,170 @@ mod tests {
     }
 
     #[test]
+    fn only_this_profiles_idle_service_is_removable() -> Result<()> {
+        let dir = r"C:\Users\me\MassRelay";
+        let name = service_name(dir);
+        let command = command_line(r"C:\bin\massrelay.exe", dir, &name, r"C:\shell.exe")?;
+        let ours = || Registered {
+            command: &command,
+            own_account: true,
+            process: Some(40),
+        };
+        let check = |service: Registered, host, updating| {
+            check_removable(&service, dir, &name, host, updating)
+        };
+        check(ours(), None, false)?;
+        // A marker left by another runtime, and a stopped service, which hosts nothing.
+        check(ours(), Some(41), false)?;
+        let stopped = Registered {
+            process: None,
+            ..ours()
+        };
+        check(stopped, None, false)?;
+
+        let foreign = Registered {
+            command: r"C:\Windows\System32\svchost.exe -k netsvcs",
+            ..ours()
+        };
+        assert!(check(foreign, None, false).is_err());
+        let theirs = Registered {
+            own_account: false,
+            ..ours()
+        };
+        assert!(check(theirs, None, false).is_err());
+        assert!(check(ours(), Some(40), false).is_err());
+        assert!(check(ours(), None, true).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn an_install_applies_only_what_was_shown() -> Result<()> {
+        let approval = |command: &str, running: Option<bool>, grant| Approval {
+            dir: r"C:\state".into(),
+            name: "MassRelay-1".into(),
+            account: r"PC\me".into(),
+            command: command.into(),
+            existing: running.map(|running| {
+                let registration = Registration {
+                    command: "massrelay".into(),
+                    account: r".\me".into(),
+                    start: 2,
+                };
+                (registration, running)
+            }),
+            grant,
+        };
+        let plan = |shown| InstallPlan {
+            options: InstallOptions {
+                shell: None,
+                password_stdin: false,
+                allow_administrator: false,
+            },
+            shown,
+        };
+
+        let over_stopped = plan(approval("massrelay", Some(false), false));
+        over_stopped.confirm(&approval("massrelay", Some(false), false))?;
+        for changed in [
+            approval("other", Some(false), false),
+            // Removed, or started so that installing would end its sessions.
+            approval("massrelay", None, false),
+            approval("massrelay", Some(true), false),
+            // The account lost the right.
+            approval("massrelay", Some(false), true),
+        ] {
+            assert!(over_stopped.confirm(&changed).is_err());
+        }
+        // Lost after that look too: nothing grants what was not shown.
+        assert!(!over_stopped.grant(false)?);
+        assert!(over_stopped.grant(true).is_err());
+
+        let granting = plan(approval("massrelay", None, true));
+        assert!(granting.grant(true)?);
+        assert!(!granting.grant(false)?);
+        assert!(
+            granting
+                .confirm(&approval("massrelay", Some(false), true))
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_removal_applies_only_to_the_registration_that_was_shown() -> Result<()> {
+        let registration = |command: &str, account: &str, start| Registration {
+            command: command.into(),
+            account: account.into(),
+            start,
+        };
+        let installed = || registration("massrelay", r".\me", 2);
+        let plan = |shown| UninstallPlan {
+            dir: r"C:\state".into(),
+            name: "MassRelay-1".into(),
+            shown,
+        };
+        let confirm = |plan: &UninstallPlan, found: Option<Registration>| {
+            plan.confirm("MassRelay-1", found.map(|found| (found, ())))
+        };
+        // Nothing was shown, so a service registered since is not removed.
+        assert_eq!(confirm(&plan(None), None)?, None);
+        assert!(confirm(&plan(None), Some(installed())).is_err());
+
+        let shown = plan(Some(installed()));
+        assert_eq!(confirm(&shown, Some(installed()))?, Some(()));
+        for replaced in [
+            None,
+            Some(registration("other", r".\me", 2)),
+            Some(registration("massrelay", r".\other", 2)),
+            Some(registration("massrelay", r".\me", 4)),
+        ] {
+            assert!(confirm(&shown, replaced).is_err());
+        }
+        assert!(
+            shown
+                .confirm("MassRelay-2", Some((installed(), ())))
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_service_is_marked_for_deletion_before_it_is_stopped() {
+        struct Manager {
+            refuse: &'static str,
+            asked: std::cell::RefCell<Vec<&'static str>>,
+        }
+        impl Manager {
+            fn ask(&self, request: &'static str) -> Result<()> {
+                self.asked.borrow_mut().push(request);
+                ensure!(self.refuse != request, "refused");
+                Ok(())
+            }
+        }
+        impl Unregister for Manager {
+            fn delete(&self) -> Result<()> {
+                self.ask("delete")
+            }
+            fn stop(&self) -> Result<()> {
+                self.ask("stop")
+            }
+        }
+        for (refuse, asked) in [
+            ("", &["delete", "stop"][..]),
+            // Nothing is stopped that could not be deleted.
+            ("delete", &["delete"]),
+            ("stop", &["delete", "stop"]),
+        ] {
+            let manager = Manager {
+                refuse,
+                asked: Default::default(),
+            };
+            assert_eq!(unregister(&manager).is_ok(), refuse.is_empty());
+            assert_eq!(*manager.asked.borrow(), asked);
+        }
+    }
+
+    #[test]
     fn only_a_started_update_replaces_the_previous_log() -> Result<()> {
         use std::{fs, io::Write as _};
 
@@ -552,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn the_queued_environment_drops_the_shell_marker_and_ends_with_two_nuls() {
+    fn the_queued_environment_drops_the_session_markers_and_ends_with_two_nuls() {
         let block = |variables: &[(&str, &str)]| {
             environment_block(
                 variables
@@ -562,7 +914,10 @@ mod tests {
             )
         };
         assert_eq!(block(&[]), [0, 0]);
-        assert_eq!(block(&[("MassRelay_Shell_Host", "1")]), [0, 0]);
+        assert_eq!(
+            block(&[("MassRelay_Shell_Host", "1"), ("Ssh_Connection", "2")]),
+            [0, 0]
+        );
         let expected: Vec<u16> = "a=1\0B=2\0\0".encode_utf16().collect();
         assert_eq!(
             block(&[("B", "2"), (crate::private::HOST_ENV, "1"), ("a", "1")]),

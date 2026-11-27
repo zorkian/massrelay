@@ -60,6 +60,19 @@ impl Fixture {
         Ok(found)
     }
 
+    /// The uninstall as planned now: what it would show.
+    fn removal(&self, state: &Path) -> Result<Removal> {
+        Ok(survey(Account::current()?, &self.home, state))
+    }
+
+    fn uninstall(&self, state: &Path) -> Result<()> {
+        self.removal(state)?.apply()
+    }
+
+    fn ledger(&self) -> PathBuf {
+        self.ssh().join(FRAGMENTS).join(LEDGER)
+    }
+
     /// A user's own file, in a `~/.ssh` made beforehand.
     fn existing(&self, name: &str, contents: &[u8], mode: u32) -> Result<PathBuf> {
         if !self.ssh().exists() {
@@ -84,6 +97,20 @@ fn write(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
 
 fn client(state: &Path) -> PathBuf {
     state.join(cli::DIR_NAME).join(CLIENT_CONFIG)
+}
+
+fn record(state: &Path) -> PathBuf {
+    state.join(cli::DIR_NAME).join(CLIENT_RECORD)
+}
+
+fn digest(contents: &[u8]) -> Vec<u8> {
+    format!("{:x}\n", Sha256::digest(contents)).into_bytes()
+}
+
+/// What the runtime leaves once it has written a configuration.
+fn publish(state: &Path, contents: &[u8]) -> Result<()> {
+    write(&client(state), contents, 0o600)?;
+    write(&record(state), &digest(contents), 0o600)
 }
 
 fn mode(path: &Path) -> Result<u32> {
@@ -368,6 +395,303 @@ fn a_file_changed_after_it_was_read_is_not_overwritten() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn the_last_uninstall_takes_back_the_include_and_keeps_everything_else() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let original = b"ServerAliveInterval 30\r\n\r\nHost a\r\n    User b";
+    let config = fixture.existing("config", original, 0o640)?;
+    let own_key = fixture.existing("id_ed25519", b"the user's key", 0o600)?;
+    let first = fixture.profile("first")?;
+    let second = fixture.profile("second")?;
+    let mut kept = vec![own_key];
+    for state in [&first, &second] {
+        fixture.install(state)?;
+        let private = state.join(cli::DIR_NAME);
+        for name in [CLIENT_STATE, "ssh-client-key-peer", "ssh-pin-peer"] {
+            if name != CLIENT_STATE {
+                write(&private.join(name), b"runtime", 0o600)?;
+            }
+            kept.push(private.join(name));
+        }
+    }
+    kept.push(fixture.ledger());
+    publish(&first, b"Host written-by-the-runtime\n")?;
+    let stamps = |paths: &[PathBuf]| paths.iter().map(|path| stamp(path)).collect();
+    let before: Result<Vec<_>> = stamps(&kept);
+    let before = before?;
+    let installed = stamp(&config)?;
+    let [first_fragment, second_fragment] = [&first, &second].map(|state| {
+        let (name, _) = fragment(&client(state)).unwrap();
+        fixture.ssh().join(FRAGMENTS).join(name)
+    });
+
+    // Planning shows the removals and makes none.
+    let shown = fixture.removal(&first)?.to_string();
+    assert!(shown.contains(&format!("stopped: {}", client(&first).display())));
+    assert!(shown.contains(&format!("remove: {}", first_fragment.display())));
+    assert!(shown.contains(&format!("keep {}", config.display())));
+    assert!(first_fragment.is_file() && client(&first).is_file());
+
+    // Another profile still needs the include.
+    fixture.uninstall(&first)?;
+    assert!(!client(&first).exists() && !first_fragment.exists());
+    assert!(!record(&first).exists());
+    assert!(second_fragment.is_file() && client(&second).is_file());
+    assert_eq!(stamp(&config)?, installed);
+
+    fixture.uninstall(&second)?;
+    assert!(fixture.fragments()?.is_empty());
+    assert!(!client(&second).exists());
+    assert_eq!(fs::read(&config)?, original);
+    assert_eq!(mode(&config)?, 0o640);
+    let after: Result<Vec<_>> = stamps(&kept);
+    assert_eq!(after?, before);
+
+    // Again finds nothing to do and writes nothing.
+    let removed = stamp(&config)?;
+    for state in [&first, &second] {
+        let again = fixture.removal(state)?;
+        assert!(again.to_string().starts_with("nothing to remove"));
+        again.apply()?;
+    }
+    assert_eq!(stamp(&config)?, removed);
+
+    // A later install gives each profile its namespace back, so no alias changes hands.
+    let ledger = fs::read(fixture.ledger())?;
+    fixture.install(&second)?;
+    fixture.install(&first)?;
+    assert_eq!(fs::read(fixture.ledger())?, ledger);
+    assert_eq!(fixture.fragments()?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn an_uninstall_that_stopped_partway_can_be_run_again() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let state = fixture.profile("state")?;
+    let config = fixture.install(&state)?;
+    let fragment = fixture.fragments()?.remove(0);
+    let generated = fs::read(&fragment)?;
+    let installed = fs::read(&config)?;
+
+    // A file edited after it was shown stops the removal there.
+    let planned = fixture.removal(&state)?;
+    let edited = [&generated[..], b"Host mine\n"].concat();
+    write(&fragment, &edited, 0o600)?;
+    assert!(planned.apply().is_err());
+    assert!(client(&state).exists());
+    assert_eq!(fs::read(&fragment)?, edited);
+    assert_eq!(fs::read(&config)?, installed);
+
+    write(&fragment, &generated, 0o600)?;
+    fixture.uninstall(&state)?;
+    assert!(!client(&state).exists() && !fragment.exists());
+    assert_eq!(fs::read(&config)?, b"");
+
+    // Only the include is left, as after a failure to rewrite the configuration.
+    write(&config, &installed, 0o600)?;
+    fixture.uninstall(&state)?;
+    assert_eq!(fs::read(&config)?, b"");
+    Ok(())
+}
+
+#[test]
+fn an_uninstall_removes_only_what_it_was_shown_to_remove() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let first = fixture.profile("first")?;
+    let config = fixture.install(&first)?;
+    let installed = fs::read(&config)?;
+    // Another profile is installed between the plan and its application.
+    let planned = fixture.removal(&first)?;
+    let second = fixture.profile("second")?;
+    fixture.install(&second)?;
+    planned.apply()?;
+    assert_eq!(fs::read(&config)?, installed);
+    assert_eq!(fixture.fragments()?.len(), 1);
+    assert!(client(&second).exists());
+    Ok(())
+}
+
+#[test]
+fn an_uninstall_keeps_what_it_cannot_show_the_install_made() -> Result<()> {
+    // An edited fragment stays, and so does the include that reads it.
+    let fixture = Fixture::new()?;
+    let state = fixture.profile("state")?;
+    let config = fixture.install(&state)?;
+    let fragment = fixture.fragments()?.remove(0);
+    let edited = [&fs::read(&fragment)?[..], b"Host mine\n"].concat();
+    write(&fragment, &edited, 0o600)?;
+    let installed = fs::read(&config)?;
+    fixture.uninstall(&state)?;
+    assert_eq!(fs::read(&fragment)?, edited);
+    assert_eq!(fs::read(&config)?, installed);
+    assert!(client(&state).exists());
+
+    // The user's own file among the fragments keeps the include too.
+    fs::remove_file(&fragment)?;
+    let own = fixture.ssh().join(FRAGMENTS).join("mine.conf");
+    write(&own, b"Host mine\n", 0o600)?;
+    fixture.uninstall(&state)?;
+    assert_eq!(fs::read(&config)?, installed);
+    assert_eq!(fs::read(&own)?, b"Host mine\n");
+    fs::remove_file(&own)?;
+
+    // A configuration that has become a link is left, and so is what it points at.
+    let target = fixture.root.join("dotfiles-config");
+    fs::rename(&config, &target)?;
+    symlink(&target, &config)?;
+    let removal = fixture.removal(&state)?;
+    assert!(removal.to_string().contains("is a link"), "{removal}");
+    removal.apply()?;
+    assert!(config.is_symlink());
+    assert_eq!(fs::read(&target)?, installed);
+
+    // An include the user wrote is theirs.
+    fs::remove_file(&config)?;
+    write(&config, b"Include massrelay.d/*.conf\n", 0o600)?;
+    fixture.uninstall(&state)?;
+    assert_eq!(fs::read(&config)?, b"Include massrelay.d/*.conf\n");
+
+    // A linked fragment directory shows nothing about whose the configuration is, and does
+    // not stop the uninstall.
+    let moved = fixture.root.join("moved-fragments");
+    fs::rename(fixture.ssh().join(FRAGMENTS), &moved)?;
+    symlink(&moved, fixture.ssh().join(FRAGMENTS))?;
+    fixture.uninstall(&state)?;
+    assert!(client(&state).exists());
+    fs::remove_file(client(&state))?;
+    fs::remove_file(fixture.ssh().join(FRAGMENTS))?;
+    fs::rename(&moved, fixture.ssh().join(FRAGMENTS))?;
+
+    // Links in place of the profile's own files are not removed or followed.
+    let other = fixture.root.join("unrelated");
+    write(&other, b"unrelated", 0o600)?;
+    symlink(&other, client(&state))?;
+    symlink(&other, &fragment)?;
+    fixture.uninstall(&state)?;
+    assert!(client(&state).is_symlink() && fragment.is_symlink());
+    assert_eq!(fs::read(&other)?, b"unrelated");
+    Ok(())
+}
+
+#[test]
+fn an_uninstall_removes_a_configuration_only_while_massrelay_wrote_all_of_it() -> Result<()> {
+    const WRITTEN: &[u8] = b"# Written by MassRelay.\n\nHost massrelay-a mr-a\n    User b\n";
+    let edited = [WRITTEN, b"\nHost mine\n    User me\n"].concat();
+    // An installed profile whose runtime has written its configuration.
+    let published = || -> Result<(Fixture, PathBuf, PathBuf)> {
+        let fixture = Fixture::new()?;
+        let state = fixture.profile("state")?;
+        fixture.install(&state)?;
+        publish(&state, WRITTEN)?;
+        let fragment = fixture.fragments()?.remove(0);
+        Ok((fixture, state, fragment))
+    };
+    let kept = |removal: &Removal, state: &Path| {
+        let shown = removal.to_string();
+        shown.contains(&format!("keep {}: ", client(state).display()))
+    };
+
+    let (fixture, state, fragment) = published()?;
+    let removal = fixture.removal(&state)?;
+    assert!(!kept(&removal, &state), "{removal}");
+    removal.apply()?;
+    assert!(!client(&state).exists() && !record(&state).exists() && !fragment.exists());
+
+    // A stanza added by hand keeps the file, while its aliases go with the fragment.
+    let (fixture, state, fragment) = published()?;
+    write(&client(&state), &edited, 0o600)?;
+    let removal = fixture.removal(&state)?;
+    assert!(kept(&removal, &state), "{removal}");
+    removal.apply()?;
+    assert!(!fragment.exists());
+    assert_eq!(fs::read(fixture.ssh().join("config"))?, b"");
+    // Nothing shows whose it is any more, so a second run keeps it too.
+    fixture.uninstall(&state)?;
+    assert_eq!(fs::read(client(&state))?, edited);
+    assert_eq!(fs::read(record(&state))?, digest(WRITTEN));
+
+    // Edited after it was shown to be removed.
+    let (fixture, state, fragment) = published()?;
+    let removal = fixture.removal(&state)?;
+    write(&client(&state), &edited, 0o600)?;
+    removal.apply()?;
+    assert_eq!(fs::read(client(&state))?, edited);
+    assert!(record(&state).exists() && !fragment.exists());
+
+    // Seen between the runtime's two writes, and complete once it has stopped.
+    let (fixture, state, _) = published()?;
+    write(&client(&state), &edited, 0o600)?;
+    let removal = fixture.removal(&state)?;
+    publish(&state, &edited)?;
+    removal.apply()?;
+    assert!(!client(&state).exists() && !record(&state).exists());
+
+    // Only a private record of exactly these bytes counts, and any other is left alone.
+    let good = digest(WRITTEN);
+    let upper = good.to_ascii_uppercase();
+    let longer = [&good[..], b"\n"].concat();
+    for (bytes, permissions) in [
+        (&digest(&edited)[..], 0o600),
+        (&upper, 0o600),
+        (&good[..64], 0o600),
+        (&longer, 0o600),
+        (&good, 0o640),
+    ] {
+        let (fixture, state, fragment) = published()?;
+        write(&record(&state), bytes, permissions)?;
+        fixture.uninstall(&state)?;
+        assert_eq!(fs::read(client(&state))?, WRITTEN);
+        assert_eq!(fs::read(record(&state))?, bytes);
+        assert!(!fragment.exists());
+    }
+    for link in [false, true] {
+        let (fixture, state, _) = published()?;
+        let elsewhere = fixture.root.join("record");
+        fs::rename(record(&state), &elsewhere)?;
+        if link {
+            symlink(&elsewhere, record(&state))?;
+        }
+        fixture.uninstall(&state)?;
+        assert_eq!(fs::read(client(&state))?, WRITTEN);
+        assert_eq!(record(&state).is_symlink(), link);
+        assert_eq!(fs::read(&elsewhere)?, good);
+    }
+
+    // A matching record is not enough without the fragment the install wrote.
+    for replacement in [None, Some(&b"Host mine\n"[..])] {
+        let (fixture, state, fragment) = published()?;
+        match replacement {
+            Some(contents) => write(&fragment, contents, 0o600)?,
+            None => fs::remove_file(&fragment)?,
+        }
+        fixture.uninstall(&state)?;
+        assert_eq!(fs::read(client(&state))?, WRITTEN);
+        assert_eq!(fs::read(record(&state))?, good);
+    }
+
+    // An empty configuration holds nothing to lose. A record of other bytes stays.
+    for recorded in [&b""[..], WRITTEN] {
+        let (fixture, state, _) = published()?;
+        write(&client(&state), b"", 0o600)?;
+        write(&record(&state), &digest(recorded), 0o600)?;
+        fixture.uninstall(&state)?;
+        assert!(!client(&state).exists());
+        assert_eq!(record(&state).exists(), !recorded.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn an_uninstall_with_nothing_installed_creates_nothing() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let state = fixture.profile("state")?;
+    fixture.uninstall(&state)?;
+    assert!(!fixture.ssh().exists());
+    assert_eq!(fs::read_dir(state.join(cli::DIR_NAME))?.count(), 0);
+    Ok(())
+}
+
 /// The system's OpenSSH reads the result: the fragments apply to every host, and no block in
 /// them or in the user's configuration spills into another.
 #[test]
@@ -440,6 +764,19 @@ fn openssh_reads_each_profile_without_rescoping_the_users_settings() -> Result<(
         ("massrelay-two", "two", 2202, "no"),
         ("plain", "fallback", 2200, "yes"),
         ("other", "fallback", 22, "yes"),
+    ] {
+        let mut seen = settings(host)?;
+        seen.sort();
+        assert_eq!(seen, expected(user, port, forward), "{host}");
+    }
+
+    // After an uninstall of each, the user's own hosts connect as they did before.
+    for state in [&first, &second, &removed] {
+        fixture.uninstall(state)?;
+    }
+    for (host, user, port, forward) in [
+        ("massrelay-one", "fallback", 22, "yes"),
+        ("plain", "fallback", 2200, "yes"),
     ] {
         let mut seen = settings(host)?;
         seen.sort();

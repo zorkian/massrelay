@@ -1,6 +1,6 @@
-//! The account's SSH files on Windows, for `massrelay install`.
+//! The account's SSH files on Windows, for `massrelay install` and `massrelay uninstall`.
 //!
-//! The install runs elevated, so nothing here trusts the environment or who owns the device's
+//! Both run elevated, so nothing here trusts the environment or who owns the device's
 //! state. The home directory is the profile of the process token's user. Every SSH file used
 //! must be owned by exactly that user: an elevated process's files belong to Administrators
 //! unless an owner is named, so each file made here names one, in the same call that creates
@@ -46,7 +46,7 @@ use super::{
 /// More than any SSH configuration holds.
 const LIMIT: u64 = 16 * 1024 * 1024;
 
-/// The account running the install, which is the one its service runs as.
+/// The account running the command, which is the one its service runs as.
 pub struct Account(super::Account);
 
 /// A file as it was read.
@@ -135,6 +135,11 @@ impl Account {
                 return Err(os_error(error).context(format!("create {}", path.display())));
             }
         }
+        self.existing_directory(path)
+    }
+
+    /// Such a directory, which is not created.
+    pub fn existing_directory(&self, path: &Path) -> Result<()> {
         no_reparse(path)?;
         ensure!(
             fs::symlink_metadata(path)?.is_dir(),
@@ -145,7 +150,7 @@ impl Account {
         ensure_trusted(&rules::plain(path)?, Role::Holder, &self.0)
     }
 
-    /// Hold off other installs of this account while its SSH files change.
+    /// Hold off other installs and uninstalls of this account while its SSH files change.
     pub fn lock(&self, path: &Path) -> Result<File> {
         let file = PrivateFile::new(&self.0)?
             .open(path, GENERIC_READ | GENERIC_WRITE, OPEN_ALWAYS)
@@ -234,6 +239,11 @@ impl Account {
         Ok(())
     }
 
+    /// The runtime's record: private, as the configuration it describes is.
+    pub fn check_record(&self, path: &Path, found: &Found) -> Result<()> {
+        self.check_client(path, found)
+    }
+
     /// A temporary file beside `path`. Its name matches no `*.conf` include.
     fn stage(&self, path: &Path, contents: &[u8]) -> Result<NamedTempFile> {
         let directory = path.parent().context("the file has no directory")?;
@@ -309,6 +319,20 @@ impl Account {
         let _ = fs::remove_file(&previous);
         Ok(true)
     }
+
+    /// Delete the file `found` was read from, under the same limits as `replace`. False if
+    /// it is no longer that file with those contents.
+    pub fn remove(&self, path: &Path, found: &Found) -> Result<bool> {
+        self.check_fragment(path, found)?;
+        let unchanged = self
+            .read(path)?
+            .is_some_and(|now| now.identity == found.identity && now.contents == found.contents);
+        if !unchanged {
+            return Ok(false);
+        }
+        fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+        Ok(true)
+    }
 }
 
 /// Neither `path` nor any directory above it is a link or mount point, so that what is checked
@@ -320,7 +344,7 @@ fn no_reparse(path: &Path) -> Result<()> {
             fs::symlink_metadata(part).with_context(|| format!("check {}", part.display()))?;
         ensure!(
             metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
-            "{} is a link or mount point, which massrelay install does not follow",
+            "{} is a link or mount point, which MassRelay does not follow",
             part.display()
         );
     }
@@ -366,14 +390,86 @@ pub(crate) fn check_managed_file(path: &Path) -> Result<()> {
     account.check_client(path, &found)
 }
 
+/// Refuse `path`, a file or a directory of the system SSH server, unless the system, the
+/// machine's administrators and TrustedInstaller alone control it and every directory above
+/// it, none of them a link or mount point. No other account counts, the one running this
+/// included: its ordinary token must not change what the server reads.
+pub(crate) fn check_system_path(path: &Path, directory: bool) -> Result<()> {
+    no_reparse(path)?;
+    ensure!(
+        fs::symlink_metadata(path)?.is_dir() == directory,
+        "{} is not the expected kind of file",
+        path.display()
+    );
+    let path = rules::plain(path)?;
+    for (depth, part) in Path::new(&path).ancestors().enumerate() {
+        // A directory that receives new files must not pass them unsafe permissions.
+        let role = match (depth, directory) {
+            (0, false) => Role::Program,
+            (0, true) | (1, false) => Role::Staging,
+            _ => Role::Ancestor,
+        };
+        // The account named to this rule is trusted besides the privileged ones.
+        if let Some(sid) = rules::untrusted(&security(part)?, role, rules::SYSTEM) {
+            bail!("{} has unsafe access to {}", describe(sid), part.display());
+        }
+    }
+    Ok(())
+}
+
+/// Hold the machine's lock on changes to the system SSH server: the file `path` in the
+/// server's own directory, which only the system and administrators can open and one handle
+/// at a time holds. Waits `limit` for another holder. Windows releases it when the process
+/// ends, however it ends.
+pub(crate) fn lock_system(path: &Path, limit: std::time::Duration) -> Result<File> {
+    let directory = path.parent().context("the lock has no directory")?;
+    check_system_path(directory, true)?;
+    // Owned by Administrators, and open to them and the system alone.
+    let administrators = super::Account {
+        token_user: Vec::new(),
+        sid: rules::ADMINISTRATORS.to_owned(),
+        user: String::new(),
+        domain: String::new(),
+    };
+    let permissions = PrivateFile::new(&administrators)?;
+    let deadline = std::time::Instant::now() + limit;
+    let held = windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32;
+    let file = loop {
+        match permissions.open_sharing(path, GENERIC_READ | GENERIC_WRITE, 0, OPEN_ALWAYS) {
+            Ok(file) => break file,
+            Err(error)
+                if error.raw_os_error() == Some(held) && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("take the lock {} on SSH server changes", path.display())
+                });
+            }
+        }
+    };
+    regular(path, &file)?;
+    // An existing file open to others could be held by one of them.
+    let security = handle_security(path, &file)?;
+    ensure!(
+        rules::untrusted(&security, Role::Private, rules::SYSTEM).is_none(),
+        "{} is open to other accounts",
+        path.display()
+    );
+    Ok(file)
+}
+
 #[cfg(test)]
 mod tests {
     use std::process::Command;
 
+    use sha2::{Digest, Sha256};
+
     use super::*;
     use crate::{
         private::cli,
-        ssh_install::{CLIENT_CONFIG, integrate},
+        ssh_install::{CLIENT_CONFIG, CLIENT_RECORD, CLIENT_STATE, integrate, survey},
         windows_service::private_marker,
     };
 
@@ -441,6 +537,28 @@ mod tests {
         assert!(present(&account, &config)?.identity == after.identity);
         // The configuration, the fragments and no staged or previous file.
         assert_eq!(fs::read_dir(home.join(".ssh"))?.count(), 2);
+
+        // An uninstall removes what the runtime recorded writing, and takes back the added
+        // lines keeping the access list. The next install adds them again.
+        let record = profile.join(CLIENT_RECORD);
+        let mut staged = private_marker(&profile)?;
+        writeln!(staged, "{:x}", Sha256::digest(settings))?;
+        staged.persist(&record)?;
+        survey(Account::current()?, &home, &state).apply()?;
+        assert!(!record.exists());
+        let removed = present(&account, &config)?;
+        assert_eq!(removed.contents, b"Host a\r\n");
+        assert_eq!(removed.security.owner, before.security.owner);
+        assert_eq!(entries(&removed), entries(&before));
+        assert!(!client.exists());
+        assert!(profile.join(CLIENT_STATE).is_file());
+        // The ledger and the lock stay; the profile's fragment is gone.
+        assert_eq!(fs::read_dir(&fragments)?.count(), 2);
+        integrate(&account, &home, &state)?;
+        let mut staged = private_marker(&profile)?;
+        staged.write_all(settings)?;
+        staged.persist(&client)?;
+        let after = present(&account, &config)?;
 
         // Windows OpenSSH reads the drive path the fragment includes. The copy it parses
         // names the disposable fragments, since a relative include means the real home's.

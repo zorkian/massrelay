@@ -1,334 +1,233 @@
-use std::io::{self, Write};
-use std::os::fd::OwnedFd;
-use std::os::unix::fs::PermissionsExt;
-#[cfg(not(target_os = "macos"))]
-use std::os::unix::net::UnixStream as StdStream;
-use std::path::Path;
-use std::process::Stdio;
-use std::time::Duration;
+//! The destination side: the installed system SSH server, reached only on `127.0.0.1`.
+//!
+//! The installer describes that server in the profile (`crate::host_ssh`). Without the
+//! description this device offers no SSH. It is read for every request, under the lock the
+//! installer holds while changing it, so removal takes effect at once. This module starts no
+//! server, changes no host configuration and never touches the server's host keys.
 
-use anyhow::{Context, Result, ensure};
-use tempfile::{NamedTempFile, TempDir};
-#[cfg(target_os = "macos")]
-use tokio::net::TcpStream as LocalStream;
-#[cfg(not(target_os = "macos"))]
-use tokio::net::UnixStream as LocalStream;
-use tokio::process::{Child, Command};
+use std::collections::HashSet;
+use std::io;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, anyhow, ensure};
+use tokio::net::TcpStream;
 
 use crate::mailbox::Bytes;
 
-use super::{Host, keys};
+use super::super::binding::EndpointKey;
+use super::super::codec::hex;
+use super::super::pairing::{Refusal, SessionHandle};
+use super::{Host, Settings, keys, lease};
 
-const SSHD: &str = "/usr/sbin/sshd";
-const HOST_FILE: &str = "ssh-host-ed25519";
-const TEMP_DIR: &str = "/tmp";
+/// The installer's description of the server, in the private profile.
+const DESCRIPTION: &str = "ssh-server.json";
+/// Bound on this device's open tunnels, and so on its lines in the key file.
+const MAX_TUNNELS: usize = 256;
 
-#[cfg(target_os = "linux")]
-fn has_user_bus(runtime: &Path, uid: u32) -> bool {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
-
-    std::fs::symlink_metadata(runtime)
-        .is_ok_and(|dir| dir.is_dir() && dir.uid() == uid && dir.mode() & 0o077 == 0)
-        && std::fs::symlink_metadata(runtime.join("bus"))
-            .is_ok_and(|bus| bus.file_type().is_socket() && bus.uid() == uid)
+/// A validated description of this device's system SSH server.
+#[derive(PartialEq, Eq)]
+pub(in crate::private) struct Target {
+    user: String,
+    port: u16,
+    host_key: [u8; 32],
 }
 
-fn session_environment() -> String {
-    let host = format!("SetEnv={}={}", crate::private::HOST_ENV, std::process::id());
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: geteuid is infallible and has no preconditions.
-        let uid = unsafe { libc::geteuid() };
-        let runtime = format!("/run/user/{uid}");
-        if has_user_bus(Path::new(&runtime), uid) {
-            return format!(
-                "{host} XDG_RUNTIME_DIR={runtime} DBUS_SESSION_BUS_ADDRESS=unix:path={runtime}/bus"
+impl Target {
+    /// This device's server, with the lock under which it was read.
+    async fn locked(profile: &Path) -> Result<(Self, lease::Lock)> {
+        // Nothing is created in a profile that was never set up.
+        ensure!(
+            profile.join(DESCRIPTION).try_exists()?,
+            "no system SSH server is set up for this profile"
+        );
+        let lock = lease::Lock::acquire(profile).await?;
+        let server = crate::host_ssh::Server::load(profile)?;
+        ensure!(
+            Host::valid_user(&server.user),
+            "unsupported SSH account name"
+        );
+        ensure!(server.port != 0, "invalid SSH server port");
+        let file = &server.authorized_keys;
+        ensure!(
+            file.file_name() == Some(lease::KEY_FILE.as_ref())
+                && file.parent().and_then(|dir| dir.canonicalize().ok())
+                    == Some(profile.canonicalize()?),
+            "the SSH key file must be {} in this profile",
+            lease::KEY_FILE
+        );
+        let target = Self {
+            host_key: keys::parse_public_line(&server.host_key)
+                .context("read the system SSH host key")?,
+            user: server.user,
+            port: server.port,
+        };
+        Ok((target, lock))
+    }
+
+    pub(in crate::private) async fn load(profile: &Path) -> Result<Self> {
+        Ok(Self::locked(profile).await?.0)
+    }
+
+    /// Whether an install described a server to this profile at all.
+    pub(in crate::private) fn described(profile: &Path) -> bool {
+        profile.join(DESCRIPTION).exists()
+    }
+
+    pub(in crate::private) fn host(&self) -> Host {
+        Host {
+            user: self.user.clone(),
+            key: Bytes(self.host_key),
+            system: true,
+        }
+    }
+
+    pub(in crate::private) async fn connect(&self) -> io::Result<TcpStream> {
+        let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, self.port)).await?;
+        stream.set_nodelay(true)?;
+        Ok(stream)
+    }
+}
+
+/// A connection to the SSH server, as both of its ends name it: (our end, the server's).
+type Ends = (SocketAddrV4, SocketAddrV4);
+
+/// This runtime's tunnels into the system SSH server.
+pub(in crate::private) struct Destination {
+    /// Tags this profile's lines in the key file.
+    owner: String,
+    lifetime: Mutex<Duration>,
+    open: Arc<Mutex<HashSet<Ends>>>,
+    keys: Arc<lease::Withdrawals>,
+}
+
+/// One open tunnel. Dropping it withdraws its key, then forgets its connection.
+pub(in crate::private) struct Tunnel {
+    // Declared first, so it is withdrawn first.
+    lease: Option<lease::Lease>,
+    _open: Open,
+}
+
+struct Open {
+    all: Arc<Mutex<HashSet<Ends>>>,
+    ends: Ends,
+}
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        if let Ok(mut all) = self.all.lock() {
+            all.remove(&self.ends);
+        }
+    }
+}
+
+impl Tunnel {
+    /// Withdraw the key and keep the connection, which has had its time to authenticate.
+    pub(in crate::private) fn expire(&mut self) {
+        self.lease = None;
+    }
+}
+
+impl Destination {
+    pub(in crate::private) fn new(endpoint: &EndpointKey, profile: &Path) -> Self {
+        Self {
+            owner: hex(&endpoint[..16]),
+            lifetime: Mutex::new(Settings::default().lease),
+            open: Arc::default(),
+            keys: lease::Withdrawals::new(profile),
+        }
+    }
+
+    pub(in crate::private) fn set_lifetime(&self, lifetime: Duration) {
+        *self.lifetime.lock().expect("SSH lifetime") = lifetime;
+    }
+
+    pub(in crate::private) fn lifetime(&self) -> Duration {
+        *self.lifetime.lock().expect("SSH lifetime")
+    }
+
+    /// Withdraw keys an earlier run of this profile left behind. Only before any tunnel,
+    /// within the async runtime. It does not wait for the setup lock.
+    pub(in crate::private) fn purge(&self) {
+        if let Err(error) = lease::purge(&self.keys, &self.owner) {
+            super::warn("could not withdraw earlier SSH tunnel keys", &error);
+        }
+    }
+
+    /// Give keys still being withdrawn at most `grace`, then stop trying. Only after the
+    /// tunnels have ended.
+    pub(in crate::private) async fn close(&self, grace: Duration) {
+        if !self.keys.close(grace).await {
+            super::warn(
+                "an SSH tunnel's key was left to expire",
+                &anyhow!("it could not be withdrawn before stopping"),
             );
         }
     }
-    host
-}
 
-async fn account() -> Result<String> {
-    unsafe extern "C" {
-        fn getuid() -> u32;
-        fn geteuid() -> u32;
-    }
-    // SAFETY: These libc calls have no preconditions and cannot fail.
-    let (uid, effective) = unsafe { (getuid(), geteuid()) };
-    ensure!(
-        uid != 0 && uid == effective,
-        "SSH requires a regular runtime user"
-    );
-    let run_id = |args: &[&str]| {
-        let mut cmd = Command::new("/usr/bin/id");
-        cmd.args(args).env_clear().kill_on_drop(true);
-        cmd
-    };
-    let name = run_id(&["-un"]).output().await?;
-    ensure!(name.status.success(), "could not resolve the runtime user");
-    let user = std::str::from_utf8(&name.stdout)?.trim_end_matches('\n');
-    ensure!(Host::valid_user(user), "unsupported SSH account name");
-    let resolved = run_id(&["-u", user]).output().await?;
-    ensure!(
-        resolved.status.success()
-            && std::str::from_utf8(&resolved.stdout)?
-                .trim_end_matches('\n')
-                .parse::<u32>()?
-                == uid,
-        "SSH account does not resolve to the runtime UID"
-    );
-    Ok(user.to_owned())
-}
-
-async fn install_host_key(dir: &Path, rotate: bool) -> Result<[u8; 32]> {
-    let staging = tempfile::Builder::new()
-        .permissions(std::fs::Permissions::from_mode(0o700))
-        .tempdir_in(dir)?;
-    let generated = staging.path().join("host");
-    let key = keys::generate(&generated).await?;
-    let mut replacement = NamedTempFile::new_in(dir)?;
-    replacement.write_all(&tokio::fs::read(generated).await?)?;
-    replacement.as_file().sync_all()?;
-    let path = dir.join(HOST_FILE);
-    if rotate {
-        replacement.persist(&path)?;
-    } else if let Err(err) = replacement.persist_noclobber(&path) {
-        if err.error.kind() != io::ErrorKind::AlreadyExists {
-            return Err(err.error.into());
-        }
-        return keys::public_key(&path).await;
-    }
-    std::fs::File::open(dir)?.sync_all()?;
-    Ok(key)
-}
-
-pub(in crate::private) async fn rotate_host_key(dir: &Path) -> Result<String> {
-    account().await?;
-    let key = install_host_key(dir, true).await?;
-    Ok(keys::fingerprint(&key))
-}
-
-pub(in crate::private) async fn host_info(dir: &Path) -> Result<Host> {
-    let user = account().await?;
-    ensure!(
-        Path::new(SSHD).is_file(),
-        "OpenSSH server executable is missing"
-    );
-    let path = dir.join(HOST_FILE);
-    let key = match tokio::fs::try_exists(&path).await? {
-        true => keys::public_key(&path).await?,
-        false => install_host_key(dir, false).await?,
-    };
-    Ok(Host {
-        user,
-        key: Bytes(key),
-    })
-}
-
-pub(in crate::private) struct Prepared {
-    files: TempDir,
-    user: String,
-    #[cfg(target_os = "macos")]
-    pair: (LocalStream, std::net::TcpStream),
-}
-
-#[cfg(any(test, target_os = "macos"))]
-async fn audit_socket_pair() -> Result<(tokio::net::TcpStream, std::net::TcpStream)> {
-    // Apple sshd needs an IP address for its audit session. The listener
-    // exists only while we connect our own socket and close it before spawn.
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
-    let local = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
-    let (remote, peer) = listener.accept().await?;
-    drop(listener);
-    ensure!(
-        peer == local.local_addr()?,
-        "unexpected connection while preparing the OpenSSH audit socket"
-    );
-    let remote = remote.into_std()?;
-    remote.set_nonblocking(false)?;
-    Ok((local, remote))
-}
-
-impl Prepared {
-    pub(in crate::private) async fn new(dir: &Path, key: &[u8; 32]) -> Result<Self> {
-        let user = host_info(dir).await?.user;
-        let files = tempfile::Builder::new()
-            .prefix("massrelay-sshd-")
-            .permissions(std::fs::Permissions::from_mode(0o700))
-            .tempdir_in(TEMP_DIR)?;
-        tokio::fs::write(
-            files.path().join("client.pub"),
-            keys::public_line(key) + "\n",
-        )
-        .await?;
-        #[cfg(target_os = "macos")]
-        let pair = tokio::time::timeout(Duration::from_secs(2), audit_socket_pair()).await??;
-        Ok(Self {
-            files,
-            user,
-            #[cfg(target_os = "macos")]
-            pair,
+    /// Record `stream`, a connection to the SSH server, as a tunnel of this runtime.
+    pub(in crate::private) fn register(&self, stream: &TcpStream) -> Result<Tunnel> {
+        let v4 = |address| match address {
+            SocketAddr::V4(address) => Ok(address),
+            SocketAddr::V6(_) => Err(anyhow::anyhow!("the SSH connection is not IPv4")),
+        };
+        let ends = (v4(stream.local_addr()?)?, v4(stream.peer_addr()?)?);
+        let mut open = self.open.lock().expect("SSH tunnels");
+        ensure!(open.len() < MAX_TUNNELS, "too many open SSH tunnels");
+        ensure!(open.insert(ends), "the SSH connection is already recorded");
+        Ok(Tunnel {
+            lease: None,
+            _open: Open {
+                all: self.open.clone(),
+                ends,
+            },
         })
     }
 
-    fn command(&self, dir: &Path) -> Command {
-        let mut command = Command::new(SSHD);
-        command
-            .args(["-e", "-f", "/dev/null"])
-            .args([
-                "-o",
-                "PidFile=none",
-                "-o",
-                "AuthenticationMethods=publickey",
-                "-o",
-                "PubkeyAcceptedAlgorithms=ssh-ed25519",
-                "-o",
-                "AuthorizedKeysCommand=none",
-                "-o",
-                "PasswordAuthentication=no",
-                "-o",
-                "KbdInteractiveAuthentication=no",
-                "-o",
-                // PAM requires privileges on both Linux and macOS.
-                "UsePAM=no",
-                "-o",
-                "PermitRootLogin=no",
-                "-o",
-                "DisableForwarding=yes",
-                "-o",
-                "PermitTunnel=no",
-                "-o",
-                "PermitUserRC=no",
-                "-o",
-                "LoginGraceTime=20",
-                "-o",
-                // The private configuration supplies SFTP even without the
-                // system's external sftp-server subsystem.
-                "Subsystem=sftp internal-sftp",
-                // The authorized key is in our own mode-0700 directory
-                // under /tmp. OpenSSH StrictModes rejects that ancestor.
-                "-o",
-                "StrictModes=no",
-            ])
-            .arg("-o")
-            .arg(format!("AllowUsers={}", self.user))
-            .arg("-o")
-            .arg(session_environment())
-            .arg("-h")
-            .arg(dir.join(HOST_FILE))
-            .arg("-o")
-            .arg(format!(
-                "AuthorizedKeysFile={}/client.pub",
-                self.files.path().display()
-            ))
-            .env_clear()
-            .kill_on_drop(true);
-        command
-    }
-
-    #[cfg(test)]
-    pub(in crate::private) async fn check_config(&self, dir: &Path) -> Result<()> {
-        let output = self.command(dir).arg("-t").output().await?;
-        ensure!(
-            output.status.success(),
-            "{SSHD} rejected the private configuration: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        Ok(())
-    }
-
-    // This runs under SessionHandle's startup lock. The daemon side is
-    // asynchronous. OpenSSH gets blocking descriptors for its own side.
-    pub(in crate::private) fn start(self, dir: &Path) -> Result<(LocalStream, Sshd)> {
-        #[cfg(not(target_os = "macos"))]
-        let (local, remote) = {
-            let (local, remote) = StdStream::pair()?;
-            local.set_nonblocking(true)?;
-            (LocalStream::from_std(local)?, remote)
-        };
-        let stderr = if cfg!(test) {
-            Stdio::inherit()
-        } else {
-            Stdio::null()
-        };
-        let mut command = self.command(dir);
-        #[cfg(target_os = "macos")]
-        let (local, remote) = self.pair;
-        let child = command
-            .arg("-i")
-            .stdin(OwnedFd::from(remote.try_clone()?))
-            .stdout(OwnedFd::from(remote))
-            .stderr(stderr)
-            .spawn()
-            .context("start OpenSSH in inetd mode")?;
-        Ok((
-            local,
-            Sshd {
-                child,
-                _files: self.files,
-            },
-        ))
-    }
-}
-
-pub(in crate::private) struct Sshd {
-    child: Child,
-    _files: TempDir,
-}
-
-impl Sshd {
-    pub(in crate::private) async fn reap(mut self) {
-        // The connected socket has been dropped. Let OpenSSH handle its
-        // own channel shutdown. Never signal detached workspace processes.
-        if tokio::time::timeout(Duration::from_secs(1), self.child.wait())
-            .await
-            .is_err()
-        {
-            let _ = self.child.kill().await;
+    /// Authorize `key` for `tunnel`, which is connected to `target`, while `session` is
+    /// authorized. The server must still be described as it was when connected.
+    pub(in crate::private) async fn authorize(
+        &self,
+        tunnel: &mut Tunnel,
+        session: &SessionHandle,
+        profile: &Path,
+        target: &Target,
+        key: &[u8; 32],
+    ) -> Result<Result<()>, Refusal> {
+        let deadline = Instant::now() + lease::WAIT;
+        loop {
+            let current = Target::locked(profile).await.and_then(|(current, lock)| {
+                ensure!(current == *target, "the SSH server setup changed");
+                Ok(lock)
+            });
+            let lock = match current {
+                Ok(lock) => lock,
+                Err(error) => return Ok(Err(error)),
+            };
+            let (owner, lifetime) = (&self.owner, self.lifetime());
+            let granted = lease::grant(&lock, session, &self.keys, owner, key, lifetime)?;
+            // Released first: a lease takes the lock again when dropped.
+            drop(lock);
+            match granted {
+                Ok(lease::Grant::Made(lease)) => {
+                    tunnel.lease = Some(lease);
+                    return Ok(Ok(()));
+                }
+                Ok(lease::Grant::Blocked(error)) if Instant::now() >= deadline => {
+                    return Ok(Err(anyhow!(error).context("replace the SSH key file")));
+                }
+                Ok(lease::Grant::Blocked(_)) => tokio::time::sleep(lease::RETRY).await,
+                Err(error) => return Ok(Err(error)),
+            }
         }
     }
-}
 
-#[cfg(test)]
-#[tokio::test]
-async fn ssh_audit_socket_only_accepts_the_connected_peer_after_preparation() {
-    let (local, remote) = audit_socket_pair().await.unwrap();
-    assert_eq!(remote.peer_addr().unwrap(), local.local_addr().unwrap());
-    let address = remote.local_addr().unwrap();
-    assert!(address.ip().is_loopback());
-    assert_eq!(
-        tokio::net::TcpStream::connect(address)
-            .await
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::ConnectionRefused
-    );
-}
-
-#[cfg(all(test, target_os = "linux"))]
-#[test]
-fn ssh_only_exports_a_bus_in_the_accounts_private_runtime_directory() {
-    use std::os::unix::fs::symlink;
-    use std::os::unix::net::UnixListener;
-
-    let directory = tempfile::Builder::new()
-        .permissions(std::fs::Permissions::from_mode(0o700))
-        .tempdir()
-        .unwrap();
-    let path = directory.path();
-    // SAFETY: geteuid has no preconditions.
-    let uid = unsafe { libc::geteuid() };
-    let bus = path.join("bus");
-    assert!(!has_user_bus(path, uid));
-    let listener = UnixListener::bind(&bus).unwrap();
-    assert!(has_user_bus(path, uid));
-    assert!(!has_user_bus(path, uid ^ 1));
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o770)).unwrap();
-    assert!(!has_user_bus(path, uid));
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
-    drop(listener);
-    std::fs::rename(&bus, path.join("elsewhere")).unwrap();
-    symlink(path.join("elsewhere"), &bus).unwrap();
-    assert!(!has_user_bus(path, uid));
+    /// Whether the connection with exactly these ends is one of the open tunnels.
+    pub(in crate::private) fn owns(&self, client: SocketAddrV4, server: SocketAddrV4) -> bool {
+        self.open
+            .lock()
+            .is_ok_and(|open| open.contains(&(client, server)))
+    }
 }

@@ -93,9 +93,17 @@ On Linux and macOS, shells run with the MassRelay account's usual permissions. O
 
 ## Keep MassRelay running
 
-After creating or joining a network, stop any foreground `massrelay run` and run `massrelay install` to start a background service. Use `massrelay start`, `massrelay stop`, and `massrelay restart` to manage it. Linux uses a systemd user unit. macOS uses a LaunchAgent in your login session.
+After creating or joining a network, stop any foreground `massrelay run` and run `massrelay install` to start a background service and set up SSH. Use `massrelay start`, `massrelay stop`, and `massrelay restart` to manage it. Linux uses a systemd user unit. macOS uses a LaunchAgent in your login session.
 
-On Windows, open an elevated PowerShell under the same account that enrolled the device. Run `massrelay install --allow-administrator` and enter the account password at the prompt. The service starts before sign-in and uses Windows PowerShell by default. Use an elevated local terminal for service controls, and rerun `install` if the password changes. Stop the service before rerunning `install.ps1` to upgrade the binary.
+`install` lists the service and SSH changes it plans to make and asks before making them. Pass `-y` or `--yes` to skip that question, which you must do when there's no terminal to answer it. Changes to the system SSH server may still need `sudo`, a password, or other operating system approval, which `--yes` doesn't skip. If no usable system SSH server is found, the list says so, and `install` sets up the service and this account's SSH aliases without inbound SSH.
+
+From a paired device with a shell grant, use `ssh mr-PEER` or `ssh massrelay-PEER`. MassRelay carries the connection to the host's system OpenSSH server. That server controls login, shell startup, and SSH features. The setup adds an account-specific key file for these loopback logins alongside the current files. Direct SSH keeps its existing configuration. If you change the server's `AuthorizedKeysFile` paths, rerun `massrelay install` to refresh the loopback rule.
+
+After upgrading an earlier MassRelay installation, rerun `massrelay install` on the destination to configure its system SSH server. Use a local terminal, direct SSH, or a built-in `massrelay shell` until that setup is done. System OpenSSH must already be running, reachable on IPv4 loopback, and have an Ed25519 host key.
+
+On Windows, open an elevated PowerShell under the same account that enrolled the device. Run `massrelay install --allow-administrator`, confirm the changes, and enter the account password at the prompt. With `--password-stdin`, also pass `--yes`. The service starts before sign-in and uses Windows PowerShell by default. Use an elevated local terminal for service controls, and rerun `install` if the password changes. Stop the service before rerunning `install.ps1` to upgrade the binary.
+
+To remove the service and MassRelay's SSH setup, run `massrelay uninstall` from a local terminal. It lists the removals and asks first, with the same `--yes` option. Your enrollment, device keys, logs, the program, and your own SSH settings stay, as do the records that stop an old SSH alias from naming another device. The `Include` that `install` added to `~/.ssh/config` is removed with the last profile that needs it. Files that were changed since `install` wrote them are left in place and listed. If a removal fails partway, run `uninstall` again.
 
 ## See what's happening
 
@@ -123,7 +131,7 @@ The relay also hosts an encrypted mailbox for membership and invites. It can see
 
 ## Update MassRelay
 
-Run `massrelay update` from a local terminal or SSH session. It downloads and checks the latest release, waits for active MassRelay sessions to finish, then restarts the installed service. If the new daemon fails to start, the updater restores the previous binary when it can do so safely.
+Run `massrelay update` to download and check the latest release, wait for active MassRelay sessions to finish, then restart the installed service. If the new daemon fails to start, the updater restores the previous binary when it can do so safely. When a MassRelay session carries the command, it queues the update and prints where to check progress. Exit that session so the update can proceed. On Windows, the account running the update needs permission to start the installed service.
 
 The command needs a release it can download without a GitHub account. To bring an older installation up to a version that supports `update`, rerun the installer and restart the service. If an update was interrupted, rerun `massrelay update` to resume recovery.
 

@@ -1826,10 +1826,18 @@ pub async fn run(state_dir: &Path) -> Result<i32> {
     let host = live(&state_dir)?;
     let timing = Timing::default();
 
-    if let Some(pid) = std::env::var(crate::private::HOST_ENV)
+    // A command may run inside a session of the service itself: a MassRelay shell marks its
+    // processes, and the runtime knows the ends of an SSH login that it carries.
+    let shell = std::env::var(crate::private::HOST_ENV)
         .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        && host.service.state()? == Manager::Running(pid)
+        .and_then(|value| value.parse::<u32>().ok());
+    let login = runtime::local_ssh_tunnel(&profile)
+        .await
+        .context("check whether this SSH login is carried by the service being updated")?
+        .map(|identity| identity.pid);
+    if (shell.is_some() || login.is_some())
+        && matches!(host.service.state()?, Manager::Running(pid)
+            if [shell, login].contains(&Some(pid)))
     {
         // Recovery can wait for idle, too. Leave this session before touching its journal.
         let program = std::env::current_exe().context("find the running MassRelay executable")?;
@@ -1909,10 +1917,10 @@ pub async fn run(state_dir: &Path) -> Result<i32> {
     );
     let installed = PathBuf::from(text);
     ensure!(
-        std::env::var(crate::private::HOST_ENV).ok().as_deref() != Some(&identity.pid.to_string()),
-        "this command is running inside a MassRelay shell on this device. The update waits for \
-         every session to end, including that shell, and ending the shell ends this command. \
-         Run 'massrelay update' from a local terminal or another kind of remote session"
+        ![shell, login].contains(&Some(identity.pid)),
+        "this command is running inside a MassRelay shell or SSH session on this device. The \
+         update waits for every session to end, including that one, and ending it ends this \
+         command. Run 'massrelay update' from a local terminal or another kind of remote session"
     );
 
     // The program and the whole path to it are checked before the program is run for its

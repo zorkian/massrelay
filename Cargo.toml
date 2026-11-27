@@ -1,6 +1,6 @@
 [package]
 name = "massrelay"
-version = "0.5.5"
+version = "0.5.6"
 edition = "2024"
 description = "User-mode pocket networks for your own machines"
 
@@ -44,8 +44,6 @@ ed25519-dalek = { version = "3" }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-russh = { version = "=0.65.4", default-features = false, features = ["ring"] }
-zeroize = "1"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",

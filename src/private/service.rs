@@ -49,6 +49,13 @@
 //!    stay registered through that drain: any end of authority, including a
 //!    grant or default change for that service, closes at once.
 //!
+//! # SSH
+//!
+//! An SSH request is admitted under the shell grant. Its tunnel (`super::ssh`) reaches only
+//! the installed system SSH server on `127.0.0.1`: the connect and every write run under the
+//! guard, the client's key is authorized only while the session is, and it is withdrawn
+//! before the connection closes. The system server decides who may log in.
+//!
 //! # Early data
 //!
 //! Safety against replayed 0-RTT data does not rest on the stream's early
@@ -83,6 +90,7 @@
 //! can choose a local target. Connections are logged through `super::audit` with
 //! fixed event reasons.
 
+use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -135,7 +143,9 @@ const MSG_ELEVATED_UNAVAILABLE: &str = "this device cannot start an administrato
 const MSG_CONNECT: &str = "could not connect to the target";
 const MSG_RESOLVE: &str = "could not resolve the target";
 const MSG_ENDED: &str = "authorization ended";
-const MSG_SSH: &str = "could not start the private OpenSSH transport";
+const MSG_SSH_SETUP: &str = "system SSH is not set up; run massrelay install there";
+const MSG_SSH_SERVER: &str = "no SSH server answers on 127.0.0.1 on that device";
+const MSG_SSH_KEY: &str = "could not authorize the SSH key on that device";
 const MSG_SSH_CUSTOM_SHELL: &str = "this device uses a custom shell; SSH access is disabled";
 const REPLY_MESSAGES: &[&str] = &[
     MSG_NOT_AUTHORIZED,
@@ -147,7 +157,9 @@ const REPLY_MESSAGES: &[&str] = &[
     MSG_CONNECT,
     MSG_RESOLVE,
     MSG_ENDED,
-    MSG_SSH,
+    MSG_SSH_SETUP,
+    MSG_SSH_SERVER,
+    MSG_SSH_KEY,
     MSG_SSH_CUSTOM_SHELL,
 ];
 
@@ -335,6 +347,9 @@ pub struct Node<M: Mailbox> {
     log: Arc<DeviceLog>,
     routes: Routes,
     versions: Arc<PeerVersions>,
+    /// Tunnels into this device's system SSH server.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    ssh: ssh::Destination,
 }
 
 impl<M: Mailbox + Send + Sync + 'static> Node<M> {
@@ -358,6 +373,8 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
         log.set_own(endpoint);
         let routes = Routes::open(device.store().dir());
         let versions = Arc::new(PeerVersions::open(device.store().dir()));
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        let ssh = ssh::Destination::new(&endpoint, device.store().dir());
         Ok(Arc::new(Self {
             device,
             owner,
@@ -367,6 +384,8 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
             log,
             routes,
             versions,
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+            ssh,
         }))
     }
 
@@ -376,6 +395,39 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
 
     pub(super) fn version_observations(&self) -> Observations {
         self.versions.observations()
+    }
+
+    /// Set how long a tunnel's client key stays authorized, and withdraw the keys an
+    /// earlier run of this profile left behind. Only before anything is served, within the
+    /// async runtime.
+    pub(super) fn prepare_ssh(&self, lease: Duration) {
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        {
+            self.ssh.set_lifetime(lease);
+            self.ssh.purge();
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        let _ = lease;
+    }
+
+    /// Give keys of ended tunnels still being withdrawn at most `grace`.
+    pub(super) async fn close_ssh(&self, grace: Duration) {
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        self.ssh.close(grace).await;
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        let _ = grace;
+    }
+
+    /// Whether the connection with exactly these ends, from this device to its own SSH
+    /// server, is one of this runtime's open tunnels.
+    pub(super) fn has_ssh_tunnel(&self, client: SocketAddrV4, server: SocketAddrV4) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        return self.ssh.owns(client, server);
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        {
+            let _ = (client, server);
+            false
+        }
     }
 
     pub async fn watch_routes(&self, conn: &Connection) {
@@ -813,7 +865,7 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
         }
         let mut teardown = None;
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-        let mut sshd = None;
+        let mut tunnel = None;
         let serve = async {
             let connected = || track.connected(Some(conn));
             match req {
@@ -823,12 +875,12 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
                 }
                 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
                 None => {
-                    self.serve_ssh(&session, ssh_info, rx, tx, &mut sshd, connected)
+                    self.serve_ssh(&session, ssh_info, rx, tx, &mut tunnel, connected)
                         .await
                 }
                 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
                 None => {
-                    refuse(tx, WireRefusal::TargetUnavailable, MSG_SSH).await;
+                    refuse(tx, WireRefusal::TargetUnavailable, MSG_SSH_SETUP).await;
                     Ended::Refused(WireRefusal::TargetUnavailable)
                 }
             }
@@ -839,23 +891,16 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
             ended = serve => Outcome::Served(ended),
         };
         // The serving future is dropped here: copies stop, sockets close and
-        // a shell's PTY is dropped (its reaper wakes, kills and reaps).
-        #[cfg(windows)]
-        if matches!(outcome, Outcome::Over(_))
-            && let Some(child) = sshd.as_ref()
-        {
-            child.terminate();
-        }
+        // a shell's PTY is dropped (its reaper wakes, kills and reaps). An SSH
+        // tunnel's key is withdrawn before the dialer sees the connection close.
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        drop(tunnel);
         let ended = match outcome {
             Outcome::Served(e) => e,
             Outcome::Over(why) => over(why),
         };
         if let Some(t) = teardown {
             t.wait().await;
-        }
-        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-        if let Some(child) = sshd {
-            child.reap().await;
         }
         (ended, Some(session))
     }
@@ -867,9 +912,13 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
         info: bool,
         rx: &mut RecvStream,
         tx: &mut SendStream,
-        sshd: &mut Option<ssh::Sshd>,
+        tunnel: &mut Option<ssh::Tunnel>,
         connected: impl FnOnce(),
     ) -> Ended {
+        async fn unavailable(tx: &mut SendStream, message: &'static str) -> Ended {
+            refuse(tx, WireRefusal::TargetUnavailable, message).await;
+            Ended::Refused(WireRefusal::TargetUnavailable)
+        }
         let custom_shell = self.shell.as_deref().is_some_and(|shell| {
             #[cfg(windows)]
             {
@@ -881,20 +930,25 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
                 true
             }
         });
+        // The system server would give the account's own shell instead.
         if custom_shell {
-            refuse(tx, WireRefusal::TargetUnavailable, MSG_SSH_CUSTOM_SHELL).await;
-            return Ended::Refused(WireRefusal::TargetUnavailable);
+            return unavailable(tx, MSG_SSH_CUSTOM_SHELL).await;
         }
-        let unavailable = |tx| refuse(tx, WireRefusal::TargetUnavailable, MSG_SSH);
-        let dir = self.device.store().dir();
+        let profile = self.device.store().dir();
+        let target = match ssh::Target::load(profile).await {
+            Ok(target) => target,
+            Err(error) => {
+                // A device without an install has nothing to report.
+                if ssh::Target::described(profile) {
+                    ssh::warn("system SSH is unavailable", &error);
+                }
+                return unavailable(tx, MSG_SSH_SETUP).await;
+            }
+        };
         if info {
-            let Ok(host) = ssh::host_info(dir).await else {
-                unavailable(tx).await;
-                return Ended::Refused(WireRefusal::TargetUnavailable);
-            };
             let mut guarded = session.guard(&mut *tx);
             if wire::send(&mut guarded, ServiceReply::Ready).await.is_err()
-                || wire::send(&mut guarded, host).await.is_err()
+                || wire::send(&mut guarded, target.host()).await.is_err()
             {
                 return Ended::PeerDisconnected;
             }
@@ -907,33 +961,52 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
             return Ended::BadRequest;
         };
         let key = key.try_into().expect("bounded to 32 bytes");
-        let Ok(prepared) = ssh::Prepared::new(dir, &key).await else {
-            unavailable(tx).await;
-            return Ended::Refused(WireRefusal::TargetUnavailable);
-        };
-        let stream = match session.start_now(|| prepared.start(dir)) {
-            Ok(Ok((stream, child))) => {
-                *sshd = Some(child);
-                stream
-            }
-            Ok(Err(_)) => {
-                unavailable(tx).await;
-                return Ended::Refused(WireRefusal::TargetUnavailable);
-            }
+        // Connect first: no key is authorized for a server that does not answer.
+        let connect = tokio::time::timeout(wire::RPC_TIMEOUT, target.connect());
+        let stream = match session.start(connect).await {
+            Ok(Ok(Ok(stream))) => stream,
+            Ok(_) => return unavailable(tx, MSG_SSH_SERVER).await,
             Err(_) => return denied(tx).await,
         };
-        let mut target = session.guard(stream);
-        #[cfg(windows)]
-        if ssh::worker_ready(&mut target).await.is_err() {
-            unavailable(tx).await;
-            return Ended::Refused(WireRefusal::TargetUnavailable);
+        let authorized = match self.ssh.register(&stream) {
+            Ok(registered) => {
+                let tunnel = tunnel.insert(registered);
+                self.ssh
+                    .authorize(tunnel, session, profile, &target, &key)
+                    .await
+            }
+            Err(error) => Ok(Err(error)),
+        };
+        match authorized {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                ssh::warn("could not authorize an SSH tunnel's key", &error);
+                return unavailable(tx, MSG_SSH_KEY).await;
+            }
+            Err(_) => return denied(tx).await,
         }
+        let mut target = session.guard(stream);
         let mut guarded = session.guard(&mut *tx);
         if wire::send(&mut guarded, ServiceReply::Ready).await.is_err() {
             return Ended::PeerDisconnected;
         }
         connected();
-        let result = tcp::bridge_with(rx, &mut guarded, &mut target, tcp::MAX_FRAME).await;
+        let result = {
+            let bridge = tcp::bridge_with(rx, &mut guarded, &mut target, tcp::MAX_FRAME);
+            tokio::pin!(bridge);
+            tokio::select! {
+                result = &mut bridge => result,
+                _ = tokio::time::sleep(self.ssh.lifetime()) => {
+                    // Authentication has had its time; the connection stays.
+                    if let Some(tunnel) = tunnel.as_mut() {
+                        tunnel.expire();
+                    }
+                    bridge.await
+                }
+            }
+        };
+        // The key is withdrawn before the dialer learns that the tunnel ended.
+        *tunnel = None;
         finish_tunnel(result, tx, tcp::MAX_FRAME).await
     }
 

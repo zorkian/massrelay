@@ -5177,122 +5177,498 @@ mod runtime {
         (alice, bob, ra, rb)
     }
 
-    #[cfg(windows)]
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "requires Windows OpenSSH and a previously built massrelay executable"]
-    async fn windows_ssh_uses_the_shell_grant_and_cuts_live_transports() {
-        use crate::private::cli;
+    // ----------------------------------------------------------------- SSH
+
+    /// The dedicated key file an install creates in a profile.
+    const SSH_KEYS: &str = "ssh-authorized-keys";
+    const BANNER: &[u8] = b"SSH-2.0-fixture\r\n";
+
+    /// Replace a file of a profile with a private one, as an install writes them.
+    fn write_private(dir: &std::path::Path, name: &str, content: &[u8]) {
         use std::io::Write as _;
-        use std::process::Stdio;
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        use tokio::process::Command;
+        #[cfg(windows)]
+        let mut file = crate::windows_service::private_marker(dir).unwrap();
+        #[cfg(not(windows))]
+        let mut file = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            tempfile::NamedTempFile::new_in(dir).unwrap()
+        };
+        file.write_all(content).unwrap();
+        file.persist(dir.join(name)).unwrap();
+    }
 
-        tokio::time::timeout(T * 3, async {
-            let n = net();
-            let alice = create(&n, &format!("alice/{}", cli::DIR_NAME), Clock::System);
-            let bob = join(&n, &alice, &format!("bob/{}", cli::DIR_NAME), Clock::System);
-            let (a, b) = tokio::join!(endpoint(&alice.secret), endpoint(&bob.secret));
-            let addresses = Arc::new(BTreeMap::from([(alice.ep, addr(&a)), (bob.ep, addr(&b))]));
-            let binary = crate::private::ssh::worker_executable().unwrap();
-            let config = |member: &Member| {
-                let mut config = Config::new(&member.path);
-                let addresses = addresses.clone();
-                config.addresses = Arc::new(move |key| addresses.get(key).cloned());
-                config.sync_every = None;
-                config.ssh.program = Some(binary.clone());
-                config.ssh.check_every = Duration::from_millis(100);
-                config.ssh.refresh_every = Duration::from_secs(2);
-                config.ssh.retry_after = Duration::from_millis(250);
-                config
-            };
-            let (ra, rb) = tokio::join!(
-                Runtime::start(config(&alice), n.mailbox.clone(), Clock::System, a),
-                Runtime::start(config(&bob), n.mailbox.clone(), Clock::System, b),
-            );
-            let (ra, rb) = (ra.unwrap(), rb.unwrap());
-            cmd(&alice, approve(&bob, "bob")).await;
-            cmd(&bob, approve(&alice, "alice")).await;
+    /// A public key line as an install records a host key: its type and key alone.
+    fn canonical_key(line: &str) -> String {
+        let fields: Vec<_> = line.split_ascii_whitespace().take(2).collect();
+        fields.join(" ")
+    }
 
-            let ssh = || {
-                let mut child = Command::new(&binary);
-                child
-                    .arg("--state-dir")
-                    .arg(alice.path.parent().unwrap())
-                    .args(["ssh", &key(&bob)])
-                    .kill_on_drop(true);
-                child
-            };
-            let denied = ssh().arg("echo no-grant").output().await.unwrap();
-            assert!(!denied.status.success(), "{denied:?}");
-            assert!(!bob.path.join("ssh-host-ed25519-win32").exists());
+    /// Describe a system SSH server to `m`'s profile.
+    fn describe_ssh(m: &Member, user: &str, port: u16, host_key: &str, keys: &std::path::Path) {
+        let host_key = canonical_key(host_key);
+        let server = serde_json::json!({
+            "user": user,
+            "port": port,
+            "host_key": host_key,
+            "authorized_keys": keys,
+        });
+        write_private(
+            &m.path,
+            "ssh-server.json",
+            &serde_json::to_vec(&server).unwrap(),
+        );
+    }
 
-            let enable = ControlRequest::Enable {
-                peer: "alice".into(),
-                service: Service::Shell,
-            };
-            assert_eq!(cmd(&bob, enable).await, ControlReply::Changed(true));
-            let result = ssh().arg("echo ready & exit /b 7").output().await.unwrap();
-            assert_eq!(result.status.code(), Some(7), "{result:?}");
-            assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "ready");
-            let managed_config = alice.path.join(crate::ssh_install::CLIENT_CONFIG);
-            let mut saved = crate::windows_service::private_marker(&alice.path).unwrap();
-            saved
-                .write_all(br#"{"namespace":1,"names":{},"hosts":{}}"#)
-                .unwrap();
-            saved
-                .persist(alice.path.join(crate::ssh_install::CLIENT_STATE))
-                .unwrap();
-            crate::windows_service::private_marker(&alice.path)
-                .unwrap()
-                .persist(&managed_config)
-                .unwrap();
-            tokio::time::timeout(T, async {
-                while !std::fs::read_to_string(&managed_config)
-                    .is_ok_and(|contents| contents.contains("Host massrelay-bob mr-bob\n"))
-                {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+    fn ssh_line(key: &[u8; 32]) -> String {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let blob = [&b"\0\0\0\x0bssh-ed25519\0\0\0\x20"[..], key].concat();
+        format!("ssh-ed25519 {}", STANDARD.encode(blob))
+    }
+
+    /// The authorizations in a key file, without its comments.
+    fn authorized(file: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(file)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Wait until `ready` yields a value.
+    async fn eventually<T>(what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
+        let found = async {
+            loop {
+                if let Some(found) = ready() {
+                    return found;
                 }
-            })
-            .await
-            .expect("the managed Windows SSH aliases should appear after grant confirmation");
-            let stock = crate::private::ssh::openssh("ssh").unwrap();
-            for alias in ["massrelay-bob", "mr-bob"] {
-                let result = Command::new(&stock)
-                    .arg("-F")
-                    .arg(&managed_config)
-                    .args([alias, "echo managed&exit /b 7"])
-                    .kill_on_drop(true)
-                    .output()
-                    .await
-                    .unwrap();
-                assert_eq!(result.status.code(), Some(7), "{result:?}");
-                assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "managed");
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
+        };
+        tokio::time::timeout(T, found)
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting until {what}"))
+    }
 
-            let mut live = ssh()
-                .arg("echo opened&set /p massrelay_wait=")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap();
-            let mut output = BufReader::new(live.stdout.take().unwrap());
-            let mut line = String::new();
-            output.read_line(&mut line).await.unwrap();
-            assert_eq!(line.trim(), "opened");
-            assert!(live.try_wait().unwrap().is_none());
-            let disable = ControlRequest::Disable {
-                peer: "alice".into(),
-                service: Service::Shell,
-            };
-            assert_eq!(cmd(&bob, disable).await, ControlReply::Changed(true));
-            let status = tokio::time::timeout(Duration::from_secs(10), live.wait())
+    /// Stands in for the system SSH server: it greets and echoes, and reports the source of
+    /// each connection as it opens (`true`) and ends.
+    async fn fake_sshd() -> (
+        u16,
+        tokio::sync::mpsc::UnboundedReceiver<(std::net::SocketAddr, bool)>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (events, received) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut stream, from)) = listener.accept().await {
+                let events = events.clone();
+                let _ = events.send((from, true));
+                tokio::spawn(async move {
+                    let _ = stream.write_all(BANNER).await;
+                    let mut buf = [0; 256];
+                    while let Ok(n @ 1..) = stream.read(&mut buf).await {
+                        if stream.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = events.send((from, false));
+                });
+            }
+        });
+        (port, received)
+    }
+
+    /// One SSH request through control: a tunnel for `client_key`, or the host record.
+    async fn ssh_to(
+        m: &Member,
+        peer: &str,
+        client_key: Option<[u8; 32]>,
+    ) -> (
+        tokio::net::TcpStream,
+        ControlReply,
+        Option<tokio::net::TcpStream>,
+    ) {
+        let life = crate::local::Lifetime::bind().await.unwrap();
+        let req = ControlRequest::Ssh {
+            peer: peer.into(),
+            client_key: client_key.map(crate::mailbox::Bytes),
+            lifetime_port: life.port,
+            lifetime_key: life.key,
+        };
+        let (sock, reply) = tokio::time::timeout(T, rt::request(&m.path, req))
+            .await
+            .unwrap()
+            .unwrap();
+        let keep = tokio::time::timeout(Duration::from_secs(2), life.accept())
+            .await
+            .ok()
+            .and_then(Result::ok);
+        (sock, reply, keep)
+    }
+
+    /// Read `expected` from a tunnel's data frames.
+    async fn expect_data(sock: &mut tokio::net::TcpStream, expected: &[u8]) {
+        let mut got = vec![];
+        while got.len() < expected.len() {
+            let frame = tokio::time::timeout(T, wire::read_frame(sock))
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(status.code(), Some(255));
-            let denied = ssh().arg("echo after-cutoff").output().await.unwrap();
-            assert!(!denied.status.success(), "{denied:?}");
-            assert!(String::from_utf8_lossy(&denied.stderr).contains("not authorized"));
+            assert_eq!(frame[0], 1, "{frame:?}");
+            got.extend_from_slice(&frame[1..]);
+        }
+        assert_eq!(got, expected);
+    }
+
+    /// The process of `m`'s runtime, if it says the login from `from` to `port` is its own.
+    async fn carrier(m: &Member, from: std::net::SocketAddr, port: u16) -> Option<u32> {
+        let connection = format!("127.0.0.1 {} 127.0.0.1 {port}", from.port());
+        rt::ssh_tunnel(&m.path, &connection)
+            .await
+            .unwrap()
+            .map(|identity| identity.pid)
+    }
+
+    // One worker: anything that blocks it holds up every tunnel and command.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[ignore = "requires system ssh-keygen and loopback sockets"]
+    async fn private_ssh_tunnels_lease_the_client_key_only_while_authorized() {
+        check_ssh_tunnels().await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[ignore = "requires Windows OpenSSH's ssh-keygen and loopback sockets"]
+    async fn windows_ssh_uses_the_shell_grant_and_cuts_live_transports() {
+        check_ssh_tunnels().await;
+    }
+
+    /// The destination's side of a tunnel, and this device's entries, with a stand-in for the
+    /// system SSH server.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    async fn check_ssh_tunnels() {
+        use crate::private::{cli, ssh};
+
+        tokio::time::timeout(T * 6, async {
+            let n = net();
+            let book = Book::default();
+            let alice = create(&n, &format!("alice/{}", cli::DIR_NAME), Clock::System);
+            let bob = join(&n, &alice, &format!("bob/{}", cli::DIR_NAME), Clock::System);
+            let launch = async |member: &Member, lease: Duration| {
+                let e = endpoint(&member.secret).await;
+                book.lock().unwrap().insert(member.ep, addr(&e));
+                let addresses = book.clone();
+                let mut config = Config::new(&member.path);
+                config.sync_every = None;
+                config.addresses = Arc::new(move |k| addresses.lock().unwrap().get(k).cloned());
+                config.ssh.check_every = Duration::from_millis(100);
+                config.ssh.retry_after = Duration::from_millis(100);
+                config.ssh.refresh_every = Duration::from_millis(400);
+                config.ssh.probe_deadline = Duration::from_secs(2);
+                config.ssh.program = Some(std::env::current_exe().unwrap());
+                config.ssh.lease = lease;
+                Runtime::start(config, n.mailbox.clone(), Clock::System, e)
+                    .await
+                    .unwrap()
+            };
+            let long = Duration::from_secs(60);
+            let ra = launch(&alice, long).await;
+            let rb = launch(&bob, long).await;
+            cmd(&alice, approve(&bob, "bob")).await;
+            cmd(&bob, approve(&alice, "alice")).await;
+            let shell = |enable: bool| {
+                let peer = "alice".into();
+                let service = Service::Shell;
+                if enable {
+                    ControlRequest::Enable { peer, service }
+                } else {
+                    ControlRequest::Disable { peer, service }
+                }
+            };
+            let refused = async |client_key: Option<[u8; 32]>| match ssh_to(
+                &alice, "bob", client_key,
+            )
+            .await
+            .1
+            {
+                ControlReply::Error(error) => error,
+                other => panic!("{other:?}"),
+            };
+            let (one_key, two_key) = ([1; 32], [2; 32]);
+            let keys = bob.path.join(SSH_KEYS);
+            let header = "# installer\n";
+            let reset = || write_private(&bob.path, SSH_KEYS, header.as_bytes());
+            let text = || std::fs::read_to_string(&keys).unwrap();
+
+            // Without the shell grant, and then without an install, nothing is created.
+            for request in [None, Some(one_key)] {
+                assert!(refused(request).await.contains("not authorized"));
+            }
+            assert_eq!(cmd(&bob, shell(true)).await, ControlReply::Changed(true));
+            for request in [None, Some(one_key)] {
+                assert!(refused(request).await.contains("system SSH is not set up"));
+            }
+            assert!(!keys.exists() && !bob.path.join("ssh-authorized-keys.lock").exists());
+
+            let (port, mut connections) = fake_sshd().await;
+            let host_key = ed25519_dalek::SigningKey::from_bytes(&[3; 32])
+                .verifying_key()
+                .to_bytes();
+            let host_line = format!("{} root@fixture", ssh_line(&host_key));
+            let describe = |port| describe_ssh(&bob, "fixture", port, &host_line, &keys);
+            reset();
+            describe(port);
+            let (_, reply, _life) = ssh_to(&alice, "bob", None).await;
+            let record = ssh::Host {
+                user: "fixture".into(),
+                key: crate::mailbox::Bytes(host_key),
+                system: true,
+            };
+            assert_eq!(reply, ControlReply::SshHost(record));
+            assert_eq!(text(), header);
+
+            // A live tunnel holds one key line, for loopback and a bounded time.
+            let (mut one, reply, one_life) = ssh_to(&alice, "bob", Some(one_key)).await;
+            assert_eq!(reply, ControlReply::Connected);
+            expect_data(&mut one, BANNER).await;
+            let (first, true) = connections.recv().await.unwrap() else {
+                panic!("expected a connection")
+            };
+            wire::frame(&mut one, b"\x01ping").await.unwrap();
+            expect_data(&mut one, b"ping").await;
+            let lines = authorized(&keys);
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            let expiry = lines[0]
+                .strip_prefix("from=\"127.0.0.1\",expiry-time=\"")
+                .unwrap();
+            let (expiry, rest) = expiry.split_at(14);
+            assert!(rest.starts_with(&format!("\" {} massrelay-lease:", ssh_line(&one_key))));
+            let expiry = chrono::NaiveDateTime::parse_from_str(expiry, "%Y%m%d%H%M%S").unwrap();
+            let left = expiry - chrono::Local::now().naive_local();
+            // A repeated local hour adds one.
+            assert!(
+                left.num_seconds() > 30 && left.num_seconds() <= 3662,
+                "{left}"
+            );
+            // The runtime recognizes exactly this connection as its own, and no other.
+            assert_eq!(carrier(&bob, first, port).await, Some(std::process::id()));
+            assert_eq!(carrier(&bob, first, port ^ 1).await, None);
+            assert_eq!(carrier(&alice, first, port).await, None);
+
+            // Concurrent tunnels, one with the same key, each keep their own line.
+            let ((mut two, reply_two, _two_life), (mut three, reply_three, _three_life)) = tokio::join!(
+                ssh_to(&alice, "bob", Some(two_key)),
+                ssh_to(&alice, "bob", Some(one_key)),
+            );
+            for (socket, reply) in [(&mut two, reply_two), (&mut three, reply_three)] {
+                assert_eq!(reply, ControlReply::Connected);
+                expect_data(socket, BANNER).await;
+            }
+            assert_eq!(authorized(&keys).len(), 3);
+            drop((one, one_life));
+            let rest = eventually("the ended tunnel's key is withdrawn", || {
+                Some(authorized(&keys)).filter(|lines| lines.len() == 2)
+            })
+            .await;
+            assert!(!rest.contains(&lines[0]), "{rest:?}");
+            for key in [one_key, two_key] {
+                assert!(rest.iter().any(|line| line.contains(&ssh_line(&key))));
+            }
+            tokio::time::timeout(T, async {
+                while connections.recv().await.unwrap() != (first, false) {}
+            })
+            .await
+            .unwrap();
+            assert_eq!(carrier(&bob, first, port).await, None);
+
+            // A cutoff ends the rest. Their keys are gone before the dialer sees that.
+            assert_eq!(cmd(&bob, shell(false)).await, ControlReply::Changed(true));
+            for socket in [&mut two, &mut three] {
+                drain(socket).await;
+            }
+            assert_eq!(text(), header);
+            assert!(refused(Some(one_key)).await.contains("not authorized"));
+            assert_eq!(cmd(&bob, shell(true)).await, ControlReply::Changed(true));
+
+            // While another writer holds the setup lock, a cutoff still ends the tunnel at
+            // once and nothing else stalls. The key is withdrawn once the lock is free.
+            let hold = || {
+                let lock = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(bob.path.join("ssh-authorized-keys.lock"))
+                    .unwrap();
+                fs2::FileExt::lock_exclusive(&lock).unwrap();
+                lock
+            };
+            let (mut held, reply, _held_life) = ssh_to(&alice, "bob", Some(one_key)).await;
+            assert_eq!(reply, ControlReply::Connected);
+            expect_data(&mut held, BANNER).await;
+            let setup = hold();
+            let asked = tokio::time::Instant::now();
+            assert_eq!(cmd(&bob, shell(false)).await, ControlReply::Changed(true));
+            drain(&mut held).await;
+            let status = cmd(&bob, ControlRequest::Status).await;
+            assert!(matches!(status, ControlReply::Status(_)), "{status:?}");
+            let took = asked.elapsed();
+            assert!(took < Duration::from_millis(1500), "{took:?}");
+            // Longer than any single attempt waits for the lock.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            assert_eq!(authorized(&keys).len(), 1);
+            drop(setup);
+            eventually("the key is withdrawn once the lock is free", || {
+                (text() == header).then_some(())
+            })
+            .await;
+            assert_eq!(cmd(&bob, shell(true)).await, ControlReply::Changed(true));
+
+            // A key file someone else's key is in is left alone.
+            let foreign = format!("{header}{} me@laptop\n", ssh_line(&[9; 32]));
+            write_private(&bob.path, SSH_KEYS, foreign.as_bytes());
+            assert!(refused(Some(one_key)).await.contains("could not authorize"));
+            assert_eq!(text(), foreign);
+            reset();
+            // So is one that others can read.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o640)).unwrap();
+                assert!(refused(Some(one_key)).await.contains("could not authorize"));
+                assert_eq!(text(), header);
+                reset();
+            }
+            // A description cannot point the authorization at another file.
+            let other = bob.path.join("elsewhere");
+            describe_ssh(&bob, "fixture", port, &host_line, &other);
+            assert!(refused(Some(one_key)).await.contains("not set up"));
+            assert!(!other.exists());
+            // No key is authorized for a server that does not answer.
+            let closed = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            describe(closed);
+            assert!(
+                refused(Some(one_key))
+                    .await
+                    .contains("no SSH server answers")
+            );
+            assert_eq!(text(), header);
+            describe(port);
+            // Removing the file opts out, and it is not made again.
+            std::fs::remove_file(&keys).unwrap();
+            assert!(refused(Some(one_key)).await.contains("not set up"));
+            assert!(!keys.exists());
+            std::fs::remove_file(bob.path.join("ssh-server.json")).unwrap();
+            assert!(refused(None).await.contains("not set up"));
+            reset();
+            describe(port);
+
+            // This device's entries follow the system record, which replaces the pin of the
+            // peer's former SSH server.
+            let former = alice.path.join(format!("ssh-pin-{}", key(&bob)));
+            write_private(&alice.path, &format!("ssh-pin-{}", key(&bob)), &[9; 32]);
+            write_private(
+                &alice.path,
+                "ssh-client.json",
+                br#"{"namespace":1,"names":{},"hosts":{}}"#,
+            );
+            write_private(&alice.path, "ssh-client.conf", b"");
+            let config = alice.path.join("ssh-client.conf");
+            let record = alice.path.join("ssh-client-published.sha256");
+            eventually("the peer is confirmed", || {
+                std::fs::read_to_string(&config).ok().filter(|text| {
+                    text.contains("Host massrelay-bob mr-bob\n")
+                        && text.contains("User fixture\n")
+                })
+            })
+            .await;
+            let hosts = alice.path.join(format!("ssh-client-hosts-{}", key(&bob)));
+            assert!(
+                std::fs::read_to_string(hosts)
+                    .unwrap()
+                    .contains(&ssh_line(&host_key))
+            );
+            assert!(!former.exists());
+            // The running service records what it published.
+            eventually("the publication is recorded", || {
+                use sha2::{Digest, Sha256};
+                let digest = format!("{:x}\n", Sha256::digest(std::fs::read(&config).ok()?));
+                (std::fs::read_to_string(&record).ok()? == digest).then_some(())
+            })
+            .await;
+            assert_eq!(text(), header);
+            std::fs::remove_file(&config).unwrap();
+
+            // Stopping withdraws a live tunnel's key.
+            let (mut live, reply, _live_life) = ssh_to(&alice, "bob", Some(one_key)).await;
+            assert_eq!(reply, ControlReply::Connected);
+            expect_data(&mut live, BANNER).await;
+            assert_eq!(authorized(&keys).len(), 1);
+            assert!(rb.stop().await.owner_released);
+            assert_eq!(text(), header);
+
+            // A stop under a held lock still ends, leaving the line. The next start does not
+            // give up on it either.
+            let rb = launch(&bob, long).await;
+            let (mut live, reply, _live_life) = ssh_to(&alice, "bob", Some(one_key)).await;
+            assert_eq!(reply, ControlReply::Connected);
+            expect_data(&mut live, BANNER).await;
+            let setup = hold();
+            let stopped = tokio::time::timeout(Duration::from_secs(8), rb.stop())
+                .await
+                .unwrap();
+            assert!(stopped.owner_released, "{stopped:?}");
+            assert_eq!(authorized(&keys).len(), 1);
+            let rb = launch(&bob, long).await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            assert_eq!(authorized(&keys).len(), 1);
+            drop(setup);
+            eventually("the earlier run's key is withdrawn", || {
+                (text() == header).then_some(())
+            })
+            .await;
+            assert!(rb.stop().await.owner_released);
+
+            // A start withdraws what this profile left behind, and nothing else. A key is
+            // withdrawn when its time passes, while the tunnel goes on.
+            let owner = hex(&bob.ep[..16]);
+            let left = format!(
+                "from=\"127.0.0.1\",expiry-time=\"20300101000000\" {} massrelay-lease:{owner}:00\n",
+                ssh_line(&two_key)
+            );
+            let others = left.replace(&owner, &"f".repeat(32));
+            write_private(
+                &bob.path,
+                SSH_KEYS,
+                format!("{header}{left}{others}").as_bytes(),
+            );
+            let rb = launch(&bob, Duration::from_secs(2)).await;
+            assert_eq!(text(), format!("{header}{others}"));
+            while connections.try_recv().is_ok() {}
+            let (mut short, reply, _short_life) = ssh_to(&alice, "bob", Some(one_key)).await;
+            assert_eq!(reply, ControlReply::Connected);
+            expect_data(&mut short, BANNER).await;
+            let (from, true) = connections.recv().await.unwrap() else {
+                panic!("expected a connection")
+            };
+            assert_eq!(authorized(&keys).len(), 2);
+            eventually("the lapsed key is withdrawn", || {
+                (text() == format!("{header}{others}")).then_some(())
+            })
+            .await;
+            wire::frame(&mut short, b"\x01still").await.unwrap();
+            expect_data(&mut short, b"still").await;
+            assert_eq!(carrier(&bob, from, port).await, Some(std::process::id()));
+            // Those questions left no trace in the event log.
+            let log = std::fs::read_to_string(bob.path.join(crate::private::audit::EVENT_FILE));
+            let log = log.unwrap();
+            assert!(log.contains("\"enable\""), "{log}");
+            assert!(!log.contains("ssh_tunnel"), "{log}");
+
             let (sa, sb) = tokio::join!(ra.stop(), rb.stop());
             assert!(sa.owner_released && sb.owner_released, "{sa:?} {sb:?}");
         })
@@ -5323,6 +5699,106 @@ mod runtime {
         relay.shutdown().await.unwrap();
     }
 
+    /// A throwaway system SSH server, run by this account on loopback, standing in for the
+    /// installed one. It reads `keys` as its only key file.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct Sshd {
+        _server: tokio::process::Child,
+        port: u16,
+        host_key: String,
+        fingerprint: String,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn start_sshd(dir: &std::path::Path, user: &str, keys: &std::path::Path) -> Sshd {
+        use tokio::process::Command;
+
+        std::fs::create_dir(dir).unwrap();
+        let host = dir.join("host");
+        let made = Command::new("/usr/bin/ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "fixture", "-f"])
+            .arg(&host)
+            .status()
+            .await
+            .unwrap();
+        assert!(made.success());
+        let public = dir.join("host.pub");
+        let listed = Command::new("/usr/bin/ssh-keygen")
+            .arg("-lf")
+            .arg(&public)
+            .output()
+            .await
+            .unwrap();
+        let listed = String::from_utf8(listed.stdout).unwrap();
+        let fingerprint = listed.split_ascii_whitespace().nth(1).unwrap().to_owned();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let config = dir.join("config");
+        std::fs::write(
+            &config,
+            format!(
+                "ListenAddress 127.0.0.1:{port}\n\
+                 HostKey \"{}\"\n\
+                 AuthorizedKeysFile \"{}\"\n\
+                 PidFile none\n\
+                 UsePAM no\n\
+                 AuthenticationMethods publickey\n\
+                 PasswordAuthentication no\n\
+                 KbdInteractiveAuthentication no\n\
+                 AllowUsers {user}\n\
+                 Subsystem sftp internal-sftp\n\
+                 # The fixture's files are below the shared temporary directory.\n\
+                 StrictModes no\n",
+                host.display(),
+                keys.display(),
+            ),
+        )
+        .unwrap();
+        let log = std::fs::File::create(dir.join("log")).unwrap();
+        let mut server = Command::new("/usr/sbin/sshd")
+            .args(["-D", "-e", "-f"])
+            .arg(&config)
+            .stderr(log)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        tokio::time::timeout(T, async {
+            while tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err()
+            {
+                if server.try_wait().unwrap().is_some() {
+                    panic!(
+                        "sshd did not start: {}",
+                        std::fs::read_to_string(dir.join("log")).unwrap()
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        Sshd {
+            _server: server,
+            port,
+            host_key: canonical_key(&std::fs::read_to_string(public).unwrap()),
+            fingerprint,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn account_name() -> String {
+        let name = tokio::process::Command::new("/usr/bin/id")
+            .arg("-un")
+            .output()
+            .await
+            .unwrap();
+        String::from_utf8(name.stdout).unwrap().trim().to_owned()
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     async fn check_private_ssh(relay: Option<iroh::RelayUrl>) {
         use crate::private::{cli, ssh};
@@ -5333,7 +5809,12 @@ mod runtime {
 
         tokio::time::timeout(T * 3, async {
             let n = net();
-            for executable in ["/usr/bin/ssh", "/usr/bin/ssh-keygen", "/usr/bin/sftp"] {
+            for executable in [
+                "/usr/bin/ssh",
+                "/usr/bin/ssh-keygen",
+                "/usr/bin/sftp",
+                "/usr/sbin/sshd",
+            ] {
                 assert!(
                     std::fs::metadata(executable).is_ok_and(|meta| {
                         meta.is_file() && meta.permissions().mode() & 0o111 != 0
@@ -5341,13 +5822,6 @@ mod runtime {
                     "native SSH fixture requires {executable}"
                 );
             }
-            let capability = tempfile::tempdir_in(&n.root).unwrap();
-            let prepared = ssh::Prepared::new(capability.path(), &[7; 32])
-                .await
-                .expect("native SSH fixture requires a regular account and system OpenSSH server");
-            prepared.check_config(capability.path()).await.unwrap();
-            drop(prepared);
-
             let book = Book::default();
             let alice = create(&n, &format!("alice/{}", cli::DIR_NAME), Clock::System);
             let bob = join(&n, &alice, &format!("bob/{}", cli::DIR_NAME), Clock::System);
@@ -5409,6 +5883,18 @@ mod runtime {
                 child
             };
 
+            let keys = bob.path.join(SSH_KEYS);
+            write_private(&bob.path, SSH_KEYS, b"");
+            let user = account_name().await;
+            let server = start_sshd(&n.root.join("sshd"), &user, &keys).await;
+            describe_ssh(&bob, &user, server.port, &server.host_key, &keys);
+            let withdrawn = async || {
+                eventually("the tunnel keys are withdrawn", || {
+                    authorized(&keys).is_empty().then_some(())
+                })
+                .await
+            };
+
             // A TCP grant alone opens neither the host-info nor SSH tunnel request.
             let enable = |service| ControlRequest::Enable {
                 peer: "alice".into(),
@@ -5428,9 +5914,12 @@ mod runtime {
                     "{result:?}"
                 );
             }
-            assert!(!bob.path.join("ssh-host-ed25519").exists());
+            assert!(authorized(&keys).is_empty());
 
-            // An effective default shell grant admits the stock OpenSSH client.
+            // An effective default shell grant admits the stock OpenSSH client, which the
+            // system server accepts by the line written for this tunnel. Its record
+            // replaces the pin of the peer's former SSH server.
+            write_private(&alice.path, &format!("ssh-pin-{}", key(&bob)), &[9; 32]);
             let default = ControlRequest::SetDefault {
                 service: Service::Shell,
                 enabled: true,
@@ -5444,6 +5933,11 @@ mod runtime {
                 .await
                 .unwrap();
             assert_eq!(result.stdout, local_uid.stdout);
+            assert!(
+                String::from_utf8_lossy(&result.stderr).contains("system SSH server"),
+                "{result:?}"
+            );
+            withdrawn().await;
 
             // Use an SSH Include as a stock caller can. Both launches have
             // independent client keys and the same authenticated host pin.
@@ -5457,7 +5951,10 @@ mod runtime {
             let mut live = Command::new("/usr/bin/ssh")
                 .arg("-F")
                 .arg(&config)
-                .args([&launch.alias, "echo opened; exec /bin/cat"])
+                .args([
+                    &launch.alias,
+                    "echo opened; echo \"$SSH_CONNECTION\"; exec /bin/cat",
+                ])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .kill_on_drop(true)
@@ -5467,6 +5964,18 @@ mod runtime {
             let mut line = String::new();
             output.read_line(&mut line).await.unwrap();
             assert_eq!(line, "opened\n");
+            // What the login names as its connection is one of the runtime's tunnels.
+            line.clear();
+            output.read_line(&mut line).await.unwrap();
+            let carried = rt::ssh_tunnel(&bob.path, line.trim_end_matches('\n'))
+                .await
+                .unwrap();
+            assert_eq!(
+                carried.map(|identity| identity.pid),
+                Some(std::process::id()),
+                "{line}"
+            );
+            assert_eq!(authorized(&keys).len(), 1);
 
             let transfer = ssh::Launch::prepare(&alice.path, key(&bob), None, &binary)
                 .await
@@ -5526,9 +6035,61 @@ mod runtime {
                 String::from_utf8_lossy(&denied.stderr).contains("Permission denied (publickey)")
             );
 
+            // The server holds the lines this runtime writes to their source and time.
+            let spare = n.root.join("spare");
+            let made = Command::new("/usr/bin/ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", "", "-C", "", "-f"])
+                .arg(&spare)
+                .status()
+                .await
+                .unwrap();
+            assert!(made.success());
+            let public = std::fs::read_to_string(n.root.join("spare.pub")).unwrap();
+            // Rewrite the file only once the tunnels that ended have left it.
+            let held = eventually("only the live tunnel's key remains", || {
+                (authorized(&keys).len() == 1).then(|| std::fs::read_to_string(&keys).unwrap())
+            })
+            .await;
+            for (source, expiry, admitted) in [
+                ("127.0.0.1", "29990101000000", true),
+                ("127.0.0.1", "20000101000000", false),
+                ("192.0.2.1", "29990101000000", false),
+            ] {
+                let line = format!(
+                    "{held}from=\"{source}\",expiry-time=\"{expiry}\" {} massrelay-lease:00:00\n",
+                    public.trim()
+                );
+                write_private(&bob.path, SSH_KEYS, line.as_bytes());
+                let direct = Command::new("/usr/bin/ssh")
+                    .args(["-F", "/dev/null", "-i"])
+                    .arg(&spare)
+                    .args([
+                        "-oIdentitiesOnly=yes",
+                        "-oIdentityAgent=none",
+                        "-oBatchMode=yes",
+                        "-oStrictHostKeyChecking=no",
+                        "-oUserKnownHostsFile=/dev/null",
+                        "-p",
+                    ])
+                    .arg(server.port.to_string())
+                    .arg(format!("{user}@127.0.0.1"))
+                    .arg("true")
+                    .kill_on_drop(true)
+                    .output()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    direct.status.success(),
+                    admitted,
+                    "{source} {expiry} {direct:?}"
+                );
+            }
+            write_private(&bob.path, SSH_KEYS, held.as_bytes());
+
             // Changing the destination key also fails at the OpenSSH layer
             // when a previously prepared config has the old host key.
-            let fingerprint = ssh::rotate_host_key(&bob.path).await.unwrap();
+            let rotated = start_sshd(&n.root.join("sshd-rotated"), &user, &keys).await;
+            describe_ssh(&bob, &user, rotated.port, &rotated.host_key, &keys);
             let wrong_host = Command::new("/usr/bin/ssh")
                 .arg("-F")
                 .arg(&config)
@@ -5549,7 +6110,7 @@ mod runtime {
                 .args([
                     "ssh",
                     "--replace-host-key",
-                    &fingerprint,
+                    &rotated.fingerprint,
                     &key(&bob),
                     "true",
                 ])
@@ -5580,6 +6141,7 @@ mod runtime {
             })
             .await
             .unwrap();
+            withdrawn().await;
             let blocked = proxy().output().await.unwrap();
             assert!(!blocked.status.success());
             assert!(String::from_utf8_lossy(&blocked.stderr).contains("not authorized"));
@@ -5605,22 +6167,6 @@ mod runtime {
             .map(|dir| dir.join("massrelay"))
             .find(|path| path.is_file())
             .expect("build massrelay before running the SSH fixture")
-    }
-
-    /// Wait until `ready` yields a value.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    async fn eventually<T>(what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
-        let found = async {
-            loop {
-                if let Some(found) = ready() {
-                    return found;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        };
-        tokio::time::timeout(T, found)
-            .await
-            .unwrap_or_else(|_| panic!("timed out waiting until {what}"))
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -5652,6 +6198,11 @@ mod runtime {
                 .await
                 .unwrap()
         };
+        let keys = bob.path.join(SSH_KEYS);
+        write_private(&bob.path, SSH_KEYS, b"");
+        let user = account_name().await;
+        let server = start_sshd(&n.root.join("sshd"), &user, &keys).await;
+        describe_ssh(&bob, &user, server.port, &server.host_key, &keys);
         let ra = launch(&alice).await;
         let rb = launch(&bob).await;
         let shell = |enable: bool| {
@@ -5673,7 +6224,7 @@ mod runtime {
         let saved = alice.path.join("ssh-client.json");
         let identity = alice.path.join(format!("ssh-client-key-{}", key(&bob)));
         assert!(!config.exists() && !saved.exists() && !identity.exists());
-        assert!(!bob.path.join("ssh-host-ed25519").exists());
+        assert!(authorized(&keys).is_empty());
 
         // The file appearing under a running runtime opts the profile in.
         let opt_in = || {
@@ -5735,22 +6286,11 @@ mod runtime {
         // A changed host key stays untrusted until `massrelay ssh` replaces the pin.
         let hosts = alice.path.join(format!("ssh-client-hosts-{}", key(&bob)));
         let pinned = std::fs::read_to_string(&hosts).unwrap();
-        let fingerprint = crate::private::ssh::rotate_host_key(&bob.path)
-            .await
-            .unwrap();
-        let alternate = Command::new("/usr/bin/ssh-keygen")
-            .args(["-y", "-f"])
-            .arg(bob.path.join("ssh-host-ed25519"))
-            .output()
-            .await
-            .unwrap();
-        assert!(alternate.status.success(), "{alternate:?}");
+        let rotated = start_sshd(&n.root.join("sshd-rotated"), &user, &keys).await;
+        describe_ssh(&bob, &user, rotated.port, &rotated.host_key, &keys);
         std::fs::write(
             &fallback_hosts,
-            format!(
-                "massrelay-lab {}",
-                String::from_utf8(alternate.stdout).unwrap()
-            ),
+            format!("massrelay-lab {}\n", rotated.host_key),
         )
         .unwrap();
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -5760,9 +6300,14 @@ mod runtime {
             String::from_utf8_lossy(&rejected.stderr).contains("Host key verification failed"),
             "{rejected:?}"
         );
-        crate::private::ssh::Launch::prepare(&alice.path, key(&bob), Some(&fingerprint), &binary)
-            .await
-            .unwrap();
+        crate::private::ssh::Launch::prepare(
+            &alice.path,
+            key(&bob),
+            Some(&rotated.fingerprint),
+            &binary,
+        )
+        .await
+        .unwrap();
         eventually("the replaced pin is used", || {
             (std::fs::read_to_string(&hosts).unwrap() != pinned).then_some(())
         })

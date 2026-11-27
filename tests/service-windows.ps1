@@ -103,7 +103,7 @@ $root = Join-Path $env:USERPROFILE "massrelay-service-test-$id"
 $state = Join-Path $root 'state with spaces'
 $exe = Join-Path $root 'bin\massrelay.exe'
 $marker = Join-Path $state 'private-experimental-0\private-runtime.json'
-$install = @('--state-dir', $state, 'install', '--password-stdin')
+$install = @('--state-dir', $state, 'install', '--password-stdin', '--yes')
 
 # Every service this run registered has the throwaway directory in its command line.
 function Get-TestService {

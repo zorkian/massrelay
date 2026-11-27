@@ -240,7 +240,7 @@ pub enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
-    /// Replace this device's SSH host key and print its new fingerprint.
+    /// Explain how to replace the SSH host key, which the system server owns.
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     SshRotateHostKey,
     #[cfg(any(unix, windows))]
@@ -412,10 +412,13 @@ pub async fn execute(state_dir: &Path, command: Command) -> Result<i32> {
             .await;
         }
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-        Command::SshRotateHostKey => {
-            ensure!(profile_exists(state_dir), "no private MassRelay profile");
-            println!("{}", super::ssh::rotate_host_key(&dir).await?);
-        }
+        Command::SshRotateHostKey => bail!(
+            "MassRelay uses this device's system OpenSSH server and never changes its host \
+             keys, which every SSH client of this device shares. Have its administrator \
+             replace them with the system's OpenSSH tools, run 'massrelay install' again \
+             here, then verify the new fingerprint on each peer and use 'massrelay ssh \
+             --replace-host-key'"
+        ),
         #[cfg(any(unix, windows))]
         Command::SshProxy { peer, client_key } => {
             super::ssh::proxy(&dir, peer, &client_key).await?;

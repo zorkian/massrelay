@@ -787,6 +787,7 @@ pub fn operation(r: &ControlRequest) -> (&'static str, Option<&str>, Option<Serv
         ControlRequest::Update(UpdateRequest::Identify) => ("update_identify", None, None),
         ControlRequest::Update(UpdateRequest::Hold) => ("update_hold", None, None),
         ControlRequest::Update(UpdateRequest::Commit) => ("update_retire", None, None),
+        ControlRequest::SshTunnel { .. } => ("ssh_tunnel_query", None, None),
     }
 }
 

@@ -6,6 +6,10 @@ mod background_service;
 mod background_service;
 mod connection_log;
 mod grants;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+mod host_ssh;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+mod installer;
 // Linux has no launchd; this builds the macOS service code there and tests its portable part.
 #[cfg(all(test, target_os = "linux"))]
 #[allow(dead_code)]
@@ -154,12 +158,20 @@ enum Command {
     #[cfg(unix)]
     #[command(subcommand)]
     RelayStore(RelayStore),
-    /// Set up and start this device's background service.
+    /// Set up and start this device's background service and its SSH access.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    Install,
-    /// Set up and start this device's background service, which Windows starts before sign-in.
+    Install(installer::Confirmation),
+    /// Set up this device's SSH access and its background service, which starts before sign-in.
     #[cfg(windows)]
-    Install(windows_service::InstallOptions),
+    Install {
+        #[command(flatten)]
+        service: windows_service::InstallOptions,
+        #[command(flatten)]
+        confirmation: installer::Confirmation,
+    },
+    /// Remove this device's background service and SSH setup, keeping its enrollment.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    Uninstall(installer::Confirmation),
     /// Start this device's installed background service.
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     Start,
@@ -210,17 +222,6 @@ enum Command {
 }
 
 fn main() {
-    #[cfg(windows)]
-    {
-        let mut arguments = std::env::args_os().skip(1);
-        if arguments
-            .next()
-            .is_some_and(|argument| argument == private::ssh::WORKER_ARG)
-            && arguments.next().is_none()
-        {
-            std::process::exit(i32::from(private::ssh::run_worker().is_err()));
-        }
-    }
     let cli =
         Cli::from_arg_matches(&grouped_cli().get_matches()).unwrap_or_else(|error| error.exit());
     #[cfg(windows)]
@@ -279,7 +280,16 @@ fn grouped_cli() -> clap::Command {
         (
             "Manage this device",
             &[
-                "status", "rename", "logs", "install", "start", "restart", "stop", "update", "run",
+                "status",
+                "rename",
+                "logs",
+                "install",
+                "start",
+                "restart",
+                "stop",
+                "update",
+                "uninstall",
+                "run",
             ],
         ),
         (
@@ -344,13 +354,16 @@ async fn execute(cli: Cli) -> Result<i32> {
         return Ok(0);
     };
     match command {
-        // Only an install changes the account's SSH configuration, once its service runs.
+        // Only these two change SSH configuration, and each asks first.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        Command::Install => ssh_install::register(&background_service::install(&dir)?)?,
+        Command::Install(confirmation) => installer::install(&dir, confirmation).await?,
         #[cfg(windows)]
-        Command::Install(options) => {
-            ssh_install::register(&background_service::install(&dir, options)?)?
-        }
+        Command::Install {
+            service,
+            confirmation,
+        } => installer::install(&dir, confirmation, service).await?,
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        Command::Uninstall(confirmation) => installer::uninstall(&dir, confirmation).await?,
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         Command::Start => background_service::control(&dir, ServiceAction::Start)?,
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]

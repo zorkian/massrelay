@@ -110,7 +110,34 @@ pub(super) async fn public_key(path: &Path) -> Result<[u8; 32]> {
     ensure!(result.status.success(), "could not read OpenSSH public key");
     let mut fields = std::str::from_utf8(&result.stdout)?.split_ascii_whitespace();
     ensure!(fields.next() == Some("ssh-ed25519"), "expected Ed25519 key");
-    let blob = STANDARD.decode(fields.next().context("missing public key blob")?)?;
+    parse_blob(fields.next().context("missing public key blob")?)
+}
+
+/// The key in an OpenSSH Ed25519 public key line without options:
+/// `ssh-ed25519 BASE64 [comment]`.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+pub(super) fn parse_public_line(line: &str) -> Result<[u8; 32]> {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    ensure!(
+        !line.chars().any(char::is_control),
+        "the SSH public key is not a single line"
+    );
+    let mut fields = line.split_ascii_whitespace();
+    ensure!(
+        fields.next() == Some("ssh-ed25519"),
+        "expected an Ed25519 SSH public key"
+    );
+    let key = parse_blob(fields.next().context("missing SSH public key")?)?;
+    ed25519_dalek::VerifyingKey::from_bytes(&key).context("invalid Ed25519 public key")?;
+    Ok(key)
+}
+
+/// The key in the base64 field of an OpenSSH Ed25519 public key.
+pub(super) fn parse_blob(encoded: &str) -> Result<[u8; 32]> {
+    let blob = STANDARD
+        .decode(encoded)
+        .context("invalid SSH public key encoding")?;
     Ok(blob
         .strip_prefix(ED25519_BLOB)
         .context("invalid Ed25519 key blob")?

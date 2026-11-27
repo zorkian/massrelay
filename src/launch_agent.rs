@@ -1,8 +1,10 @@
 use std::{
-    env, fs,
+    env, fmt, fs,
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Command, Output},
+    thread,
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -16,42 +18,154 @@ use crate::{ServiceAction, default_state_dir, private::cli};
 mod update_job;
 
 const LABEL: &str = "com.massrelay.client";
+/// How long launchd is given to end a job it was told to unload, which includes the runtime's
+/// own ordered stop.
+const STOP_LIMIT: Duration = Duration::from_secs(90);
+const HOSTED: &str = "this command depends on the service it would remove: it runs under that \
+    service, such as in a MassRelay shell on this device, and would end partway. Nothing was \
+    changed. Run 'massrelay uninstall' from a local terminal on this device";
+const CHANGED: &str = "the background service is no longer as it was shown, so it was not \
+    touched. Run 'massrelay uninstall' again";
+const INSTALL_CHANGED: &str = "the background service, or what an install would write, is no \
+    longer as it was shown, so nothing was installed. Run 'massrelay install' again";
 
 /// The audit path used by installed LaunchAgents, including older installs.
 pub fn audit_path(dir: &Path) -> Result<PathBuf> {
     Ok(Job::for_profile(dir)?.events)
 }
 
-/// Returns the canonical state directory the service was installed for.
-pub fn install(dir: &Path) -> Result<PathBuf> {
-    cli::check_enrolled(dir)?;
+/// Everything `install` settles before it changes anything, and so all that a confirmation of
+/// it approves.
+#[derive(Debug, PartialEq, Eq)]
+struct Prepared {
+    dir: PathBuf,
+    job: Job,
+    domain: String,
+    service: String,
+    /// Set when launchd has the job loaded, with what identifies it where that can be read.
+    loaded: Option<Option<Loaded>>,
+    previous: Option<Plist>,
+    binary: PathBuf,
+    contents: String,
+}
+
+impl Prepared {
+    /// Look, changing nothing, at what an install of `binary` for the profile in the
+    /// canonical `dir` would replace.
+    fn read(dir: PathBuf, job: Job, binary: PathBuf, run: Tool) -> Result<Self> {
+        let domain = user_domain(run)?;
+        check_session(&domain, run)?;
+        let service = format!("{domain}/{}", job.label);
+        let printed = run("/bin/launchctl", &["print", &service])
+            .with_context(|| format!("look for {service}"))?;
+        let loaded = printed.success.then(|| Loaded::read(&printed.stdout));
+        let previous = plist_file(&job.plist)?;
+        ensure!(
+            loaded.is_none() || previous.is_some(),
+            "the loaded LaunchAgent has no plist at {}",
+            job.plist.display()
+        );
+        let contents = job.render(&binary, &dir)?;
+        Ok(Self {
+            dir,
+            job,
+            domain,
+            service,
+            loaded,
+            previous,
+            binary,
+            contents,
+        })
+    }
+}
+
+fn prepare(dir: &Path) -> Result<Prepared> {
     let dir = dir
         .canonicalize()
         .context("resolve the device state directory")?;
     let job = Job::for_profile(&dir)?;
-    let domain = login_domain()?;
-    let service = format!("{domain}/{}", job.label);
-    let loaded = launchctl("print", &service).output()?.status.success();
+    let binary = env::current_exe().context("find the running MassRelay binary")?;
+    Prepared::read(dir, job, binary, &tool)
+}
 
+/// An install as shown for confirmation, which displays as the changes it would make.
+pub struct InstallPlan(Prepared);
+
+impl fmt::Display for InstallPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        let Prepared {
+            dir,
+            job,
+            domain,
+            loaded,
+            previous,
+            binary,
+            ..
+        } = &self.0;
+        let write = if previous.is_some() {
+            "Replace"
+        } else {
+            "Write"
+        };
+        let load = if loaded.is_some() {
+            "Unload the running job, then load"
+        } else {
+            "Load"
+        };
+        write!(
+            formatter,
+            "{write} the LaunchAgent property list {}\n\
+             {load} {} into {domain}, which starts it\n\
+             It runs {} for the profile in {} and records events in {}",
+            job.plist.display(),
+            job.label,
+            binary.display(),
+            dir.display(),
+            job.events.display()
+        )
+    }
+}
+
+/// What `install` would write and load. Changes nothing, and so leaves to `apply` the lint of
+/// the property list and the checks that open the profile's files for writing.
+pub fn plan_install(dir: &Path) -> Result<InstallPlan> {
+    prepare(dir).map(InstallPlan)
+}
+
+impl InstallPlan {
+    /// Install and load the service, if what it would replace and write is still as it was
+    /// shown. Returns the canonical state directory the service was installed for.
+    pub fn apply(self) -> Result<PathBuf> {
+        cli::check_enrolled(&self.0.dir)?;
+        register(self.confirm(prepare(&self.0.dir)?)?)
+    }
+
+    /// Require what an install finds now to be what was shown.
+    fn confirm(&self, found: Prepared) -> Result<Prepared> {
+        ensure!(found == self.0, INSTALL_CHANGED);
+        Ok(found)
+    }
+}
+
+fn register(prepared: Prepared) -> Result<PathBuf> {
+    let Prepared {
+        dir,
+        job,
+        domain,
+        service,
+        loaded,
+        previous,
+        contents,
+        ..
+    } = prepared;
+    // Only a job that was shown as loaded is unloaded.
+    let loaded = loaded.is_some();
     if !loaded {
         let _lock = cli::claim_owner(&dir).context("stop the foreground massrelay run first")?;
     }
     let directory = job.plist.parent().expect("LaunchAgents directory");
     fs::create_dir_all(directory)?;
     fs::create_dir_all(job.events.parent().expect("Logs directory"))?;
-    let previous = match fs::symlink_metadata(&job.plist) {
-        Ok(metadata) if metadata.is_file() => Some(fs::read(&job.plist)?),
-        Ok(_) => bail!("expected a regular file at {}", job.plist.display()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    ensure!(
-        !loaded || previous.is_some(),
-        "the loaded LaunchAgent has no plist at {}",
-        job.plist.display()
-    );
-    let binary = env::current_exe().context("find the running MassRelay binary")?;
-    let contents = job.render(&binary, &dir)?;
     let staged = stage(directory, contents.as_bytes())?;
     checked(
         Command::new("/usr/bin/plutil")
@@ -73,7 +187,7 @@ pub fn install(dir: &Path) -> Result<PathBuf> {
         let restore = (|| {
             match previous {
                 Some(previous) => {
-                    stage(directory, &previous)?.persist(&job.plist)?;
+                    stage(directory, &previous.contents)?.persist(&job.plist)?;
                 }
                 None => match fs::remove_file(&job.plist) {
                     Ok(()) => {}
@@ -137,6 +251,377 @@ pub fn control(dir: &Path, action: ServiceAction) -> Result<()> {
     Ok(())
 }
 
+/// A removal as shown for confirmation, which displays as the changes it would make.
+pub struct UninstallPlan {
+    /// The canonical state directory, and the job `install` gives it.
+    dir: PathBuf,
+    job: Job,
+    found: Found,
+    text: String,
+}
+
+impl fmt::Display for UninstallPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str(&self.text)
+    }
+}
+
+/// What there is to unload and remove for this profile. Changes nothing.
+pub fn plan_uninstall(dir: &Path) -> Result<UninstallPlan> {
+    let dir = dir
+        .canonicalize()
+        .context("resolve the device state directory")?;
+    let job = Job::for_profile(&dir)?;
+    let (found, text) = manage(&dir, &job, |removal| {
+        let found = removal.inspect()?;
+        let text = removal.describe(&found);
+        Ok((found, text))
+    })?;
+    Ok(UninstallPlan {
+        dir,
+        job,
+        found,
+        text,
+    })
+}
+
+impl UninstallPlan {
+    /// Unload this profile's LaunchAgent and remove its property list, with any update job
+    /// that has finished, if all are still as they were shown. The profile, its keys and its
+    /// logs are kept. A plan that showed nothing to remove succeeds while there is still
+    /// nothing.
+    ///
+    /// A hangup is ignored from the first change until this command ends: a terminal that
+    /// reached this device through the service goes away when it stops.
+    pub fn apply(self) -> Result<()> {
+        manage(&self.dir, &self.job, |removal| {
+            let found = removal.confirm(&self.found)?;
+            // SAFETY: ignoring a signal installs no handler.
+            unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+            let done = removal.remove(found)?;
+            // The terminal may be gone, which must not turn a finished removal into a panic.
+            let _ = writeln!(io::stdout(), "{done}");
+            Ok(())
+        })
+    }
+}
+
+/// Look at one profile's LaunchAgent with macOS's own tools.
+fn manage<T>(dir: &Path, job: &Job, work: impl FnOnce(&Removal) -> Result<T>) -> Result<T> {
+    work(&Removal {
+        dir,
+        job,
+        shell_host: env::var(crate::private::HOST_ENV)
+            .ok()
+            .and_then(|value| value.parse().ok()),
+        process: std::process::id(),
+        stop_limit: STOP_LIMIT,
+        run: &tool,
+    })
+}
+
+/// Runs a program, by its path and with these arguments, within a time limit.
+type Tool<'a> = &'a dyn Fn(&str, &[&str]) -> Result<crate::update::Finished>;
+
+/// What there is to remove for a profile.
+#[derive(Debug)]
+struct Found {
+    /// The login session's domain, when there is one to hold jobs.
+    domain: Option<String>,
+    /// The generated property list.
+    plist: Option<Plist>,
+    /// The service's job, as launchd has it loaded.
+    loaded: Option<Loaded>,
+    /// An update job that has ended and that launchd still holds.
+    finished_update: Option<Loaded>,
+}
+
+impl Found {
+    /// Whether removing this is removing `shown`.
+    fn is(&self, shown: &Self) -> bool {
+        self.plist == shown.plist
+            && self.loaded == shown.loaded
+            && self.finished_update == shown.finished_update
+    }
+}
+
+/// A property list as it was read: its bytes, and which writing of the file held them.
+#[derive(Debug, PartialEq, Eq)]
+struct Plist {
+    contents: Vec<u8>,
+    /// Device, inode and modification time. An install replaces the file, even with the
+    /// same bytes.
+    written: (u64, u64, SystemTime),
+}
+
+/// What identifies a loaded job: not whether or as which process it runs.
+#[derive(Debug, PartialEq, Eq)]
+struct Loaded {
+    arguments: Vec<String>,
+    /// The property list launchd says it loaded the job from.
+    path: Option<String>,
+}
+
+impl Loaded {
+    /// From `launchctl print` output, if the job's arguments can be read there.
+    fn read(printed: &str) -> Option<Self> {
+        Some(Self {
+            arguments: job_arguments(printed)?,
+            path: printed
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("path = "))
+                .map(str::to_owned),
+        })
+    }
+}
+
+/// The removal of one profile's LaunchAgent.
+struct Removal<'a> {
+    /// The canonical state directory.
+    dir: &'a Path,
+    job: &'a Job,
+    /// The runtime serving the MassRelay shell this command says it is in.
+    shell_host: Option<u32>,
+    /// This command's process ID.
+    process: u32,
+    stop_limit: Duration,
+    run: Tool<'a>,
+}
+
+impl Removal<'_> {
+    /// Establish that everything to be unloaded or removed is this profile's, and that doing
+    /// so is safe now. Changes nothing.
+    fn inspect(&self) -> Result<Found> {
+        let plist = plist_file(&self.job.plist)?;
+        if plist.is_some() {
+            self.check_plist()?;
+        }
+        let domain = user_domain(self.run)?;
+        let mut found = Found {
+            domain: None,
+            plist,
+            loaded: None,
+            finished_update: None,
+        };
+        if let Err(error) = check_session(&domain, self.run) {
+            // launchd holds a login's jobs only while it lasts. With a property list to
+            // remove, whether its job is loaded has to be known.
+            return if found.plist.is_none() {
+                Ok(found)
+            } else {
+                Err(error)
+            };
+        }
+
+        let target = format!("{domain}/{}", self.job.label);
+        if let Some(printed) = self.print(&target)? {
+            let dir = path_text(self.dir)?;
+            let job = Loaded::read(&printed)
+                .filter(|job| {
+                    job.arguments
+                        .get(1..4)
+                        .is_some_and(|run| run == ["--state-dir", dir, "run"])
+                })
+                .with_context(|| {
+                    format!(
+                        "launchd has a job {target} that cannot be matched to this profile's \
+                         service; nothing was changed. Inspect it with 'launchctl print {target}'"
+                    )
+                })?;
+            if let Some(pid) = job_pid(&printed) {
+                let processes = (self.run)("/bin/ps", &["-A", "-o", "pid=,ppid="])
+                    .context("find what started this command")?;
+                ensure!(processes.success, "find what started this command failed");
+                ensure!(
+                    self.shell_host != Some(pid) && !descends(&processes.stdout, self.process, pid),
+                    HOSTED
+                );
+            }
+            found.loaded = Some(job);
+        }
+
+        let update = format!("{target}.update");
+        if let Some(printed) = self.print(&update)? {
+            ensure!(
+                finished(&printed),
+                "an update of this service is queued or running as {update}; nothing was \
+                 changed. Run 'massrelay uninstall' once it has finished, or cancel it while it \
+                 waits with 'launchctl bootout {update}'"
+            );
+            // One that cannot be matched to this profile is left alone.
+            let dir = path_text(self.dir)?;
+            found.finished_update = Loaded::read(&printed).filter(|job| {
+                job.arguments
+                    .ends_with(&["--state-dir", dir, "update"].map(String::from))
+            });
+        }
+        found.domain = Some(domain);
+        Ok(found)
+    }
+
+    /// Inspect again, and require what is there now to be what was shown.
+    fn confirm(&self, shown: &Found) -> Result<Found> {
+        let found = self.inspect()?;
+        ensure!(found.is(shown), CHANGED);
+        Ok(found)
+    }
+
+    /// Require the property list to be one `install` writes for this profile.
+    fn check_plist(&self) -> Result<()> {
+        let path = path_text(&self.job.plist)?;
+        let read = (self.run)(
+            "/usr/bin/plutil",
+            &["-convert", "json", "-o", "-", "--", path],
+        )
+        .context("read the LaunchAgent")?;
+        ensure!(
+            read.success,
+            "could not read {path} as a property list; nothing was changed"
+        );
+        let plist: serde_json::Value = serde_json::from_str(&read.stdout)
+            .with_context(|| format!("read {path}; nothing was changed"))?;
+        let argument = |index: usize| plist["ProgramArguments"][index].as_str();
+        ensure!(
+            plist["Label"].as_str() == Some(&self.job.label)
+                && argument(1) == Some("--state-dir")
+                && argument(2) == Some(path_text(self.dir)?)
+                && argument(3) == Some("run"),
+            "{path} was not written by 'massrelay install' for this profile; nothing was changed"
+        );
+        Ok(())
+    }
+
+    /// What launchd prints for a job, when it is loaded.
+    fn print(&self, target: &str) -> Result<Option<String>> {
+        let printed = (self.run)("/bin/launchctl", &["print", target])
+            .with_context(|| format!("look for {target}"))?;
+        Ok(printed.success.then_some(printed.stdout))
+    }
+
+    fn describe(&self, found: &Found) -> String {
+        let (label, dir) = (&self.job.label, self.dir.display());
+        let plist = self.job.plist.display();
+        let mut steps = vec![];
+        if let Some(domain) = &found.domain
+            && found.loaded.is_some()
+        {
+            steps.push(format!(
+                "Unload the LaunchAgent {label} from {domain}, which stops it"
+            ));
+        }
+        if found.plist.is_some() {
+            steps.push(format!("Remove its property list {plist}"));
+        }
+        if found.finished_update.is_some() {
+            steps.push(format!("Unload the finished update job {label}.update"));
+        }
+        if steps.is_empty() {
+            let mut text = format!(
+                "No LaunchAgent to remove for the profile in {dir}: there is no property list \
+                 at {plist}"
+            );
+            if found.domain.is_none() {
+                text.push_str("\nThere is no login session to hold a loaded one");
+            }
+            return text;
+        }
+        steps.push(format!(
+            "Keep the device profile and keys in {dir}, and the logs"
+        ));
+        steps.join("\n")
+    }
+
+    fn remove(&self, found: Found) -> Result<String> {
+        if found.loaded.is_none() && found.plist.is_none() && found.finished_update.is_none() {
+            return Ok(self.describe(&found));
+        }
+        let domain = found.domain.as_deref().context("no login session")?;
+        let target = format!("{domain}/{}", self.job.label);
+        if found.loaded.is_some() {
+            // Immediately before the first change.
+            ensure!(
+                plist_file(&self.job.plist)? == found.plist
+                    && self.print(&target)?.as_deref().and_then(Loaded::read) == found.loaded,
+                CHANGED
+            );
+            self.unload(domain, &self.job.label).context(
+                "the property list is kept. Run 'massrelay uninstall' again once the service \
+                 has stopped",
+            )?;
+        }
+        if let Some(plist) = &found.plist {
+            ensure!(
+                plist_file(&self.job.plist)?.as_ref() == Some(plist)
+                    && self.print(&target)?.is_none(),
+                "{} changed, or its job was loaded again; it was not removed",
+                self.job.plist.display()
+            );
+            fs::remove_file(&self.job.plist)
+                .with_context(|| format!("remove {}", self.job.plist.display()))?;
+        }
+        if let Some(job) = &found.finished_update {
+            let label = format!("{}.update", self.job.label);
+            // Nothing may have started it since it was looked at.
+            if let Some(printed) = self.print(&format!("{domain}/{label}"))? {
+                ensure!(
+                    finished(&printed) && Loaded::read(&printed).as_ref() == Some(job),
+                    "{label} changed or started again and was left loaded. Run 'massrelay \
+                     uninstall' again once it has finished"
+                );
+                self.unload(domain, &label)?;
+            }
+        }
+        Ok(format!("Removed {}", self.job.label))
+    }
+
+    /// Unload a job, and wait within the limit until launchd no longer has it.
+    fn unload(&self, domain: &str, label: &str) -> Result<()> {
+        let target = format!("{domain}/{label}");
+        let asked = (self.run)("/bin/launchctl", &["bootout", &target])
+            .with_context(|| format!("unload {target}"))?;
+        let deadline = Instant::now() + self.stop_limit;
+        // What is asked for is that the job is gone, whatever `bootout` itself reported.
+        while self.print(&target)?.is_some() {
+            ensure!(
+                Instant::now() < deadline,
+                "launchd still has {target} after {} seconds: {}",
+                self.stop_limit.as_secs(),
+                asked
+                    .stderr
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+        // A session that ended meanwhile answers nothing, which says nothing about the job.
+        check_session(domain, self.run)
+    }
+}
+
+/// Whether `launchctl print` positively says that a loaded job is not running.
+fn finished(printed: &str) -> bool {
+    let mut lines = printed.lines().map(str::trim);
+    !lines.clone().any(|line| line.starts_with("pid = "))
+        // The job's own state comes first; nested sections have states of their own.
+        && lines.find_map(|line| line.strip_prefix("state = ")) == Some("not running")
+}
+
+/// Whether `ancestor` started `process`, at any remove, in `ps -o pid=,ppid=` output.
+fn descends(table: &str, process: u32, ancestor: u32) -> bool {
+    let parents: std::collections::HashMap<u32, u32> = table
+        .lines()
+        .filter_map(|line| {
+            let mut columns = line.split_whitespace().map(str::parse);
+            Some((columns.next()?.ok()?, columns.next()?.ok()?))
+        })
+        .collect();
+    std::iter::successors(Some(process), |process| parents.get(process).copied())
+        // A listing taken while processes come and go must not be followed for ever.
+        .take(parents.len() + 1)
+        .any(|found| found == ancestor)
+}
+
 /// An installed LaunchAgent, for `massrelay update`.
 pub struct Managed {
     dir: PathBuf,
@@ -194,18 +679,32 @@ impl Managed {
 
 /// `login_domain`, with each request bounded, for the update.
 fn bounded_domain() -> Result<String> {
-    let uid = bounded(Command::new("/usr/bin/id").arg("-u")).context("read the user ID")?;
+    let domain = user_domain(&tool)?;
+    check_session(&domain, &tool)?;
+    Ok(domain)
+}
+
+/// This account's login domain, whether or not a session holds it now.
+fn user_domain(run: Tool) -> Result<String> {
+    let uid = run("/usr/bin/id", &["-u"]).context("read the user ID")?;
     ensure!(uid.success, "read the user ID failed");
     let uid = uid.stdout.trim().parse::<u32>()?;
     ensure!(
         uid != 0,
         "manage MassRelay from your Mac account without sudo"
     );
-    let domain = format!("gui/{uid}");
+    Ok(format!("gui/{uid}"))
+}
+
+fn check_session(domain: &str, run: Tool) -> Result<()> {
     let session =
-        bounded(&mut launchctl("print", &domain)).context("find the macOS login session")?;
+        run("/bin/launchctl", &["print", domain]).context("find the macOS login session")?;
     ensure!(session.success, "find the macOS login session failed");
-    Ok(domain)
+    Ok(())
+}
+
+fn tool(program: &str, args: &[&str]) -> Result<crate::update::Finished> {
+    bounded(Command::new(program).args(args))
 }
 
 /// A command, within the limit an update gives one request to a service manager.
@@ -321,6 +820,7 @@ fn login_domain() -> Result<String> {
     Ok(domain)
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct Job {
     label: String,
     plist: PathBuf,
@@ -384,6 +884,30 @@ impl Job {
 "#
         ))
     }
+}
+
+/// A property list's contents, if there is one. Only a regular file is read.
+fn read_plist(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(fs::read(path)?)),
+        Ok(_) => bail!("expected a regular file at {}", path.display()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// `read_plist`, with which writing of the file was read.
+fn plist_file(path: &Path) -> Result<Option<Plist>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(contents) = read_plist(path)? else {
+        return Ok(None);
+    };
+    let metadata = fs::symlink_metadata(path)?;
+    Ok(Some(Plist {
+        contents,
+        written: (metadata.dev(), metadata.ino(), metadata.modified()?),
+    }))
 }
 
 fn path_text(path: &Path) -> Result<&str> {
@@ -507,6 +1031,271 @@ mod tests {
                 path_text(&custom.events)?,
             ]
         );
+        Ok(())
+    }
+}
+
+/// Planned installs and removals, with macOS's tools stood in for.
+#[cfg(all(test, unix))]
+mod plan_tests {
+    use std::cell::RefCell;
+
+    use super::*;
+
+    /// A login domain with the profile's service and update jobs.
+    #[derive(Default)]
+    struct Launchd {
+        session: bool,
+        /// What `print` says of each job, when it is loaded.
+        service: Option<String>,
+        update: Option<String>,
+        /// What `plutil` reads from the property list.
+        plist: String,
+        /// `bootout` leaves the job loaded.
+        stuck: bool,
+        changes: Vec<String>,
+    }
+
+    impl Launchd {
+        fn run(
+            state: &RefCell<Self>,
+            program: &str,
+            args: &[&str],
+        ) -> Result<crate::update::Finished> {
+            let mut launchd = state.borrow_mut();
+            let mut success = true;
+            let stdout = match (program, args[0]) {
+                ("/usr/bin/id", _) => "501\n".into(),
+                ("/usr/bin/plutil", _) => launchd.plist.clone(),
+                // This command is process 30, started by 20, which 7 started.
+                ("/bin/ps", _) => " 7 1\n 20 7\n 30 20\n".into(),
+                ("/bin/launchctl", verb) => {
+                    let target = args[1];
+                    if target == "gui/501" {
+                        success = launchd.session;
+                        String::new()
+                    } else {
+                        let update = target.ends_with(".update");
+                        if verb != "print" {
+                            launchd.changes.push(target.to_owned());
+                        }
+                        let stuck = launchd.stuck;
+                        let job = if update {
+                            &mut launchd.update
+                        } else {
+                            &mut launchd.service
+                        };
+                        if verb == "bootout" && !stuck {
+                            *job = None;
+                        }
+                        success = job.is_some() || verb == "bootout";
+                        job.clone().unwrap_or_default()
+                    }
+                }
+                _ => anyhow::bail!("unexpected program {program}"),
+            };
+            Ok(crate::update::Finished {
+                success,
+                stdout,
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn an_install_applies_only_over_what_was_shown() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path().join("profile");
+        let job = || Job::new(temp.path(), &dir, None).unwrap();
+        let plist = job().plist;
+        let launchd = RefCell::new(Launchd {
+            session: true,
+            ..Default::default()
+        });
+        let run = |program: &str, args: &[&str]| Launchd::run(&launchd, program, args);
+        let read = |binary: &str| Prepared::read(dir.clone(), job(), binary.into(), &run);
+        let refused = |plan: &InstallPlan, binary: &str| {
+            assert!(plan.confirm(read(binary).unwrap()).is_err());
+        };
+        let loaded = |program: &str, pid: u32| {
+            Some(format!(
+                "x = {{\n\tpid = {pid}\n\targuments = {{\n\t\t{program}\n\t}}\n}}"
+            ))
+        };
+
+        // Nothing is installed, and looking makes nothing.
+        let plan = InstallPlan(read("/m")?);
+        plan.confirm(read("/m")?)?;
+        assert!(!plist.parent().unwrap().exists());
+        refused(&plan, "/other");
+        fs::create_dir_all(plist.parent().unwrap())?;
+        fs::write(&plist, "installed since")?;
+        refused(&plan, "/m");
+
+        // A job loaded since the plan showed none would have to be unloaded.
+        let plan = InstallPlan(read("/m")?);
+        launchd.borrow_mut().service = loaded("/m", 7);
+        refused(&plan, "/m");
+        // One shown as loaded may restart meanwhile, but not become another, or go.
+        let plan = InstallPlan(read("/m")?);
+        launchd.borrow_mut().service = loaded("/m", 8);
+        plan.confirm(read("/m")?)?;
+        for changed in [loaded("/other", 8), None] {
+            launchd.borrow_mut().service = changed;
+            refused(&plan, "/m");
+        }
+        launchd.borrow_mut().service = loaded("/m", 8);
+        // The property list was written anew, even alike.
+        let _earlier = fs::File::open(&plist)?;
+        stage(plist.parent().unwrap(), b"installed since")?.persist(&plist)?;
+        refused(&plan, "/m");
+        assert!(launchd.borrow().changes.is_empty());
+        assert_eq!(fs::read_to_string(&plist)?, "installed since");
+        Ok(())
+    }
+
+    #[test]
+    fn uninstall_unloads_only_this_profiles_jobs_and_can_be_repeated() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path().join("my profile");
+        fs::create_dir(&dir)?;
+        let job = Job::new(temp.path(), &dir, None)?;
+        fs::create_dir_all(job.plist.parent().unwrap())?;
+        fs::write(&job.plist, "generated")?;
+        fs::write(dir.join("kept"), "enrollment")?;
+        let state = path_text(&dir)?;
+        let printed = |pid: &str, run: &str, state: &str| {
+            format!(
+                "x = {{\n\tstate = {pid}\n\targuments = {{\n\t\t/m\n\t\t--state-dir\n\t\t{state}\n\t\t{run}\n\t}}\n}}"
+            )
+        };
+        let running = |pid| printed(&format!("running\n\tpid = {pid}"), "run", state);
+        let plist = |state: &str| {
+            serde_json::json!({
+                "Label": job.label,
+                "ProgramArguments": ["/m", "--state-dir", state, "run"],
+            })
+            .to_string()
+        };
+        let launchd = RefCell::new(Launchd {
+            session: true,
+            service: Some(running(99)),
+            update: Some(printed("not running", "update", state)),
+            plist: plist(state),
+            ..Default::default()
+        });
+        let run = |program: &str, args: &[&str]| Launchd::run(&launchd, program, args);
+        let removal = Removal {
+            dir: &dir,
+            job: &job,
+            shell_host: None,
+            process: 30,
+            stop_limit: Duration::ZERO,
+            run: &run,
+        };
+        // As the command does it: shown, then applied to what was shown.
+        let uninstall = |removal: &Removal| {
+            let shown = removal.inspect()?;
+            removal.remove(removal.confirm(&shown)?)
+        };
+        let changes = || std::mem::take(&mut launchd.borrow_mut().changes);
+        let refused = |removal: &Removal| {
+            let error = format!("{:#}", uninstall(removal).unwrap_err());
+            assert!(job.plist.exists(), "{error}");
+            assert!(changes().is_empty(), "{error}");
+        };
+
+        // A property list, or a loaded job, that is another profile's.
+        launchd.borrow_mut().plist = plist("/elsewhere");
+        refused(&removal);
+        launchd.borrow_mut().plist = plist(state);
+        launchd.borrow_mut().service = Some(printed("running", "run", "/elsewhere"));
+        refused(&removal);
+        launchd.borrow_mut().service = Some(running(99));
+        // The command would end with the service: by its shell's host, or as its descendant.
+        refused(&Removal {
+            shell_host: Some(99),
+            ..removal
+        });
+        launchd.borrow_mut().service = Some(running(7));
+        refused(&removal);
+        launchd.borrow_mut().service = Some(running(99));
+        // An update under way, and a session whose jobs cannot be seen.
+        let idle = launchd.borrow_mut().update.replace(running(55));
+        refused(&removal);
+        launchd.borrow_mut().update = idle;
+        launchd.borrow_mut().session = false;
+        refused(&removal);
+        launchd.borrow_mut().session = true;
+
+        let shown = removal.inspect()?;
+        let plan = removal.describe(&shown);
+        assert!(plan.contains(&job.label) && plan.contains(path_text(&job.plist)?));
+        assert!(changes().is_empty());
+        // Another process for the same job leaves the registration as it was.
+        launchd.borrow_mut().service = Some(running(98));
+        removal.confirm(&shown)?;
+
+        // Nothing shown, or one registration shown: another is not removed in its place.
+        fs::remove_file(&job.plist)?;
+        let service = launchd.borrow_mut().service.take();
+        let update = launchd.borrow_mut().update.take();
+        let nothing = removal.inspect()?;
+        removal.confirm(&nothing)?;
+        fs::write(&job.plist, "generated")?;
+        assert!(removal.confirm(&nothing).is_err());
+        // A job loaded since, with or without the property list, is refused too.
+        fs::remove_file(&job.plist)?;
+        launchd.borrow_mut().service = service;
+        assert!(removal.confirm(&nothing).is_err());
+        fs::write(&job.plist, "generated")?;
+        launchd.borrow_mut().update = update;
+        let shown = removal.inspect()?;
+        // Written anew, even alike. The earlier file is kept open, so that its inode is not
+        // used again.
+        let replace = || -> Result<fs::File> {
+            let earlier = fs::File::open(&job.plist)?;
+            stage(job.plist.parent().unwrap(), b"generated")?.persist(&job.plist)?;
+            Ok(earlier)
+        };
+        let _first = replace()?;
+        assert!(removal.confirm(&shown).is_err());
+        let shown = removal.inspect()?;
+        // Replaced after the last inspection, right before the first change.
+        let confirmed = removal.confirm(&shown)?;
+        let _second = replace()?;
+        assert!(removal.remove(confirmed).is_err());
+        assert!(changes().is_empty());
+        assert!(job.plist.exists());
+
+        // A job launchd does not let go of keeps its property list.
+        launchd.borrow_mut().stuck = true;
+        assert!(uninstall(&removal).is_err());
+        assert!(job.plist.exists());
+        assert_eq!(changes(), [format!("gui/501/{}", job.label)]);
+        launchd.borrow_mut().stuck = false;
+
+        uninstall(&removal)?;
+        assert!(!job.plist.exists());
+        assert_eq!(
+            changes(),
+            [
+                format!("gui/501/{}", job.label),
+                format!("gui/501/{}.update", job.label)
+            ]
+        );
+
+        // Nothing left: success, with or without a login session. A job whose file was removed
+        // by hand is still found.
+        uninstall(&removal)?;
+        launchd.borrow_mut().session = false;
+        uninstall(&removal)?;
+        assert!(changes().is_empty());
+        launchd.borrow_mut().session = true;
+        launchd.borrow_mut().service = Some(running(99));
+        uninstall(&removal)?;
+        assert_eq!(changes(), [format!("gui/501/{}", job.label)]);
+        assert_eq!(fs::read_to_string(dir.join("kept"))?, "enrollment");
         Ok(())
     }
 }
