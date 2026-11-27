@@ -102,7 +102,7 @@ use super::binding::EndpointKey;
 use super::codec::{Dec, Enc, hex};
 use super::mailbox::Mailbox;
 use super::membership::{
-    Advance, Device, Dispatch, Error as MembershipError, Gate, Polled, Settle, Stop,
+    Advance, Device, Dispatch, Error as MembershipError, Gate, MemberView, Polled, Settle, Stop,
 };
 use super::pairing::{
     Approved, Authorization, Cutoff, Exposure, Owner, PAIRING_ALPN, PairError, PairingState, Peers,
@@ -482,6 +482,11 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
     /// Accepted roster (endpoint keys only; names carry no authority).
     pub fn roster(&self) -> Result<Vec<EndpointKey>, PairError> {
         Ok(self.device.roster()?)
+    }
+
+    pub fn member_view(&self) -> Result<MemberView, PairError> {
+        let guard = self.device.store().lock()?;
+        Ok(self.device.member_view(&guard)?)
     }
 
     /// Issue a membership invite. The membership pass admits its joiner.

@@ -460,6 +460,7 @@ def _exercise(binary, root, processes):
     eventually(lambda: members("c") == {a, b}, "c sees a and b", seconds=60)
     cli("a", "approve", c, "--as", "carol")
     cli("c", "approve", a, "--as", "alice")
+    cli("c", "approve", b, "--as", "bob")
     terminal("c", "alice", False)
     cli("a", "enable", "shell", "carol")
     terminal("c", "alice", True)
@@ -470,6 +471,7 @@ def _exercise(binary, root, processes):
     assert read_exactly(session.stdout, 6) == b"live\0\xff"
     cut = cli("a", "revoke", "bob")
     assert "Cut off locally" in cut.stdout, cut
+    assert b not in peers("a")
     assert session.wait(timeout=20) == 1, "the open session ended at the cutoff"
     eventually(lambda: not shows_connection("a", "inbound", "bob", tcp_service), "cut connection gone")
     # A cut-off peer's dial is closed by the destination during the pairing exchange; the
@@ -481,7 +483,7 @@ def _exercise(binary, root, processes):
     assert b"refused" in message or b"connection lost" in message, result.stderr
     assert echo_target.accepted == reached
     terminal("b", "alice", False)
-    eventually(lambda: members("c") == {a}, "c learns b's removal", seconds=60)
+    eventually(lambda: b not in peers("c"), "c drops b from the peer list", seconds=60)
     eventually(lambda: "this device was removed" in status("b"), "b learns its removal", seconds=60)
 
     # --------------------------------- halt on a relay serving another incarnation

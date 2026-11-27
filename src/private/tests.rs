@@ -5359,6 +5359,16 @@ mod runtime {
             .unwrap();
         assert!(matches!(r, ControlReply::CutOff { .. }), "{r:?}");
         assert!(t0.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            cmd(&bob, ControlRequest::Peers).await,
+            ControlReply::Peers(vec![])
+        );
+        assert!(
+            rt::offline_status(&bob.reopen(&n))
+                .unwrap()
+                .peers
+                .is_empty()
+        );
         let (_, failed) = drain(&mut sock).await;
         assert_eq!(
             failed.as_deref(),

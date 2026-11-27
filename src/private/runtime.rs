@@ -118,7 +118,7 @@ use super::audit::{self, DeviceLog};
 use super::binding::EndpointKey;
 use super::codec::{hex, unhex};
 use super::mailbox::Mailbox;
-use super::membership::{Clock, Device};
+use super::membership::{Clock, Device, MemberView};
 use super::pairing::{self, Decision, Owner, PairError, PairingState, Refusal};
 use super::service::{CLOSE_AUTHORITY_ENDED, CLOSE_DONE, Node, PrivateRequest, ServiceStream};
 use super::versions::{Observation, Observations, PeerVersions};
@@ -295,8 +295,7 @@ fn decision(d: &Decision) -> String {
 }
 
 fn view(
-    endpoint: &EndpointKey,
-    roster: &[EndpointKey],
+    members: &MemberView,
     st: &PairingState,
     running: bool,
     last_sync: Option<String>,
@@ -308,33 +307,23 @@ fn view(
             .ok()
             .and_then(|id| versions.get(&id).cloned())
     };
-    let mut peers: Vec<PeerView> = st
-        .peers
+    let peers = members
+        .roster
         .iter()
-        .map(|p| PeerView {
-            key: hex(&p.endpoint),
-            alias: Some(p.alias.clone()),
-            member: roster.contains(&p.endpoint),
-            local: decision(&p.local),
-            remote: decision(&p.remote),
-            paired: p.pairing.is_some(),
-            version: report(&p.endpoint),
+        .filter(|key| members.ineligible(key).is_none())
+        .map(|key| {
+            let record = st.peer(key);
+            PeerView {
+                key: hex(key),
+                alias: record.map(|p| p.alias.clone()),
+                member: true,
+                local: record.map_or_else(|| "none".into(), |p| decision(&p.local)),
+                remote: record.map_or_else(|| "none".into(), |p| decision(&p.remote)),
+                paired: record.is_some_and(|p| p.pairing.is_some()),
+                version: report(key),
+            }
         })
         .collect();
-    for key in roster {
-        if key != endpoint && !st.peers.iter().any(|p| &p.endpoint == key) {
-            peers.push(PeerView {
-                key: hex(key),
-                alias: None,
-                member: true,
-                local: "none".into(),
-                remote: "none".into(),
-                paired: false,
-                version: report(key),
-            });
-        }
-    }
-    peers.sort_by(|a, b| a.key.cmp(&b.key));
     let defaults = st
         .defaults
         .list(|_| None)
@@ -356,7 +345,7 @@ fn view(
         .collect();
     let exclusions = st.exclusions.iter().map(|(k, s)| (hex(k), *s)).collect();
     StatusView {
-        endpoint: hex(endpoint),
+        endpoint: hex(&members.endpoint),
         version: Some(env!("CARGO_PKG_VERSION").into()),
         running,
         connections: vec![],
@@ -375,11 +364,13 @@ fn view(
 pub fn offline_status<M: Mailbox>(device: &Device<M>) -> Result<StatusView, PairError> {
     let state = device.state()?;
     let st = pairing::read_state(device)?;
-    let roster = device.roster().unwrap_or_default();
+    let members = {
+        let guard = device.store().lock()?;
+        device.member_view(&guard)?
+    };
     let halt = state.halt.map(|h| format!("{h:?}"));
     Ok(view(
-        &state.endpoint,
-        &roster,
+        &members,
         &st,
         false,
         None,
@@ -851,11 +842,10 @@ fn manage<M: Mailbox + Send + Sync + 'static>(
         let peer = |s: &str| resolve(&st, s);
         Ok(match request {
             ControlRequest::Status | ControlRequest::Peers => {
-                let roster = node.roster().unwrap_or_default();
+                let members = node.member_view().map_err(err)?;
                 let last = shared.last_sync.lock().expect("sync note").clone();
                 let mut v = view(
-                    &node.endpoint_key(),
-                    &roster,
+                    &members,
                     &st,
                     true,
                     last,

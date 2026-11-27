@@ -305,7 +305,7 @@ pub struct PairingState {
 }
 
 impl PairingState {
-    fn peer(&self, ep: &EndpointKey) -> Option<&PeerRecord> {
+    pub(super) fn peer(&self, ep: &EndpointKey) -> Option<&PeerRecord> {
         self.peers.iter().find(|p| &p.endpoint == ep)
     }
 
