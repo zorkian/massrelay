@@ -6,9 +6,9 @@ Connections go directly between devices when possible and fall back to a relay w
 
 ## Install MassRelay
 
-Release binaries are available for Linux and macOS on x86-64 and ARM64, and for Windows x86-64 on Windows 10 version 1809 or later. The installers verify the release checksum before replacing the binary.
+Release binaries are available for Linux and macOS on x86-64 and ARM64, and for Windows x86-64 on Windows 10 version 1809 or later.
 
-The GitHub repository is currently private. Sign in with `gh auth login` using an account with access before running the installer. You can also download binaries and checksums from [GitHub Releases](https://github.com/zorkian/massrelay/releases).
+Sign in with `gh auth login` before running the installer, or download the binary from [GitHub Releases](https://github.com/zorkian/massrelay/releases).
 
 The installers use the latest release by default. Set `MASSRELAY_VERSION` to a tag to install a specific version.
 
