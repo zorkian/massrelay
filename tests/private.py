@@ -259,7 +259,7 @@ def _exercise(binary, root, processes):
     assert not (root / "a" / "device.json").exists(), "no legacy profile is written"
     again = cli("a", "create", "--relay", relay_locator, check=False)
     assert again.returncode == 1 and "already" in again.stderr, again
-    # Management needs the running owner; nothing mutates the profile from outside it.
+    # Issuing invites needs the running owner.
     offline = cli("a", "invite", check=False)
     assert offline.returncode == 1 and "start it in the foreground" in offline.stderr, offline
     assert "Runtime: not running" in status("a")
@@ -295,6 +295,10 @@ def _exercise(binary, root, processes):
     reused = cli("c", "join", "--bind", "127.0.0.1:0", data=invite + "\n", check=False)
     assert reused.returncode == 1 and "used by another device" in reused.stderr, reused
     assert "Membership: not joined" in status("c")
+    cli("b", "rename", "renamed-laptop")
+    assert cli("b", "rename", "invalid name", check=False).returncode == 1
+    assert "Name: renamed-laptop\n" in status("b")
+    assert key("b") == b
     run_b = run("b")
     eventually(lambda: members("a") == {b} and members("b") == {a}, "a and b see each other")
 
@@ -310,6 +314,7 @@ def _exercise(binary, root, processes):
     assert cli("b", "ping", a, "-c", "1", check=False).returncode == 1
     cli("a", "approve", b, "--as", "bob")
     terminal("b", a, False)
+    assert peers("a")[b][0] == "laptop", "a did not learn the unpaired device's rename"
     cli("b", "approve", a, "--as", "alice")
     # Mutually approved, but no grant: refused; the attempt completes the pairing.
     terminal("b", "alice", False)
@@ -364,13 +369,14 @@ def _exercise(binary, root, processes):
     terminal("b", "alice", False)
     cli("a", "enable", "shell", "bob")
     terminal("b", "alice", True)
+    eventually(lambda: peers("a")[b][:2] == ["renamed-laptop", "bob"], "offline rename reported")
 
     # A temporary exposed port can address a target chosen by the destination
     # and closes any active session when the exposure command leaves.
     exposed_port = free_port(socket.SOCK_STREAM)
     exposed_service = f"tcp:{exposed_port}"
     target = f"127.0.0.1:{echo_target.port}"
-    exposure = popen("a", "expose", "--tcp", str(exposed_port), "--to", "laptop", target)
+    exposure = popen("a", "expose", "--tcp", str(exposed_port), "--to", "renamed-laptop", target)
     eventually(
         lambda: any(exposed_service in row and "temporary" in row and target in row
                     for row in cli("a", "list").stdout.splitlines()),
@@ -386,7 +392,7 @@ def _exercise(binary, root, processes):
     exposed_port = free_port(socket.SOCK_DGRAM)
     exposed_udp = f"udp:{exposed_port}"
     udp_target_addr = f"127.0.0.1:{udp_target.port}"
-    exposure = popen("a", "expose", "--udp", str(exposed_port), "--to", "laptop", udp_target_addr)
+    exposure = popen("a", "expose", "--udp", str(exposed_port), "--to", "renamed-laptop", udp_target_addr)
     eventually(lambda: exposed_udp in cli("a", "list").stdout, "temporary UDP grant")
     udp_session = popen("b", "connect", "workstation", exposed_udp, "--listen", "0")
     local = int(read_line(udp_session.stderr, "send datagrams to").strip().rsplit(":", 1)[1])
@@ -424,6 +430,23 @@ def _exercise(binary, root, processes):
     version = subprocess.check_output([binary, "--version"], text=True).strip().rsplit(" ", 1)[1]
     eventually(lambda: f"bob\t{version}\t20" in status("a"), "inbound peer version")
     eventually(lambda: f"alice\t{version}\t20" in status("b"), "outbound peer version")
+    before_rename = peers("a")[b]
+    cli("a", "rename", "renamed-workstation")
+    assert "Name: renamed-workstation\n" in status("a")
+    assert key("a") == a and peers("a")[b] == before_rename
+    assert peers("b")[a][0] == "workstation", "existing connection did not publish a new name"
+    fresh, fresh_master, _ = open_shell("b", "alice")
+    try:
+        eventually(
+            lambda: peers("b")[a][:2] == ["renamed-workstation", "alice"],
+            "running rename reported on a new connection",
+        )
+    finally:
+        os.close(fresh_master)
+        stop(fresh)
+    terminal("b", "renamed-workstation", True)
+    assert shell.poll() is None and not process_gone(shell_pid)
+    assert shows_connection("a", "inbound", "bob", "shell")
     os.kill(relay.pid, signal.SIGSTOP)
     try:
         time.sleep(3)  # at least two pass intervals: a membership call is now in flight
@@ -440,6 +463,8 @@ def _exercise(binary, root, processes):
         assert "the profile is released" in shutdown_log, shutdown_log
         assert process_gone(shell_pid), "the runtime stopped and reaped its shell"
         assert "Runtime: not running" in status("a")
+        assert "Name: renamed-workstation\n" in status("a")
+        assert peers("a")[b] == before_rename, "the peer observation survived shutdown"
         assert f"bob\t{version}\t20" in status("a")
         run_a = run("a")
         assert json.loads(profile_file.read_text())["udp_port"] == previous_port
@@ -466,7 +491,16 @@ def _exercise(binary, root, processes):
     cli("c", "approve", b, "--as", "bob")
     terminal("c", "alice", False)
     cli("a", "enable", "shell", "carol")
-    terminal("c", "alice", True)
+    cli("c", "rename", "renamed-laptop")
+    held, held_master, _ = open_shell("c", "alice")
+    try:
+        eventually(lambda: peers("a")[c][0] == "renamed-laptop", "duplicate reported name")
+        assert peers("a")[b] == before_rename, "a report only changes its sender's entry"
+        ambiguous = cli("a", "enable", "shell", "renamed-laptop", check=False)
+        assert ambiguous.returncode == 1 and b in ambiguous.stderr and c in ambiguous.stderr
+    finally:
+        os.close(held_master)
+        stop(held)
 
     # ---------------------------------------------------------------- cutoff
     session = popen("b", "connect", "alice", tcp_service)
@@ -526,6 +560,7 @@ def _exercise(binary, root, processes):
         assert connected & ended, "a logged session reached native service and disconnected"
         assert relay_locator not in log.read_text() and invite not in log.read_text()
         assert "LIVE_SHELL" not in log.read_text() and target not in log.read_text()
+        assert "renamed-workstation" not in log.read_text() and "renamed-laptop" not in log.read_text()
     # Each device's diagnostics are in the system log under its own profile. That log is not
     # private to this account, so it names no device, peer, credential, target or payload.
     if Path("/run/systemd/journal/socket").exists() and shutil.which("journalctl"):
@@ -541,7 +576,8 @@ def _exercise(binary, root, processes):
             assert recorded in logs["a"], logs["a"]
         removed = "this device was removed from the network"
         assert removed in logs["b"] and removed not in logs["a"] + logs["c"], logs
-        for secret in [a, b, key("c"), relay_locator, invite, target, "LIVE_SHELL", "alice"]:
+        for secret in [a, b, key("c"), relay_locator, invite, target, "LIVE_SHELL", "alice",
+                       "renamed-workstation", "renamed-laptop"]:
             assert secret not in "".join(logs.values()), secret
 
         follower = popen("a", "logs", "--follow")

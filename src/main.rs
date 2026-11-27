@@ -240,7 +240,7 @@ fn grouped_cli() -> clap::Command {
         (
             "Manage this device",
             &[
-                "status", "logs", "install", "start", "restart", "stop", "run",
+                "status", "rename", "logs", "install", "start", "restart", "stop", "run",
             ],
         ),
         (

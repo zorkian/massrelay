@@ -97,7 +97,7 @@ use crate::{tcp, terminal, udp};
 use super::audit::{self, DeviceLog, Tracked};
 use super::pty;
 use super::routes::Routes;
-use super::versions::{Exchange, Observations, PeerVersions};
+use super::versions::{self, Exchange, Observations, PeerVersions};
 
 use super::binding::EndpointKey;
 use super::codec::{Dec, Enc, hex};
@@ -422,6 +422,12 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
     }
 
     // ---------------------------------------------------- control entry points
+
+    pub(super) fn rename_self(&self, name: &str) -> anyhow::Result<()> {
+        self.peers()
+            .while_running(|| versions::rename_self(&self.device, name))
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?
+    }
 
     pub fn approve(
         &self,

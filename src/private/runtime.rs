@@ -149,6 +149,9 @@ pub enum ControlRequest {
         peer: String,
         count: u16,
     },
+    RenameSelf {
+        name: String,
+    },
     /// Approve `peer` (endpoint key, or an alias already pinned to one) and
     /// pin `alias` to it.
     Approve {
@@ -296,6 +299,12 @@ pub struct PeerView {
     pub paired: bool,
     #[serde(default)]
     pub version: Option<Observation>,
+}
+
+impl PeerView {
+    pub fn reported_name(&self) -> Option<&str> {
+        self.version.as_ref()?.name()
+    }
 }
 
 fn decision(d: &Decision) -> String {
@@ -886,6 +895,10 @@ fn manage<M: Mailbox + Send + Sync + 'static>(
             }
             ControlRequest::Invite => {
                 ControlReply::Invite(hex(&node.issue_invite().map_err(err)?))
+            }
+            ControlRequest::RenameSelf { name } => {
+                node.rename_self(&name).map_err(|error| error.to_string())?;
+                ControlReply::Done
             }
             ControlRequest::Approve {
                 peer: p,

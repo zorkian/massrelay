@@ -22,6 +22,8 @@
 //!   Its diagnostics go to the host's native log (`super::diagnostics`), in the foreground and
 //!   under a service manager alike; the connection audit stays in its own JSONL file.
 //! - `logs` prints the profile's recent diagnostics from that log, and follows it on request.
+//! - `rename NEW_NAME` sets the profile's display name through the running owner or under the
+//!   offline owner lock. `rename PEER NEW_NAME` changes a local alias through the running owner.
 //! - Every other command talks to the running runtime over its authenticated local control
 //!   channel; `status` and `peers` fall back to a read-only view when it is not running.
 //!
@@ -62,6 +64,7 @@ use super::relay_mailbox::RelayMailbox;
 use super::runtime::{self, CONTROL, Config, ControlReply, ControlRequest, PeerView, Runtime};
 use super::service::SERVICE_ALPN;
 use super::store;
+use super::versions;
 use crate::slot_wire::{AckHeader, ReadHeader};
 
 /// The private profile's directory under the state directory.
@@ -137,6 +140,16 @@ pub enum Command {
     },
     /// Show this device’s enrollment and runtime.
     Status,
+    /// Rename this device or change a peer's local alias.
+    #[command(after_help = "  massrelay rename NEW_NAME       Change this device's display name\n  massrelay rename PEER NEW_NAME  Change a peer's alias on this device")]
+    Rename {
+        /// This device's new name, or the peer's current local alias or exact endpoint ID.
+        #[arg(value_name = "NEW_NAME|PEER")]
+        name_or_peer: String,
+        /// The peer's new local alias when PEER is supplied.
+        #[arg(value_name = "NEW_NAME")]
+        new_name: Option<String>,
+    },
     /// Show this device’s recent diagnostics from the system log.
     Logs {
         /// Keep printing new diagnostics as they are written.
@@ -167,12 +180,6 @@ pub enum Command {
         /// Replace an earlier decision for this key with a fresh approval.
         #[arg(long)]
         reapprove: bool,
-    },
-    /// Rename a peer's local alias on this device.
-    Rename {
-        /// Existing local alias or exact endpoint ID.
-        peer: String,
-        new_name: String,
     },
     /// Decline a peer, ending any pairing with it.
     Decline { peer: String },
@@ -278,6 +285,10 @@ pub async fn execute(state_dir: &Path, command: Command) -> Result<i32> {
             ran?
         }
         Command::Status => status(&dir).await?,
+        Command::Rename {
+            name_or_peer,
+            new_name: None,
+        } => rename_self(&dir, name_or_peer).await?,
         Command::Logs { follow } => return diagnostics::show(state_dir, follow),
         Command::Peers { full } => peers(&dir, full).await?,
         Command::Ping { peer, count } => return ping(&dir, &peer, count).await,
@@ -300,7 +311,10 @@ pub async fn execute(state_dir: &Path, command: Command) -> Result<i32> {
             println!("Approved {key} as {}{note}", crate::visible(&alias));
             eprintln!("Pairing completes on the next connection with that device.");
         }
-        Command::Rename { peer, new_name } => {
+        Command::Rename {
+            name_or_peer: peer,
+            new_name: Some(new_name),
+        } => {
             let request = ControlRequest::Rename {
                 peer,
                 alias: new_name.clone(),
@@ -1084,6 +1098,31 @@ async fn control(dir: &Path, request: ControlRequest) -> Result<ControlReply> {
     runtime::command(dir, request).await
 }
 
+async fn rename_self(dir: &Path, name: String) -> Result<()> {
+    load(dir)?;
+    check_device_name(&name).map_err(anyhow::Error::msg)?;
+    let path = dir.to_path_buf();
+    let new_name = name.clone();
+    let saved_offline = blocking(move || {
+        let _owner = match Owner::acquire(&path) {
+            Ok(owner) => owner,
+            Err(PairError::OwnedElsewhere) => return Ok(false),
+            Err(error) => return Err(anyhow!("{error:?}")),
+        };
+        let device = Device::open(&path, Offline, Clock::System).map_err(membership)?;
+        versions::rename_self(&device, &new_name)?;
+        Ok::<_, anyhow::Error>(true)
+    })
+    .await??;
+    if !saved_offline {
+        let reply =
+            runtime::command(dir, ControlRequest::RenameSelf { name: name.clone() }).await?;
+        ensure!(reply == ControlReply::Done, "unexpected rename reply");
+    }
+    println!("Renamed this device to {}", crate::visible(&name));
+    Ok(())
+}
+
 /// The running runtime's view, or a read-only one when it is not running.
 async fn current_view(dir: &Path) -> Result<runtime::StatusView> {
     if dir.join(CONTROL.marker).try_exists()? {
@@ -1109,9 +1148,12 @@ async fn status(dir: &Path) -> Result<()> {
         .map_err(membership)?;
     let endpoint = hex(profile.secret().public().as_bytes());
     if st.net.is_some() {
-        let roster = named_roster(dir).await?;
-        if let Some(name) = roster_name(&roster, &endpoint) {
-            println!("Name: {}", crate::visible(name));
+        let name = match versions::local_display_name(dir)? {
+            Some(name) => Some(name),
+            None => roster_name(&named_roster(dir).await?, &endpoint).map(str::to_owned),
+        };
+        if let Some(name) = name {
+            println!("Name: {}", crate::visible(&name));
         }
     }
     println!("Endpoint: {endpoint}");
@@ -1263,6 +1305,16 @@ async fn selected_peer(dir: &Path, selector: &str) -> Result<(PeerMatch, Option<
         .filter_map(|p| Some((p.alias.clone()?, *parse_endpoint(&p.key)?.as_bytes())))
         .collect();
     let roster = named_roster(dir).await?;
+    let roster: Vec<_> = view
+        .peers
+        .iter()
+        .filter_map(|peer| {
+            Some(RosterMember {
+                endpoint: *parse_endpoint(&peer.key)?.as_bytes(),
+                name: peer_name(peer, &roster).map(str::to_owned),
+            })
+        })
+        .collect();
     let selected = select_peer(
         selector,
         parse_endpoint(selector).map(|key| *key.as_bytes()),
@@ -1406,7 +1458,7 @@ async fn pick_peer(dir: &Path) -> Result<Option<String>> {
         let alias = peer
             .alias
             .as_deref()
-            .or_else(|| roster_name(&roster, &peer.key))
+            .or_else(|| peer_name(peer, &roster))
             .unwrap_or(&peer.key);
         eprintln!("  {}  {}", index + 1, crate::visible(alias));
     }
@@ -1439,7 +1491,7 @@ async fn peers(dir: &Path, full: bool) -> Result<()> {
         .map(String::from),
     ];
     rows.extend(view.peers.into_iter().map(|mut p: PeerView| {
-        let name = roster_name(&roster, &p.key).unwrap_or("-").to_owned();
+        let name = peer_name(&p, &roster).unwrap_or("-").to_owned();
         if terminal && !full {
             p.key.truncate(8);
         }
@@ -1455,6 +1507,11 @@ async fn peers(dir: &Path, full: bool) -> Result<()> {
     }));
     crate::print_table(&rows, terminal);
     Ok(())
+}
+
+fn peer_name<'a>(peer: &'a PeerView, roster: &'a [RosterMember]) -> Option<&'a str> {
+    peer.reported_name()
+        .or_else(|| roster_name(roster, &peer.key))
 }
 
 fn roster_name<'a>(roster: &'a [RosterMember], key: &str) -> Option<&'a str> {

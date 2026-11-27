@@ -760,6 +760,7 @@ pub fn operation(r: &ControlRequest) -> (&'static str, Option<&str>, Option<Serv
         ControlRequest::Peers => ("list_peers", None, None),
         ControlRequest::Ping { peer, .. } => ("ping", Some(peer), None),
         ControlRequest::Invite => ("issue_invite", None, None),
+        ControlRequest::RenameSelf { .. } => ("rename_self", None, None),
         ControlRequest::Approve { peer, .. } => ("approve", Some(peer), None),
         ControlRequest::Rename { peer, .. } => ("rename", Some(peer), None),
         ControlRequest::Decline { peer } => ("decline", Some(peer), None),
