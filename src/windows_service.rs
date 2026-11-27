@@ -23,17 +23,26 @@
 //! This file holds the decisions, which are tested on every platform. `native` holds the
 //! Win32 calls.
 
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::{OsStr, OsString},
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::mpsc,
+    thread,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
+use tempfile::NamedTempFile;
 
 #[cfg(windows)]
 mod native;
 #[cfg(windows)]
 pub use native::{
     Managed, control, install, is_default_shell, managed, private_audit, private_marker, serve,
-    serving, ssh_files, ssh_private_dir, until_stopped,
+    serving, ssh_files, ssh_private_dir, until_stopped, wait_for_activation,
 };
 
 #[derive(clap::Args)]
@@ -65,6 +74,86 @@ fn command_line(binary: &str, dir: &str, name: &str, shell: &str) -> Result<Stri
         profile_arguments(dir, name)?,
         quote(shell)?
     ))
+}
+
+/// The log of the last update queued from one of this device's shells, in the state
+/// directory.
+const UPDATE_LOG: &str = "update.log";
+/// Held, in the state directory, for as long as a queued update or its helper runs.
+const UPDATE_LOCK: &str = "update.lock";
+
+/// The command line of an update queued from one of this device's shells.
+fn update_command_line(binary: &str, dir: &str) -> Result<String> {
+    Ok(format!(
+        "{} --state-dir {} update",
+        quote(binary)?,
+        quote(dir)?
+    ))
+}
+
+/// The byte that lets a queued update act.
+const ACTIVATE: u8 = b'+';
+
+/// Wait up to `limit` for the activating byte on `gate`. The command that queued the update
+/// holds the only other end, so if that command ends first, however it ends, the pipe closes.
+fn await_activation(mut gate: impl Read + Send + 'static, limit: Duration) -> Result<()> {
+    let (send, received) = mpsc::channel();
+    // A pipe read has no time limit. A reader left waiting ends with the process.
+    thread::spawn(move || {
+        let mut byte = [0];
+        let _ = send.send(gate.read_exact(&mut byte).map(|()| byte[0]));
+    });
+    ensure!(
+        matches!(received.recv_timeout(limit), Ok(Ok(ACTIVATE))),
+        "the command that queued this update did not activate it, so the update did nothing"
+    );
+    Ok(())
+}
+
+/// Start a queued update writing to `log`, a new file of its own, and only once it is
+/// activated make that file `latest`. Returns where the log is. A refused start removes the new file and
+/// leaves `latest` as it was. If `latest` cannot be replaced (Windows refuses while a program
+/// holds it open), the update is already active, so its log stays under its own name.
+fn start_logged(
+    log: NamedTempFile,
+    latest: &Path,
+    start: impl FnOnce(&File) -> Result<()>,
+) -> Result<PathBuf> {
+    start(log.as_file())?;
+    Ok(match log.persist(latest) {
+        Ok(_) => latest.to_owned(),
+        Err(refused) => {
+            let mut log = refused.file;
+            log.disable_cleanup(true);
+            log.path().to_owned()
+        }
+    })
+}
+
+/// The UTF-16 environment block of a queued update: `variables` without the one that names the
+/// runtime serving this shell, each NUL-terminated and sorted by name ignoring case, then one
+/// more NUL.
+fn environment_block(
+    variables: impl Iterator<Item = (OsString, OsString)>,
+    encode: impl Fn(&OsStr) -> Vec<u16>,
+) -> Vec<u16> {
+    let mut variables: Vec<_> = variables
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(crate::private::HOST_ENV))
+        .collect();
+    variables.sort_by_cached_key(|(name, _)| name.to_string_lossy().to_uppercase());
+    let mut block = Vec::new();
+    for (name, value) in variables {
+        block.extend(encode(&name));
+        block.push(u16::from(b'='));
+        block.extend(encode(&value));
+        block.push(0);
+    }
+    // An empty block is still two NULs.
+    if block.is_empty() {
+        block.push(0);
+    }
+    block.push(0);
+    block
 }
 
 /// The part of the command line that identifies a profile's service.
@@ -391,11 +480,94 @@ mod tests {
             &name
         ));
 
+        // A queued update names the same program and profile, quoted the same way.
+        assert_eq!(
+            update_command_line(r"C:\Users\A & B\bin\massrelay.exe", dir)?,
+            r#""C:\Users\A & B\bin\massrelay.exe" --state-dir "C:\Users\A & B\My Profile\\" update"#
+        );
+
         // A quote would end the argument; '%' would be expanded by the service manager.
         assert!(quote("C:\\a\" --shell \"C:\\evil.exe").is_err());
         assert!(quote(r"C:\Users\%USERNAME%\bin").is_err());
         assert!(quote("C:\\a\nb").is_err());
         Ok(())
+    }
+
+    #[test]
+    fn only_a_started_update_replaces_the_previous_log() -> Result<()> {
+        use std::{fs, io::Write as _};
+
+        let dir = tempfile::tempdir()?;
+        let latest = dir.path().join(UPDATE_LOG);
+        fs::write(&latest, "previous diagnostics")?;
+        let files = || fs::read_dir(dir.path()).map(Iterator::count);
+        let write = |mut log: &File, text: &str| log.write_all(text.as_bytes());
+
+        let refused = start_logged(NamedTempFile::new_in(dir.path())?, &latest, |log| {
+            write(log, "partial")?;
+            anyhow::bail!("refused")
+        });
+        assert!(refused.is_err());
+        assert_eq!(fs::read_to_string(&latest)?, "previous diagnostics");
+        assert_eq!(files()?, 1);
+
+        let path = start_logged(NamedTempFile::new_in(dir.path())?, &latest, |log| {
+            Ok(write(log, "started")?)
+        })?;
+        assert_eq!(path, latest);
+        assert_eq!(fs::read_to_string(&latest)?, "started");
+        assert_eq!(files()?, 1);
+
+        // A directory cannot be replaced by a file: the running update keeps its own log.
+        let held = dir.path().join("held");
+        fs::create_dir(&held)?;
+        let path = start_logged(NamedTempFile::new_in(dir.path())?, &held, |log| {
+            Ok(write(log, "running")?)
+        })?;
+        assert_ne!(path, held);
+        assert_eq!(fs::read_to_string(path)?, "running");
+        Ok(())
+    }
+
+    #[test]
+    fn a_queued_update_acts_only_when_its_queuing_command_says_so() -> Result<()> {
+        use std::{io::Write as _, time::Instant};
+
+        let patient = Duration::from_secs(30);
+        for (said, activated) in [(Some(ACTIVATE), true), (Some(0), false), (None, false)] {
+            let (gate, mut command) = std::io::pipe()?;
+            if let Some(byte) = said {
+                command.write_all(&[byte])?;
+            }
+            // The command ends, or is ended: its end of the pipe closes.
+            drop(command);
+            let started = Instant::now();
+            assert_eq!(await_activation(gate, patient).is_ok(), activated);
+            assert!(started.elapsed() < patient);
+        }
+        // It neither activates the update nor ends.
+        let (gate, _command) = std::io::pipe()?;
+        assert!(await_activation(gate, Duration::from_millis(50)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn the_queued_environment_drops_the_shell_marker_and_ends_with_two_nuls() {
+        let block = |variables: &[(&str, &str)]| {
+            environment_block(
+                variables
+                    .iter()
+                    .map(|&(name, value)| (name.into(), value.into())),
+                |text| text.to_string_lossy().encode_utf16().collect(),
+            )
+        };
+        assert_eq!(block(&[]), [0, 0]);
+        assert_eq!(block(&[("MassRelay_Shell_Host", "1")]), [0, 0]);
+        let expected: Vec<u16> = "a=1\0B=2\0\0".encode_utf16().collect();
+        assert_eq!(
+            block(&[("B", "2"), (crate::private::HOST_ENV, "1"), ("a", "1")]),
+            expected
+        );
     }
 
     #[test]

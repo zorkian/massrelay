@@ -87,7 +87,10 @@ use crate::{
     },
 };
 
+mod queued_update;
 pub mod ssh_files;
+
+pub use queued_update::wait_for_activation;
 
 const ELEVATE: &str =
     "Windows lets only an elevated PowerShell (Run as administrator) manage services";
@@ -412,8 +415,7 @@ impl crate::update::Service for Managed {
     }
 }
 
-/// Windows PowerShell, by its full path in the system directory.
-fn powershell() -> Result<String> {
+fn system_directory() -> Result<PathBuf> {
     let mut buffer = [0u16; 260];
     // SAFETY: the buffer is writable for the length given.
     let len = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
@@ -421,8 +423,12 @@ fn powershell() -> Result<String> {
         len > 0 && len < buffer.len(),
         "cannot find the Windows system directory"
     );
-    let path = PathBuf::from(String::from_utf16_lossy(&buffer[..len]))
-        .join(r"WindowsPowerShell\v1.0\powershell.exe");
+    Ok(PathBuf::from(String::from_utf16_lossy(&buffer[..len])))
+}
+
+/// Windows PowerShell, by its full path in the system directory.
+fn powershell() -> Result<String> {
+    let path = system_directory()?.join(r"WindowsPowerShell\v1.0\powershell.exe");
     ensure!(
         path.is_file(),
         "Windows PowerShell is not at {}; choose a shell with --shell",
@@ -724,13 +730,25 @@ impl PrivateFile {
     }
 
     fn open(&self, path: &Path, access: u32, disposition: u32) -> io::Result<File> {
+        let share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+        self.open_sharing(path, access, share, disposition)
+    }
+
+    /// `open`, letting others have only the access in `share` while the file stays open.
+    fn open_sharing(
+        &self,
+        path: &Path,
+        access: u32,
+        share: u32,
+        disposition: u32,
+    ) -> io::Result<File> {
         let name: Vec<_> = path.as_os_str().encode_wide().chain([0]).collect();
         // SAFETY: the path is NUL-terminated and the security descriptor is live.
         let handle = unsafe {
             CreateFileW(
                 name.as_ptr(),
                 access,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                share,
                 &self.0,
                 disposition,
                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,

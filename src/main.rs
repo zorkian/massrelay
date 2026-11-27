@@ -6,6 +6,10 @@ mod background_service;
 mod background_service;
 mod connection_log;
 mod grants;
+// Linux has no launchd; this builds the macOS service code there and tests its portable part.
+#[cfg(all(test, target_os = "linux"))]
+#[allow(dead_code)]
+mod launch_agent;
 mod local;
 #[allow(dead_code)]
 mod mailbox;

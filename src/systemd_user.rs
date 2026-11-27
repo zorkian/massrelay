@@ -116,6 +116,38 @@ pub struct Managed {
     path: PathBuf,
 }
 
+impl Managed {
+    /// Hand the update to a separate user service, outside the daemon's session lifetime.
+    pub(crate) fn queue_update(&self, program: &Path) -> Result<String> {
+        let unit = self
+            .unit
+            .replacen("massrelay-client", "massrelay-update", 1);
+        let state = self
+            .dir
+            .to_str()
+            .context("the state directory is not UTF-8")?
+            .replace('$', "$$");
+        let unset = format!("UnsetEnvironment={}", crate::private::HOST_ENV);
+        let queued = crate::update::run_within(
+            user_manager("systemd-run")
+                .args(["--collect", "--unit", &unit])
+                .args(["--property=Type=exec", "--property", &unset, "--"])
+                .arg(program)
+                .args(["--state-dir", &state, "update"]),
+            crate::update::MANAGER_LIMIT,
+        )
+        .context("start a detached MassRelay update with systemd-run")?;
+        ensure!(
+            queued.success,
+            "could not start {unit}: {}. Check 'journalctl --user -u {unit}'",
+            queued.stderr.trim()
+        );
+        Ok(format!(
+            "Update queued as {unit}. Exit this shell so sessions can drain.\nUpdate log     journalctl --user -u {unit}"
+        ))
+    }
+}
+
 pub fn managed(dir: &Path) -> Result<Managed> {
     let dir = dir
         .canonicalize()
@@ -209,10 +241,23 @@ fn manager_state(shown: &str) -> Result<crate::update::Manager> {
 /// `systemctl --user`, within the limit an update gives one request to a service manager.
 fn bounded(args: &[&str]) -> Result<crate::update::Finished> {
     crate::update::run_within(
-        Command::new("systemctl").arg("--user").args(args),
+        user_manager("systemctl").args(args),
         crate::update::MANAGER_LIMIT,
     )
     .context("run systemctl --user")
+}
+
+/// `program --user`. A MassRelay SSH session is not a login session, so nothing there sets
+/// `XDG_RUNTIME_DIR`, without which systemd's tools cannot find the user manager.
+fn user_manager(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.arg("--user");
+    if env::var_os("XDG_RUNTIME_DIR").is_none() {
+        // SAFETY: `getuid` has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        command.env("XDG_RUNTIME_DIR", format!("/run/user/{uid}"));
+    }
+    command
 }
 
 /// Whether every command a generated unit starts is `program` running the profile in `dir`.
@@ -351,6 +396,82 @@ fn systemctl(args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "runs a disposable transient service under your systemd user manager"]
+    fn a_queued_update_runs_detached_once_at_a_time() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        // The release workflow runs every ignored test, on runners that may have no manager.
+        if env::var_os("MASSRELAY_ACCEPTANCE_SYSTEMD_USER").is_none() {
+            return Ok(());
+        }
+        ensure!(
+            bounded(&["show-environment"])?.success,
+            "systemd user manager is unavailable"
+        );
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path().join("state & ${HOME} $$ %i");
+        fs::create_dir(&dir)?;
+        let program = temp.path().join("fixture ${HOME} $$ %i updater");
+        // Each run waits to be released, for a bounded time. Only the first one fails.
+        fs::write(
+            &program,
+            r#"#!/bin/sh
+set -eu
+[ "$#" = 3 ]
+[ "$1" = --state-dir ]
+[ "$3" = update ]
+[ -z "${MASSRELAY_SHELL_HOST+x}" ]
+echo run >>"$2/runs"
+waited=0
+while [ ! -e "$2/release" ]; do
+    [ "$waited" -lt 200 ]
+    waited=$((waited + 1))
+    sleep 0.05
+done
+[ "$(wc -l <"$2/runs")" -gt 1 ]
+"#,
+        )?;
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700))?;
+        let managed = Managed {
+            unit: unit_name(&dir, None),
+            path: dir.join("unused.service"),
+            dir: dir.clone(),
+        };
+        let release = dir.join("release");
+        let unit = managed
+            .unit
+            .replacen("massrelay-client", "massrelay-update", 1);
+        for run in 1..=2 {
+            // Queueing returns while the updater is still waiting.
+            managed.queue_update(&program)?;
+            let shown = bounded(&["show", "--property=UnsetEnvironment", &unit])?;
+            assert_eq!(
+                shown.stdout.trim(),
+                format!("UnsetEnvironment={}", crate::private::HOST_ENV)
+            );
+            assert!(
+                managed.queue_update(&program).is_err(),
+                "{unit} was queued twice"
+            );
+            fs::write(&release, "")?;
+            // A finished unit is unloaded, failed or not, so its name can be used again.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while bounded(&["show", "--property=LoadState", &unit])?
+                .stdout
+                .trim()
+                != "LoadState=not-found"
+            {
+                assert!(Instant::now() < deadline, "{unit} is still loaded");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(fs::read_to_string(dir.join("runs"))?, "run\n".repeat(run));
+            fs::remove_file(&release)?;
+        }
+        Ok(())
+    }
 
     #[test]
     fn unit_uses_the_selected_profile_and_quotes_paths() -> Result<()> {

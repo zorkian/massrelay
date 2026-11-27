@@ -338,7 +338,7 @@ fn check_exclusive(dir: &Path, own: u32) -> Result<()> {
 /// directly, with no symbolic link on the way, and it and every directory above it must be
 /// exclusive (`check_exclusive`).
 #[cfg(unix)]
-fn check_ancestry(dir: &Path) -> Result<()> {
+pub(crate) fn check_ancestry(dir: &Path) -> Result<()> {
     let own = own_uid()?;
     let resolved = dir
         .canonicalize()
@@ -1812,6 +1812,8 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) 
 
 /// The `update` command.
 pub async fn run(state_dir: &Path) -> Result<i32> {
+    #[cfg(windows)]
+    crate::background_service::wait_for_activation()?;
     ensure!(
         cli::profile_exists(state_dir),
         "no device profile in {}; there is no service to update",
@@ -1823,6 +1825,37 @@ pub async fn run(state_dir: &Path) -> Result<i32> {
     let profile = state_dir.join(cli::DIR_NAME);
     let host = live(&state_dir)?;
     let timing = Timing::default();
+
+    if let Some(pid) = std::env::var(crate::private::HOST_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        && host.service.state()? == Manager::Running(pid)
+    {
+        // Recovery can wait for idle, too. Leave this session before touching its journal.
+        let program = std::env::current_exe().context("find the running MassRelay executable")?;
+        let queued = blocking(move || {
+            #[cfg(unix)]
+            {
+                let parent = program
+                    .parent()
+                    .context("the MassRelay executable has no parent directory")?;
+                check_ancestry(parent)?;
+                check_program(&program)?;
+                ensure!(
+                    host.service.launches(&program)?,
+                    "run the copy of MassRelay configured for this device's background service"
+                );
+            }
+            host.service.queue_update(&program)
+        })
+        .await??;
+        #[cfg(windows)]
+        let queued = format!(
+            "Update queued. Exit this shell so sessions can drain.\nUpdate log     {queued}"
+        );
+        say(queued);
+        return Ok(0);
+    }
 
     // An unfinished update comes first. Recovery may replace the installed program, which on
     // Windows this process maps, so there it runs in the helper.

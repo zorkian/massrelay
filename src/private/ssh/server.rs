@@ -23,6 +23,32 @@ const SSHD: &str = "/usr/sbin/sshd";
 const HOST_FILE: &str = "ssh-host-ed25519";
 const TEMP_DIR: &str = "/tmp";
 
+#[cfg(target_os = "linux")]
+fn has_user_bus(runtime: &Path, uid: u32) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    std::fs::symlink_metadata(runtime)
+        .is_ok_and(|dir| dir.is_dir() && dir.uid() == uid && dir.mode() & 0o077 == 0)
+        && std::fs::symlink_metadata(runtime.join("bus"))
+            .is_ok_and(|bus| bus.file_type().is_socket() && bus.uid() == uid)
+}
+
+fn session_environment() -> String {
+    let host = format!("SetEnv={}={}", crate::private::HOST_ENV, std::process::id());
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: geteuid is infallible and has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let runtime = format!("/run/user/{uid}");
+        if has_user_bus(Path::new(&runtime), uid) {
+            return format!(
+                "{host} XDG_RUNTIME_DIR={runtime} DBUS_SESSION_BUS_ADDRESS=unix:path={runtime}/bus"
+            );
+        }
+    }
+    host
+}
+
 async fn account() -> Result<String> {
     unsafe extern "C" {
         fn getuid() -> u32;
@@ -188,11 +214,7 @@ impl Prepared {
             .arg("-o")
             .arg(format!("AllowUsers={}", self.user))
             .arg("-o")
-            .arg(format!(
-                "SetEnv={}={}",
-                crate::private::HOST_ENV,
-                std::process::id()
-            ))
+            .arg(session_environment())
             .arg("-h")
             .arg(dir.join(HOST_FILE))
             .arg("-o")
@@ -282,4 +304,31 @@ async fn ssh_audit_socket_only_accepts_the_connected_peer_after_preparation() {
             .kind(),
         io::ErrorKind::ConnectionRefused
     );
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn ssh_only_exports_a_bus_in_the_accounts_private_runtime_directory() {
+    use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixListener;
+
+    let directory = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let path = directory.path();
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    let bus = path.join("bus");
+    assert!(!has_user_bus(path, uid));
+    let listener = UnixListener::bind(&bus).unwrap();
+    assert!(has_user_bus(path, uid));
+    assert!(!has_user_bus(path, uid ^ 1));
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o770)).unwrap();
+    assert!(!has_user_bus(path, uid));
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    drop(listener);
+    std::fs::rename(&bus, path.join("elsewhere")).unwrap();
+    symlink(path.join("elsewhere"), &bus).unwrap();
+    assert!(!has_user_bus(path, uid));
 }

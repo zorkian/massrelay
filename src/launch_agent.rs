@@ -12,6 +12,9 @@ use tempfile::NamedTempFile;
 
 use crate::{ServiceAction, default_state_dir, private::cli};
 
+#[path = "launch_agent/update_job.rs"]
+mod update_job;
+
 const LABEL: &str = "com.massrelay.client";
 
 /// The audit path used by installed LaunchAgents, including older installs.
@@ -165,6 +168,28 @@ impl Managed {
         let printed = bounded(&mut launchctl("print", &self.target()))?;
         Ok(printed.success.then_some(printed.stdout))
     }
+
+    /// Run `massrelay update` for this profile with `program`, the installed program the
+    /// service starts, as a launchd job of its own, which outlives the calling command and
+    /// its shell. At most one such job runs at a time. Returns what to tell the person who
+    /// asked: whether it was started or was already under way, and how to follow it.
+    pub fn queue_update(&self, program: &Path) -> Result<String> {
+        ensure!(
+            crate::update::Service::launches(self, program)?,
+            "the service {} is not set up to start {} for this profile. Run 'massrelay \
+             install' again, then 'massrelay update'",
+            self.job.label,
+            program.display()
+        );
+        update_job::OneShot {
+            domain: &self.domain,
+            label: format!("{}.update", self.job.label),
+            program,
+            dir: &self.dir,
+            log: &self.job.update_log,
+        }
+        .queue(&|args| bounded(Command::new("/bin/launchctl").args(args)))
+    }
 }
 
 /// `login_domain`, with each request bounded, for the update.
@@ -300,6 +325,8 @@ struct Job {
     label: String,
     plist: PathBuf,
     events: PathBuf,
+    /// The output of the last update that ran as a job of its own.
+    update_log: PathBuf,
 }
 
 impl Job {
@@ -324,6 +351,7 @@ impl Job {
         Ok(Self {
             plist: library.join("LaunchAgents").join(format!("{label}.plist")),
             events: logs.join(format!("{name}-connections.jsonl")),
+            update_log: logs.join(format!("{name}-update.log")),
             label,
         })
     }
@@ -425,7 +453,8 @@ fn checked(command: &mut Command, action: &str) -> Result<Output> {
     Ok(result)
 }
 
-#[cfg(test)]
+// These read property lists with macOS's own tool.
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 
