@@ -104,7 +104,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
@@ -120,7 +120,9 @@ use super::codec::{hex, unhex};
 use super::mailbox::Mailbox;
 use super::membership::{Clock, Device, MemberView};
 use super::pairing::{self, Decision, Owner, PairError, PairingState, Refusal};
-use super::service::{CLOSE_AUTHORITY_ENDED, CLOSE_DONE, Node, PrivateRequest, ServiceStream};
+use super::service::{
+    CLOSE_AUTHORITY_ENDED, CLOSE_DONE, Node, PrivateRequest, ServiceStream, max_payload_frame,
+};
 use super::versions::{Observation, Observations, PeerVersions};
 
 /// The private runtime's local control channel.
@@ -133,6 +135,7 @@ pub const CONTROL: Channel = Channel {
 
 /// Bound on joining each task group during `stop`.
 const STOP_WAIT: Duration = Duration::from_secs(10);
+pub const MAX_PING_COUNT: u16 = 1000;
 
 // ------------------------------------------------------------------ protocol
 
@@ -142,6 +145,10 @@ pub enum ControlRequest {
     Status,
     Peers,
     Invite,
+    Ping {
+        peer: String,
+        count: u16,
+    },
     /// Approve `peer` (endpoint key, or an alias already pinned to one) and
     /// pin `alias` to it.
     Approve {
@@ -227,6 +234,8 @@ pub enum ControlReply {
     },
     Shell,
     Connected,
+    PingStarted,
+    PingSample(Option<u64>),
     /// The exposure is live; a final `Done` or `Error` follows when it ends.
     Exposed {
         key: String,
@@ -736,6 +745,28 @@ async fn serve_control<M: Mailbox + Send + Sync + 'static>(
         return wire::send(&mut socket, reply).await;
     }
     match request {
+        ControlRequest::Ping { peer, count } => {
+            let (mut rx, mut tx) = socket.into_split();
+            let mut byte = [0];
+            let result = tokio::select! {
+                biased;
+                _ = rx.read(&mut byte) => {
+                    audit("failed", Some("local_client_closed"));
+                    return Ok(());
+                }
+                result = ping_peer(&shared, &peer, count, &mut tx) => result,
+            };
+            match result {
+                Ok(()) => {
+                    audit("allowed", None);
+                    wire::send(&mut tx, ControlReply::Done).await
+                }
+                Err(e) => {
+                    audit("failed", Some("ping_failed"));
+                    wire::send(&mut tx, ControlReply::Error(e.to_string())).await
+                }
+            }
+        }
         ControlRequest::Shell {
             peer,
             elevated,
@@ -911,7 +942,8 @@ fn manage<M: Mailbox + Send + Sync + 'static>(
             ControlRequest::ClearExclusion { peer: p, service } => {
                 ControlReply::Changed(node.clear_exclusion(&peer(&p)?, service).map_err(err)?)
             }
-            ControlRequest::Shell { .. }
+            ControlRequest::Ping { .. }
+            | ControlRequest::Shell { .. }
             | ControlRequest::Connect { .. }
             | ControlRequest::Expose { .. } => {
                 return Err("not a management command".into());
@@ -987,6 +1019,70 @@ async fn hold_exposure<M: Mailbox + Send + Sync + 'static>(
     Ok(())
 }
 
+fn peer_address<M: Mailbox>(shared: &Shared<M>, key: &EndpointKey) -> Result<EndpointAddr> {
+    let addr = (shared.addresses)(key).context("no address is known for this peer")?;
+    ensure!(
+        addr.id.as_bytes() == key,
+        "the peer's address names a different endpoint"
+    );
+    Ok(addr)
+}
+
+async fn ping_peer<M: Mailbox + Send + Sync + 'static>(
+    shared: &Shared<M>,
+    peer: &str,
+    count: u16,
+    tx: &mut (impl AsyncWrite + Unpin),
+) -> Result<()> {
+    ensure!(
+        (1..=MAX_PING_COUNT).contains(&count),
+        "ping count must be between 1 and {MAX_PING_COUNT}"
+    );
+    let state = shared
+        .node
+        .pairing_state()
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let key = resolve(&state, peer).map_err(anyhow::Error::msg)?;
+    let addr = peer_address(shared, &key)?;
+    let opened = timeout(
+        wire::RPC_TIMEOUT * 2,
+        shared.node.open_ping(&shared.endpoint, addr),
+    )
+    .await
+    .context("the peer did not answer in time")?;
+    audit::observe(&shared.node, false);
+    let stream = opened.map_err(|e| match e {
+        PairError::Refused(Refusal::ConnectionClosed) | PairError::Local(_) => anyhow::anyhow!(
+            "could not start ping: {e:?}. Check that the peer is online and both daemons support ping"
+        ),
+        _ => anyhow::anyhow!("could not start ping: {e:?}"),
+    })?;
+    let samples = async {
+        if let ServiceReply::Refused { message, .. } = &stream.reply {
+            bail!("the peer refused: {message}");
+        }
+        wire::send(tx, ControlReply::PingStarted).await?;
+        let mut ticks = tokio::time::interval(Duration::from_secs(1));
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        for _ in 0..count {
+            ticks.tick().await;
+            let elapsed = stream.probe().await?.map(|rtt| rtt.as_micros() as u64);
+            wire::send(tx, ControlReply::PingSample(elapsed)).await?;
+        }
+        Ok(())
+    };
+    let (result, reason) = tokio::select! {
+        biased;
+        why = stream.done() => (
+            Err(anyhow::anyhow!("ping connection ended: {why:?}")),
+            CLOSE_AUTHORITY_ENDED,
+        ),
+        result = samples => (result, CLOSE_DONE),
+    };
+    stream.conn.close(0u32.into(), reason);
+    result
+}
+
 /// Open a service on a peer for a local command and attach it. The
 /// command's lifetime socket ends the session at once, at any point: during
 /// setup, while a reply or data write is backed up, and during the final
@@ -1027,16 +1123,7 @@ async fn outbound<M: Mailbox + Send + Sync + 'static>(
             .map_err(|e| ("setup_failed", format!("{e:?}")))?;
         let key = resolve(&st, selector).map_err(|e| ("unknown_peer", e))?;
         track.peer(log, &key);
-        let addr = (shared.addresses)(&key).ok_or_else(|| {
-            (
-                "setup_failed",
-                "no address is known for this peer".to_string(),
-            )
-        })?;
-        if addr.id.as_bytes() != &key {
-            let e = "the peer's address names a different endpoint".to_string();
-            return Err(("setup_failed", e));
-        }
+        let addr = peer_address(shared, &key).map_err(|e| ("setup_failed", e.to_string()))?;
         let opened = shared.node.open_service(&shared.endpoint, addr, req).await;
         // The exchange may have learned a decision or paired.
         audit::observe(&shared.node, false);
@@ -1082,7 +1169,7 @@ async fn outbound<M: Mailbox + Send + Sync + 'static>(
         _ => ControlReply::Connected,
     };
     track.connected(Some(&stream.conn));
-    let max_frame = stream.max_frame();
+    let max_frame = max_payload_frame(service);
     let ServiceStream {
         conn,
         auth,
@@ -1212,7 +1299,7 @@ fn peer_cut_reason(conn: &iroh::endpoint::Connection) -> &'static str {
 // ------------------------------------------------------------- client side
 
 /// Send one command to the private runtime of `dir`; the socket is
-/// returned for shell and connect.
+/// returned for shell, connect, and ping.
 pub async fn request(dir: &Path, request: ControlRequest) -> Result<(TcpStream, ControlReply)> {
     timeout(wire::RPC_TIMEOUT * 3, async {
         let mut socket = local::connect_on(dir, &CONTROL).await?;

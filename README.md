@@ -70,6 +70,8 @@ massrelay shell workstation
 
 Pairing completes on the next connection attempt. You can set a grant before pairing. It takes effect after both devices approve each other. Use `massrelay peers` to see membership and pairing decisions. Run `massrelay connect` in a terminal to pick an approved device, or give it a peer and service directly.
 
+Run `massrelay ping PEER` to send four encrypted QUIC datagram probes and see round-trip times and packet loss. Set the count with `-c`. Ping requires mutual approval and works over direct or relayed connections. Upgrade and restart both devices' daemons to use ping.
+
 Run `massrelay decline PEER` to end a pairing. Run `massrelay revoke PEER` to cut off the peer locally and remove it from the network when membership sync completes.
 
 ## Share services

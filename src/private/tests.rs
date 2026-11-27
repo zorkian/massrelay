@@ -4250,6 +4250,13 @@ mod service {
             drop(first);
             assert!(events.try_recv().is_err());
 
+            let ping = source
+                .open_ping(&a, addr.clone())
+                .await
+                .map_err(pair_error)?;
+            assert!(matches!(ping.reply, ServiceReply::Ready));
+            assert!(ping.probe().await?.is_some());
+
             destination.grant(&alice.ep, service).map_err(pair_error)?;
             let mut stream = source
                 .open_service(&a, addr, request)
@@ -4266,6 +4273,14 @@ mod service {
             assert_eq!(connections.len(), 1);
             assert_eq!(connections[0].service, service);
             assert_eq!(connections[0].route, crate::private::audit::Route::Relayed);
+            assert!(
+                destination
+                    .cutoff(&alice.ep)
+                    .map_err(pair_error)?
+                    .local_cutoff
+            );
+            closed_with(&ping, CLOSE_AUTHORITY_ENDED).await;
+            assert!(ping.probe().await.is_err());
             Ok::<_, anyhow::Error>(())
         })
         .await??;
@@ -5539,7 +5554,29 @@ mod runtime {
         let rb = run(&bob, &book, n.mailbox.clone(), None).await;
         cmd(&alice, approve(&bob, "bob")).await;
         cmd(&bob, approve(&alice, "alice")).await;
-        let _ = shell_to(&alice, "bob").await;
+        let (mut ping, reply) = rt::request(
+            &alice.path,
+            ControlRequest::Ping {
+                peer: "bob".into(),
+                count: 1000,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply, ControlReply::PingStarted);
+        assert!(matches!(
+            wire::recv(&mut ping).await.unwrap(),
+            ControlReply::PingSample(Some(_))
+        ));
+        assert!(ra.live_sessions() > 0 && rb.live_sessions() > 0);
+        drop(ping);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while ra.live_sessions() > 0 || rb.live_sessions() > 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("both ping sessions end when the control client disconnects");
         let enable = |service| ControlRequest::Enable {
             peer: "alice".into(),
             service,

@@ -11,8 +11,9 @@
 //!    gate (a key outside the accepted roster gets nothing, not even the
 //!    group tag), the fresh mutual-consent offer and confirmation (each send
 //!    guarded against a concurrent local decline, each record read bounded
-//!    by its exact encoded size), then one fixed-size `PrivateRequest`, the
-//!    reply, and the payload.
+//!    by its exact encoded size), then one fixed-size request and its reply.
+//!    A ping request echoes fixed-size QUIC datagrams while pairing authority
+//!    lasts. Service requests carry their payload on the stream.
 //! 3. The authorization is registered with the owner's session registry in
 //!    the same critical section that commits the exchange, and stays
 //!    registered until the connection's final teardown. A decline, cutoff,
@@ -119,6 +120,8 @@ pub const CLOSE_DONE: &[u8] = b"done";
 
 const REQUEST_VERSION: u8 = 1;
 const REQUEST_LEN: usize = 8;
+const PING_REQUEST: [u8; REQUEST_LEN] = [REQUEST_VERSION, 6, 0, 0, 0, 0, 0, 0];
+const PING_BYTES: usize = 16;
 
 // Every refusal text a private destination sends. The reply bound is the
 // largest encoding of any of them, so it is a property of the format.
@@ -727,6 +730,20 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
             why = auth.done() => return (over(why), None),
             r = read_bounded(rx, &[REQUEST_LEN]) => r,
         };
+        if read.as_deref().is_ok_and(|bytes| bytes == PING_REQUEST) {
+            let ended = tokio::select! {
+                biased;
+                why = auth.done() => over(why),
+                result = echo_ping(conn, auth, tx, rx) => match result {
+                    Ok(ended) => {
+                        conn.close(0u32.into(), CLOSE_DONE);
+                        ended
+                    }
+                    Err(why) => over(why),
+                },
+            };
+            return (ended, None);
+        }
         let Some(req) = read.ok().and_then(|b| PrivateRequest::decode(&b)) else {
             conn.close(0u32.into(), CLOSE_DONE);
             return (Ended::BadRequest, None);
@@ -896,8 +913,25 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
     pub async fn open_service(
         &self,
         endpoint: &Endpoint,
-        mut addr: EndpointAddr,
+        addr: EndpointAddr,
         req: PrivateRequest,
+    ) -> Result<ServiceStream, PairError> {
+        self.open_request(endpoint, addr, &req.encode()).await
+    }
+
+    pub(super) async fn open_ping(
+        &self,
+        endpoint: &Endpoint,
+        addr: EndpointAddr,
+    ) -> Result<ServiceStream, PairError> {
+        self.open_request(endpoint, addr, &PING_REQUEST).await
+    }
+
+    async fn open_request(
+        &self,
+        endpoint: &Endpoint,
+        mut addr: EndpointAddr,
+        request: &[u8],
     ) -> Result<ServiceStream, PairError> {
         self.check_endpoint(endpoint)?;
         let local = |e: &dyn std::fmt::Display| PairError::Local(format!("service: {e}"));
@@ -921,7 +955,7 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
         let (auth, mut tx, mut rx) = self.peers().authorize(&conn, true).await?;
         let versions = self.versions.exchange(&conn, &auth);
         let io = async {
-            crate::wire::frame(&mut tx, &req.encode())
+            crate::wire::frame(&mut tx, request)
                 .await
                 .map_err(|e| local(&e))?;
             let bytes = wire::read_frame_max(&mut rx, max_reply_len())
@@ -948,12 +982,45 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
         Ok(ServiceStream {
             conn,
             auth,
-            service: req.service,
             tx,
             rx,
             reply,
             _versions: versions,
         })
+    }
+}
+
+/// Echo only fixed-size datagrams on this already-paired connection.
+async fn echo_ping(
+    conn: &Connection,
+    auth: &Authorization,
+    tx: &mut SendStream,
+    rx: &mut RecvStream,
+) -> Result<Ended, Refusal> {
+    if wire::send(tx, ServiceReply::Ready).await.is_err() {
+        return Ok(Ended::PeerDisconnected);
+    }
+    let mut byte = [0];
+    loop {
+        let datagram = tokio::select! {
+            biased;
+            _ = rx.read(&mut byte) => return Ok(Ended::StreamClosed),
+            result = tokio::time::timeout(wire::RPC_TIMEOUT, conn.read_datagram()) => result,
+        };
+        let Ok(Ok(datagram)) = datagram else {
+            return Ok(Ended::StreamClosed);
+        };
+        if datagram.len() != PING_BYTES {
+            return Ok(Ended::BadRequest);
+        }
+        if auth
+            .while_authorized(|| conn.send_datagram(datagram))?
+            .is_err()
+        {
+            return Ok(Ended::StreamClosed);
+        }
+        // Keep the ungranted echo workload bounded even for a paired flooder.
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -1067,7 +1134,6 @@ pub struct ServiceStream {
     /// Disjoint from the streams, so `auth.done()` can be awaited while
     /// they are copied.
     pub auth: Authorization,
-    pub service: Service,
     pub tx: SendStream,
     pub rx: RecvStream,
     pub reply: ServiceReply,
@@ -1075,6 +1141,30 @@ pub struct ServiceStream {
 }
 
 impl ServiceStream {
+    /// Time a single UDP-style probe. A reply arriving after the deadline
+    /// can never match the next probe's random payload.
+    pub(super) async fn probe(&self) -> anyhow::Result<Option<Duration>> {
+        let payload = super::codec::random::<PING_BYTES>();
+        let start = tokio::time::Instant::now();
+        self.auth
+            .while_authorized(|| self.conn.send_datagram(payload.to_vec().into()))
+            .map_err(|why| anyhow::anyhow!("ping authorization ended: {why:?}"))??;
+        let deadline = tokio::time::sleep_until(start + Duration::from_secs(1));
+        tokio::pin!(deadline);
+        loop {
+            let reply = tokio::select! {
+                biased;
+                why = self.auth.done() => anyhow::bail!("ping connection ended: {why:?}"),
+                _ = &mut deadline => return Ok(None),
+                result = self.conn.read_datagram() => result?,
+            };
+            if reply.as_ref() == payload {
+                return Ok(Some(start.elapsed()));
+            }
+            tokio::task::consume_budget().await;
+        }
+    }
+
     /// Resolve when this connection's authority ends or it closes.
     pub async fn done(&self) -> Refusal {
         self.auth.done().await
@@ -1082,10 +1172,5 @@ impl ServiceStream {
 
     pub fn status(&self) -> Result<(), Refusal> {
         self.auth.status()
-    }
-
-    /// Largest payload frame the destination may send on this stream.
-    pub fn max_frame(&self) -> usize {
-        max_payload_frame(self.service)
     }
 }

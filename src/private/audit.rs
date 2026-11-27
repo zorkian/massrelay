@@ -745,6 +745,7 @@ pub fn operation(r: &ControlRequest) -> (&'static str, Option<&str>, Option<Serv
     match r {
         ControlRequest::Status => ("status", None, None),
         ControlRequest::Peers => ("list_peers", None, None),
+        ControlRequest::Ping { peer, .. } => ("ping", Some(peer), None),
         ControlRequest::Invite => ("issue_invite", None, None),
         ControlRequest::Approve { peer, .. } => ("approve", Some(peer), None),
         ControlRequest::Decline { peer } => ("decline", Some(peer), None),

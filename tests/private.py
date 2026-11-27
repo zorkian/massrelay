@@ -307,12 +307,15 @@ def _exercise(binary, root, processes):
     # ------------------------------------------------------ pairing and services
     # Unapproved: refused, and nothing is paired.
     terminal("b", a, False)
+    assert cli("b", "ping", a, "-c", "1", check=False).returncode == 1
     cli("a", "approve", b, "--as", "bob")
     terminal("b", a, False)
     cli("b", "approve", a, "--as", "alice")
     # Mutually approved, but no grant: refused; the attempt completes the pairing.
     terminal("b", "alice", False)
     eventually(lambda: peers("a")[b][5] == "yes", "a paired with b")
+    ping = cli("b", "ping", "alice", "-c", "2")
+    assert "2 packets transmitted, 2 received" in ping.stdout, ping
     alias = cli("a", "approve", b, "--as", b, check=False)
     assert alias.returncode == 1 and "must not look like an endpoint key" in alias.stderr
     unknown = cli("a", "enable", "shell", "carol", check=False)

@@ -1014,6 +1014,13 @@ impl Drop for Authorization {
 }
 
 impl Authorization {
+    /// Queue one datagram while peer authority is current.
+    pub(super) fn while_authorized<T>(&self, send: impl FnOnce() -> T) -> Result<T, Refusal> {
+        let _registry = self.sessions.inner.lock().expect("sessions lock");
+        self.status()?;
+        Ok(send())
+    }
+
     /// Ok while this authorization's authority and connection last.
     pub fn status(&self) -> Result<(), Refusal> {
         if let Some(r) = self.flag.get() {

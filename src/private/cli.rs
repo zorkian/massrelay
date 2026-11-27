@@ -149,6 +149,14 @@ pub enum Command {
         #[arg(long)]
         full: bool,
     },
+    /// Measure datagram round-trip time and loss to a paired peer.
+    Ping {
+        /// Endpoint ID, alias, or device name.
+        peer: String,
+        /// Number of probes to send.
+        #[arg(short = 'c', long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..=i64::from(runtime::MAX_PING_COUNT)))]
+        count: u16,
+    },
     /// Approve a member's exact endpoint key under a local alias.
     Approve {
         /// Verified endpoint ID, local alias, or a display name to confirm.
@@ -266,6 +274,7 @@ pub async fn execute(state_dir: &Path, command: Command) -> Result<i32> {
         Command::Status => status(&dir).await?,
         Command::Logs { follow } => return diagnostics::show(state_dir, follow),
         Command::Peers { full } => peers(&dir, full).await?,
+        Command::Ping { peer, count } => return ping(&dir, &peer, count).await,
         Command::Approve {
             peer,
             alias,
@@ -1267,6 +1276,64 @@ async fn peer_key(dir: &Path, selector: &str) -> Result<String> {
         return Ok(hex(key.as_bytes()));
     }
     Ok(hex(&selected_peer(dir, selector).await?.0.endpoint()))
+}
+
+async fn ping(dir: &Path, peer: &str, count: u16) -> Result<i32> {
+    let key = peer_key(dir, peer).await?;
+    let (mut socket, reply) =
+        runtime::request(dir, ControlRequest::Ping { peer: key, count }).await?;
+    match reply {
+        ControlReply::PingStarted => {}
+        ControlReply::Error(e) => bail!("{e}"),
+        _ => bail!("unexpected ping reply"),
+    }
+    let peer = crate::visible(peer);
+    println!("PING {peer}");
+    let mut sent = 0;
+    let mut received = 0;
+    let mut min = f64::INFINITY;
+    let mut max = 0.0_f64;
+    let mut sum = 0.0;
+    let interrupt = crate::shutdown();
+    tokio::pin!(interrupt);
+    loop {
+        let reply = tokio::select! {
+            r = &mut interrupt => { r?; break; }
+            r = wire::recv(&mut socket) => r?,
+        };
+        match reply {
+            ControlReply::PingSample(Some(micros)) => {
+                sent += 1;
+                received += 1;
+                let ms = micros as f64 / 1000.0;
+                min = min.min(ms);
+                max = max.max(ms);
+                sum += ms;
+                println!("reply from {peer}: seq={sent} time={ms:.3} ms");
+            }
+            ControlReply::PingSample(None) => {
+                sent += 1;
+                println!("request timed out: seq={sent}");
+            }
+            ControlReply::Done => break,
+            ControlReply::Error(e) => bail!("{e}"),
+            _ => bail!("unexpected ping reply"),
+        }
+    }
+    println!("--- {peer} ping statistics ---");
+    let loss = if sent > 0 {
+        100.0 * f64::from(sent - received) / f64::from(sent)
+    } else {
+        0.0
+    };
+    println!("{sent} packets transmitted, {received} received, {loss:.1}% packet loss");
+    if received > 0 {
+        println!(
+            "rtt min/avg/max = {min:.3}/{:.3}/{max:.3} ms",
+            sum / f64::from(received)
+        );
+    }
+    Ok(i32::from(received == 0))
 }
 
 async fn approve_peer(dir: &Path, selector: &str) -> Result<(String, String)> {

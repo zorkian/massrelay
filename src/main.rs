@@ -247,7 +247,7 @@ fn grouped_cli() -> clap::Command {
             "Find and pair devices",
             &["peers", "approve", "decline", "revoke"],
         ),
-        ("Connect to a peer", &["shell", "connect"]),
+        ("Connect to a peer", &["shell", "connect", "ping"]),
         (
             "Share services from this device",
             &["enable", "disable", "list", "expose"],
