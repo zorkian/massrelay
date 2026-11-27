@@ -38,10 +38,10 @@ cleanup() {
     systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
     rm -rf "$root"
 }
+[ ! -e "$units/$unit" ] && [ ! -L "$units/$unit" ] || fail "A unit named $unit already exists."
+
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
-
-[ ! -e "$units/$unit" ] || fail "A unit named $unit already exists."
 mkdir -m 700 "$state"
 mkdir -m 755 "$bin"
 install -m 755 "$binary" "$bin/massrelay"

@@ -117,6 +117,8 @@ enum Role {
     /// A directory whose contents the service loads or writes: the program's directory (where
     /// Windows also looks for its DLLs) and the state directory.
     Holder,
+    /// A directory whose newly created updater files must inherit safe permissions.
+    Staging,
     /// A directory above one of those. It only has to keep the path below it in place.
     Ancestor,
     /// Private profile state. Its contents and inherited permissions must be private.
@@ -183,7 +185,9 @@ fn untrusted<'a>(security: &'a Security, role: Role, account: &str) -> Option<&'
     let harmful = takeover
         | match role {
             Role::Program => FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE,
-            Role::Holder => FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_DELETE_CHILD | GENERIC_WRITE,
+            Role::Holder | Role::Staging => {
+                FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_DELETE_CHILD | GENERIC_WRITE
+            }
             Role::Ancestor => FILE_DELETE_CHILD,
             Role::Private => {
                 FILE_READ_DATA
@@ -203,7 +207,7 @@ fn untrusted<'a>(security: &'a Security, role: Role, account: &str) -> Option<&'
                 AceKind::Other => true,
             };
             grants
-                && (!ace.inherit_only || role == Role::Private)
+                && (!ace.inherit_only || matches!(role, Role::Private | Role::Staging))
                 && !trusted(&ace.sid)
                 && ![CREATOR_OWNER, OWNER_RIGHTS].contains(&ace.sid.as_str())
         })
@@ -320,6 +324,19 @@ mod tests {
         assert_eq!(untrusted(&plantable, Role::Ancestor, ACCOUNT), None);
         assert_eq!(untrusted(&plantable, Role::Holder, ACCOUNT), Some(USERS));
         assert_eq!(untrusted(&plantable, Role::Program, ACCOUNT), Some(USERS));
+    }
+
+    #[test]
+    fn updater_staging_rejects_write_access_inherited_by_new_files() {
+        let directory = security(
+            ACCOUNT,
+            vec![Ace {
+                inherit_only: true,
+                ..allow(USERS, FILE_WRITE_DATA)
+            }],
+        );
+        assert_eq!(untrusted(&directory, Role::Holder, ACCOUNT), None);
+        assert_eq!(untrusted(&directory, Role::Staging, ACCOUNT), Some(USERS));
     }
 
     #[test]

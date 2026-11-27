@@ -364,9 +364,9 @@ impl crate::update::Service for Managed {
         let resolved = path
             .canonicalize()
             .with_context(|| format!("find {}", path.display()))?;
-        // A directory holds what the service loads; a file is what it runs.
+        // Include the ACLs that files created in a staging directory will inherit.
         let role = if resolved.is_dir() {
-            Role::Holder
+            Role::Staging
         } else {
             Role::Program
         };

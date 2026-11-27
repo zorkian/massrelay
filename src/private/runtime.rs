@@ -971,7 +971,8 @@ async fn serve_control<M: Mailbox + Send + Sync + 'static>(
         }
         ControlRequest::Update(UpdateRequest::Identify) => {
             audit("allowed", None);
-            let reply = ControlReply::Update(UpdateReply::Identity(identity(&shared)));
+            let reply = identity(&shared).map_or(UpdateReply::Retired, UpdateReply::Identity);
+            let reply = ControlReply::Update(reply);
             wire::send(&mut socket, reply).await
         }
         ControlRequest::Update(UpdateRequest::Hold) => hold_admission(&shared, socket).await,
@@ -1129,10 +1130,13 @@ async fn hold_admission<M: Mailbox + Send + Sync + 'static>(
             return wire::send(&mut socket, ControlReply::Update(reply)).await;
         }
     };
+    let Some(identity) = identity(shared) else {
+        return wire::send(&mut socket, ControlReply::Update(UpdateReply::Retired)).await;
+    };
     record("update_hold", "allowed", None);
     let held = UpdateReply::Held {
         lease_secs: shared.hold_lease.as_secs(),
-        identity: identity(shared),
+        identity,
     };
     // The only thing the updater may say next is `Commit`. Anything else, its end or an
     // error releases the hold.
@@ -1173,16 +1177,18 @@ async fn hold_admission<M: Mailbox + Send + Sync + 'static>(
 }
 
 /// This process as the runtime of its profile.
-fn identity<M: Mailbox + Send + Sync + 'static>(shared: &Shared<M>) -> Identity {
-    Identity {
+fn identity<M: Mailbox + Send + Sync + 'static>(shared: &Shared<M>) -> Option<Identity> {
+    let mut identity = Identity {
         pid: std::process::id(),
         executable: std::env::current_exe()
             .ok()
             .and_then(|path| path.to_str().map(str::to_owned)),
         version: env!("CARGO_PKG_VERSION").into(),
         endpoint: hex(&shared.node.endpoint_key()),
-        held: shared.node.held(),
-    }
+        held: false,
+    };
+    identity.held = shared.node.update_hold_state()?;
+    Some(identity)
 }
 
 /// Hold one exposure for as long as the command's lifetime socket stays

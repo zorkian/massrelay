@@ -413,6 +413,39 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Replace a same-filesystem file, requesting write-through on Windows.
+fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+        let wide = |path: &Path| {
+            path.as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>()
+        };
+        let from = wide(from);
+        let to = wide(to);
+        // Both NUL-terminated paths remain valid for the duration of the call.
+        if unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    fs::rename(from, to)
+}
+
 /// The directory beside the installed program where one update at a time stages its files.
 /// Nobody but this account can change what is in it, replace it, or replace a directory on
 /// the way to it (see `check`), and it belongs to the profile whose update is in progress.
@@ -470,8 +503,9 @@ impl Staging {
         trusts(&dir)?;
         // Nothing in a private directory is a link unless this account made it one.
         let lock = dir.join("lock");
-        if fs::symlink_metadata(&lock).is_ok() {
+        if lock.try_exists()? || fs::symlink_metadata(&lock).is_ok() {
             regular(&lock)?;
+            trusts(&lock)?;
         }
         let lock = fs::OpenOptions::new()
             .create(true)
@@ -486,7 +520,7 @@ impl Staging {
             )
         })?;
         let staging = Self { dir, _lock: lock };
-        staging.claim(state_dir)?;
+        staging.claim(state_dir, trusts)?;
         Ok(staging)
     }
 
@@ -520,22 +554,34 @@ impl Staging {
     /// Record which profile's update owns the staged files. Profiles whose services share one
     /// program share this directory, and an unfinished update of one must not be swept away
     /// by another.
-    fn claim(&self, state_dir: &Path) -> Result<()> {
+    fn claim(&self, state_dir: &Path, trusts: &dyn Fn(&Path) -> Result<()>) -> Result<()> {
         let marker = self.dir.join("profile");
-        if fs::symlink_metadata(&marker).is_ok() {
+        if marker.try_exists()? || fs::symlink_metadata(&marker).is_ok() {
             regular(&marker)?;
+            trusts(&marker)?;
             let owner: PathBuf = serde_json::from_slice(&fs::read(&marker)?)
                 .context("read the staging directory's profile")?;
+            if owner == state_dir {
+                return Ok(());
+            }
             ensure!(
-                owner == state_dir || !owner.join(JOURNAL).exists(),
+                !owner.join(JOURNAL).try_exists()?,
                 "an update of this program for the profile in {} is unfinished. Run \
                  'massrelay --state-dir {} update' first",
                 owner.display(),
                 owner.display()
             );
+            // A past unlink may have succeeded without a durable directory sync.
+            if self.previous().try_exists()? || self.candidate().try_exists()? {
+                sync_dir(&owner).context("verify the previous update was closed durably")?;
+            }
         }
-        fs::write(&marker, serde_json::to_vec(state_dir)?)
-            .context("record the staging directory's profile")
+        let mut saved = tempfile::NamedTempFile::new_in(&self.dir)?;
+        serde_json::to_writer(saved.as_file_mut(), state_dir)?;
+        saved.as_file().sync_all()?;
+        replace_file(&saved.into_temp_path(), &marker)?;
+        sync_dir(&self.dir)?;
+        Ok(())
     }
 
     fn file(&self, name: &str) -> PathBuf {
@@ -578,7 +624,7 @@ impl Staging {
         prepared.map_err(|error: anyhow::Error| {
             format!("could not prepare {}: {error:#}", installed.display())
         })?;
-        fs::rename(&placing, installed).map_err(|error| match error.kind() {
+        replace_file(&placing, installed).map_err(|error| match error.kind() {
             io::ErrorKind::PermissionDenied => format!(
                 "this account may not replace {}: {error}",
                 installed.display()
@@ -605,10 +651,8 @@ impl Staging {
 
     fn clear(self) {
         self.sweep();
-        for name in ["profile", "lock"] {
-            let _ = fs::remove_file(self.dir.join(name));
-        }
-        let _ = fs::remove_dir(&self.dir);
+        // Retain the lock inode. A process that opened it before this one closes
+        // must contend on the same inode as a later process opening the path.
     }
 }
 
@@ -896,7 +940,7 @@ impl Journal {
             let mut file = tempfile::NamedTempFile::new_in(state_dir)?;
             serde_json::to_writer(file.as_file_mut(), self)?;
             file.as_file().sync_all()?;
-            file.persist(state_dir.join(JOURNAL))?;
+            replace_file(&file.into_temp_path(), &state_dir.join(JOURNAL))?;
             sync_dir(state_dir)?;
             Ok::<_, anyhow::Error>(())
         })();
@@ -967,13 +1011,21 @@ fn close(state_dir: &Path, staging: Staging) -> Result<(), String> {
             journal.display()
         )
     };
-    match fs::remove_file(&journal) {
+    #[cfg(windows)]
+    let closed = state_dir.join("update-journal.closed");
+    #[cfg(windows)]
+    let removal = replace_file(&journal, &closed);
+    #[cfg(not(windows))]
+    let removal = fs::remove_file(&journal);
+    match removal {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(kept(error)),
     }
     sync_dir(state_dir).map_err(kept)?;
     staging.clear();
+    #[cfg(windows)]
+    let _ = fs::remove_file(closed);
     Ok(())
 }
 
@@ -1836,11 +1888,14 @@ pub async fn run(state_dir: &Path) -> Result<i32> {
     // service is idle and held.
     let staging = Staging::open(&installed, &state_dir, &|path| service.trusts(path))
         .context("the service's program cannot be updated in place")?;
+    ensure!(
+        Journal::load(&state_dir)?.is_none(),
+        "another 'massrelay update' left this profile's update unfinished; run it again"
+    );
+    // Even if a prior unlink succeeded but its sync failed, the images can
+    // now be overwritten only after the journal's absence is durable.
+    sync_dir(&state_dir).context("verify that no unfinished update remains")?;
     let prepared = async {
-        ensure!(
-            Journal::load(&state_dir)?.is_none(),
-            "another 'massrelay update' left this profile's update unfinished; run it again"
-        );
         ensure!(
             service.launches(&installed)?,
             "the service {} is not set up to start {} for this profile. Run 'massrelay install' \

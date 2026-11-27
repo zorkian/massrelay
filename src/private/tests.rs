@@ -3211,7 +3211,9 @@ mod pairing {
         assert!(exposure.cancelled().is_none());
         drop(exposure);
 
+        assert_eq!(ob.update_hold_state(), Some(false));
         let hold = ob.hold_if_idle().ok().unwrap();
+        assert_eq!(ob.update_hold_state(), Some(true));
         assert!(ob.hold_if_idle().err().unwrap().held, "one hold at a time");
         // Nothing starts or registers under the hold; local decisions still apply.
         let (la, lb) = link(&alice, &bob);
@@ -3230,6 +3232,11 @@ mod pairing {
         let (x, y) = exchange(&pa, &la, &pb, &lb);
         let (_aa, ab) = (x.unwrap(), y.unwrap());
         pb.open(&ab, tcp(9001)).unwrap();
+        drop((_aa, ab));
+        let hold = ob.hold_if_idle().ok().unwrap();
+        assert!(hold.retire("test retirement"));
+        drop(hold);
+        assert_eq!(ob.update_hold_state(), None);
     }
 
     #[test]

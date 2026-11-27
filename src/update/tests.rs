@@ -449,11 +449,17 @@ fn update(
     (outcome, root)
 }
 
-/// Whether the journal and the staging directory are still there.
+/// Whether the journal or either recovery image remains.
 fn kept(root: &Path) -> (bool, bool) {
     (
         root.join("state").join(JOURNAL).exists(),
-        root.join("bin").join(STAGING).exists(),
+        ["previous", "candidate"].into_iter().any(|name| {
+            let extension = if cfg!(windows) { ".exe" } else { "" };
+            root.join("bin")
+                .join(STAGING)
+                .join(format!("{name}{extension}"))
+                .exists()
+        }),
     )
 }
 
@@ -1345,9 +1351,9 @@ mod unix {
         fs::rename(&real, &installed).unwrap();
 
         // A sticky directory lets only an entry's owner replace it.
-        chmod(&bin, 0o1777);
-        open(&installed, &state).unwrap().clear();
-        chmod(&bin, 0o755);
+        let (_sticky_root, sticky_program, sticky_state) = installation();
+        chmod(sticky_program.parent().unwrap(), 0o1777);
+        drop(open(&sticky_program, &sticky_state).unwrap());
 
         // An existing staging directory that others can enter, or that is a link elsewhere.
         let staging = bin.join(STAGING);
@@ -1509,7 +1515,6 @@ mod unix {
         };
 
         // The program's own directory is private; one two levels up is not.
-        open(&installed, &state).unwrap().clear();
         for open in [0o775, 0o777] {
             chmod(&outer, open);
             refused(&installed, "can be changed by other accounts");
@@ -1797,7 +1802,8 @@ mod systemd {
             "systemd restarted it once, by its own policy"
         );
         assert!(Journal::load(&state_dir).unwrap().is_none());
-        assert!(!program.parent().unwrap().join(STAGING).exists());
+        let stage = program.parent().unwrap().join(STAGING);
+        assert!(!stage.join("candidate").exists() && !stage.join("previous").exists());
         say(format!(
             "acceptance: updated; systemd restarted {unit} itself as process {}",
             second.pid
@@ -1827,7 +1833,8 @@ mod systemd {
         assert_eq!(third.endpoint, first.endpoint);
         assert!(profile.join(CONTROL.marker).exists());
         assert!(Journal::load(&state_dir).unwrap().is_none());
-        assert!(!program.parent().unwrap().join(STAGING).exists());
+        let stage = program.parent().unwrap().join(STAGING);
+        assert!(!stage.join("candidate").exists() && !stage.join("previous").exists());
         say(format!(
             "acceptance: a program that does not start was reverted; {unit} serves as process {}",
             third.pid

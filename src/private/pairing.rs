@@ -551,13 +551,14 @@ impl Owner {
         })
     }
 
-    /// Whether an update's hold is in force: admission is closed, and a commit on the hold's
-    /// connection would retire this owner.
-    pub fn held(&self) -> bool {
-        match self.sessions.inner.lock() {
-            Ok(reg) => reg.hold.is_some(),
-            Err(poisoned) => poisoned.into_inner().hold.is_some(),
-        }
+    /// Whether admission is held, or `None` once retirement begins.
+    pub fn update_hold_state(&self) -> Option<bool> {
+        let reg = self
+            .sessions
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reg.stopping.is_none().then(|| reg.hold.is_some())
     }
 
     pub fn live_sessions(&self) -> usize {

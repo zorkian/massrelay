@@ -420,9 +420,8 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
         self.owner.hold_if_idle()
     }
 
-    /// Whether an update's hold is in force (see `Owner::held`).
-    pub fn held(&self) -> bool {
-        self.owner.held()
+    pub fn update_hold_state(&self) -> Option<bool> {
+        self.owner.update_hold_state()
     }
 
     /// Permanently stop through a hold that is still in force (see
