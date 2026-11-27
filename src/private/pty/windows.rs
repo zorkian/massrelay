@@ -922,13 +922,15 @@ fn quote(program: &OsStr) -> io::Result<Vec<u16>> {
     Ok(line)
 }
 
-/// This process's environment with `TERM=xterm-256color`, as a sorted
-/// UTF-16 block.
+/// This process's environment with `TERM=xterm-256color` and the serving
+/// runtime's process ID, as a sorted UTF-16 block.
 fn environment() -> Vec<u16> {
+    let host = crate::private::HOST_ENV;
     let mut vars: Vec<(OsString, OsString)> = std::env::vars_os()
-        .filter(|(k, _)| !k.eq_ignore_ascii_case("TERM"))
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("TERM") && !k.eq_ignore_ascii_case(host))
         .collect();
     vars.push(("TERM".into(), "xterm-256color".into()));
+    vars.push((host.into(), std::process::id().to_string().into()));
     vars.sort_by_cached_key(|(k, _)| k.to_string_lossy().to_uppercase());
     let mut block = Vec::new();
     for (k, v) in vars {

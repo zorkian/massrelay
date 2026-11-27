@@ -2627,6 +2627,7 @@ dependencies = [
  "openmls_traits",
  "portable-pty",
  "rcgen",
+ "reqwest",
  "rusqlite",
  "rustls",
  "serde",
@@ -2636,6 +2637,7 @@ dependencies = [
  "subtle",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "windows-sys 0.61.2",
 ]
 

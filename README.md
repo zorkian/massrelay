@@ -118,11 +118,19 @@ A forwarding relay sees which endpoint IDs it forwards between, their relay-faci
 
 The relay also hosts an encrypted mailbox for membership and invites. It can see operation types, access credentials, opaque storage handles, and ciphertext sizes and timing. Devices encrypt and verify the contents, including the roster and device names.
 
-## Upgrading and building
+## Update MassRelay
 
-Use the installer again to upgrade, then restart the daemon. Update both ends to use ping or explicit shell privilege requests. If you're upgrading from relay-managed membership in v0.4.0 or earlier, [create a new encrypted network](docs/private-discovery-setup.md).
+Run `massrelay update` from a local terminal or SSH session. It downloads and checks the latest release, waits for active MassRelay sessions to finish, then restarts the installed service. If the new daemon fails to start, the updater restores the previous binary when it can do so safely.
+
+The command needs a release it can download without a GitHub account. To bring an older installation up to a version that supports `update`, rerun the installer and restart the service. See [how updating works](docs/updating.md) for installation requirements and interrupted updates.
+
+If you're upgrading from relay-managed membership in v0.4.0 or earlier, [create a new encrypted network](docs/private-discovery-setup.md).
+
+## Build from source
 
 To build from source, install stable Rust and a platform C toolchain, then run `cargo build --locked --release`. Run `cargo test --locked` and `cargo clippy --locked --all-targets -- -D warnings` to check the code. On Unix, `cargo test --locked -- --ignored --test-threads=1` covers native networking and shells. On Linux, `python3 tests/private.py target/release/massrelay` exercises the CLI on loopback.
+
+On Linux, `tests/update-systemd.sh target/debug/massrelay` checks switching and rollback with a disposable profile and systemd user service.
 
 ## License
 

@@ -26,6 +26,8 @@ mod tcp;
 mod terminal;
 mod tunnel;
 mod udp;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+mod update;
 #[cfg(any(windows, test))]
 #[cfg_attr(not(windows), allow(dead_code))]
 mod windows_service;
@@ -168,6 +170,26 @@ enum Command {
     )]
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     Stop,
+    /// Update this device's installed background service to the latest release, once it is idle.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[command(
+        after_help = "Downloads the latest public release, checks it, waits until no connection or \
+                      temporary exposure is live, then restarts the service on the new version. \
+                      If the new version does not start, the previous one is restored."
+    )]
+    Update,
+    /// Check that this program can serve this profile. Run by 'massrelay update' on a download.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[command(hide = true)]
+    UpdateSelfCheck,
+    /// Finish a prepared update. Run by 'massrelay update' on Windows.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[command(hide = true)]
+    UpdateApply {
+        /// Finish or undo an interrupted update instead.
+        #[arg(long)]
+        recover: bool,
+    },
     /// Run as the installed background service. Only the Windows service manager starts this.
     #[cfg(windows)]
     #[command(hide = true)]
@@ -240,7 +262,7 @@ fn grouped_cli() -> clap::Command {
         (
             "Manage this device",
             &[
-                "status", "rename", "logs", "install", "start", "restart", "stop", "run",
+                "status", "rename", "logs", "install", "start", "restart", "stop", "update", "run",
             ],
         ),
         (
@@ -315,6 +337,12 @@ async fn execute(cli: Cli) -> Result<i32> {
         Command::Restart => background_service::control(&dir, ServiceAction::Restart)?,
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         Command::Stop => background_service::control(&dir, ServiceAction::Stop)?,
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        Command::Update => return update::run(&dir).await,
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        Command::UpdateSelfCheck => return update::self_check(&dir).await,
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        Command::UpdateApply { recover } => return update::apply_prepared(&dir, recover).await,
         // `main` hands this to the service manager before any runtime exists.
         #[cfg(windows)]
         Command::Service { .. } => anyhow::bail!("the service command cannot be run here"),

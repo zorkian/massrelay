@@ -62,14 +62,16 @@ use windows_sys::Win32::{
         Services::{
             ChangeServiceConfig2W, ChangeServiceConfigW, CloseServiceHandle, ControlService,
             CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW, QUERY_SERVICE_CONFIGW,
-            QueryServiceConfigW, QueryServiceStatus, RegisterServiceCtrlHandlerExW, SC_HANDLE,
-            SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE, SERVICE_ACCEPT_SHUTDOWN,
+            QueryServiceConfigW, QueryServiceStatus, QueryServiceStatusEx,
+            RegisterServiceCtrlHandlerExW, SC_HANDLE, SC_MANAGER_CONNECT,
+            SC_MANAGER_CREATE_SERVICE, SC_STATUS_PROCESS_INFO, SERVICE_ACCEPT_SHUTDOWN,
             SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
             SERVICE_CONFIG_DESCRIPTION, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_SHUTDOWN,
-            SERVICE_CONTROL_STOP, SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_QUERY_STATUS,
-            SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STOP,
-            SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
-            SetServiceStatus, StartServiceCtrlDispatcherW, StartServiceW,
+            SERVICE_CONTROL_STOP, SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_QUERY_CONFIG,
+            SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING,
+            SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOP, SERVICE_STOP_PENDING,
+            SERVICE_STOPPED, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS, SetServiceStatus,
+            StartServiceCtrlDispatcherW, StartServiceW,
         },
         SystemInformation::{ComputerNameNetBIOS, GetComputerNameExW, GetSystemDirectoryW},
         Threading::{GetCurrentProcess, OpenProcessToken},
@@ -290,6 +292,121 @@ pub fn control(dir: &Path, action: ServiceAction) -> Result<()> {
     result?;
     println!("{} {name}", action.completed());
     Ok(())
+}
+
+/// An installed service, for `massrelay update`.
+pub struct Managed {
+    dir: String,
+    name: String,
+}
+
+pub fn managed(dir: &Path) -> Result<Managed> {
+    let dir = dir
+        .canonicalize()
+        .context("resolve the device state directory")?;
+    let dir = super::plain(&dir)?;
+    let name = super::service_name(&dir);
+    let service = Managed { dir, name };
+    service.open(SERVICE_QUERY_STATUS)?;
+    Ok(service)
+}
+
+impl Managed {
+    fn open(&self, access: u32) -> Result<Handle> {
+        let manager = manager(SC_MANAGER_CONNECT)?;
+        open(&manager, &wide(&self.name)?, access)?
+            .context("no installed service for this profile. Run massrelay install first")
+    }
+}
+
+impl crate::update::Service for Managed {
+    fn label(&self) -> String {
+        self.name.clone()
+    }
+
+    fn events(&self) -> PathBuf {
+        Path::new(&self.dir).join(EVENT_LOG)
+    }
+
+    fn launches(&self, program: &Path) -> Result<bool> {
+        let program = program
+            .canonicalize()
+            .with_context(|| format!("find {}", program.display()))?;
+        let program = super::quote(&super::plain(&program)?)?;
+        let command = config(&self.open(SERVICE_QUERY_CONFIG)?)?.command;
+        Ok(super::is_profile_service(&command, &self.dir, &self.name)
+            && command.starts_with(&format!("{program} ")))
+    }
+
+    fn controllable(&self) -> Result<()> {
+        self.open(SERVICE_QUERY_STATUS | SERVICE_START).map(drop)
+    }
+
+    /// A path the update writes beside or runs gets the check the install gives the program:
+    /// only this account and administrators may modify it or any directory above it. It must
+    /// also be reached without a reparse point, so that what is checked is what is used.
+    fn trusts(&self, path: &Path) -> Result<()> {
+        for part in path.ancestors() {
+            // A drive's root has no entry of its own to be a reparse point.
+            if part.parent().is_none() {
+                break;
+            }
+            let attributes = fs::symlink_metadata(part)
+                .with_context(|| format!("find {}", part.display()))?
+                .file_attributes();
+            ensure!(
+                attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+                "{} is a link or mount point; 'massrelay update' does not follow one to the \
+                 installed program",
+                part.display()
+            );
+        }
+        let resolved = path
+            .canonicalize()
+            .with_context(|| format!("find {}", path.display()))?;
+        // A directory holds what the service loads; a file is what it runs.
+        let role = if resolved.is_dir() {
+            Role::Holder
+        } else {
+            Role::Program
+        };
+        ensure_trusted(&super::plain(&resolved)?, role, &Account::current()?)
+    }
+
+    /// The service manager's own state for the service. Only `SERVICE_STOPPED` is stopped:
+    /// a start or a stop that is pending, and any other state, is in between, and the program
+    /// is not replaced or started while it lasts.
+    fn state(&self) -> Result<crate::update::Manager> {
+        use crate::update::Manager;
+        let service = self.open(SERVICE_QUERY_STATUS)?;
+        let mut status = SERVICE_STATUS_PROCESS::default();
+        let mut needed = 0;
+        // SAFETY: the handle is open and the buffer is this structure, writable for its size.
+        ensure!(
+            unsafe {
+                QueryServiceStatusEx(
+                    service.0,
+                    SC_STATUS_PROCESS_INFO,
+                    (&raw mut status).cast(),
+                    size_of::<SERVICE_STATUS_PROCESS>() as u32,
+                    &mut needed,
+                )
+            } != 0,
+            "read the service status: {}",
+            io::Error::last_os_error()
+        );
+        Ok(match status.dwCurrentState {
+            SERVICE_RUNNING if status.dwProcessId != 0 => Manager::Running(status.dwProcessId),
+            SERVICE_STOPPED => Manager::Stopped,
+            SERVICE_START_PENDING => Manager::Pending("as starting".into()),
+            SERVICE_STOP_PENDING => Manager::Pending("as stopping".into()),
+            other => Manager::Pending(format!("in state {other}")),
+        })
+    }
+
+    fn start(&self) -> Result<()> {
+        start(&self.open(SERVICE_QUERY_STATUS | SERVICE_START)?)
+    }
 }
 
 /// Windows PowerShell, by its full path in the system directory.

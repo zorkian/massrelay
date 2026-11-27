@@ -60,7 +60,7 @@ use super::diagnostics::{self, Level};
 use super::mailbox::Mailbox;
 use super::membership::{Advance, Stop};
 use super::pairing::{Decision, PairError, PairingState, Refusal};
-use super::runtime::{ControlReply, ControlRequest};
+use super::runtime::{ControlReply, ControlRequest, UpdateRequest};
 use super::service::{Ended, Node, Synced};
 
 /// Default event file name in the private profile directory (as legacy).
@@ -783,6 +783,9 @@ pub fn operation(r: &ControlRequest) -> (&'static str, Option<&str>, Option<Serv
         ControlRequest::Shell { peer, .. } => ("shell", Some(peer), Some(Service::Shell)),
         ControlRequest::Connect { peer, service, .. } => ("connect", Some(peer), Some(*service)),
         ControlRequest::Expose { peer, service, .. } => ("expose", Some(peer), Some(*service)),
+        ControlRequest::Update(UpdateRequest::Identify) => ("update_identify", None, None),
+        ControlRequest::Update(UpdateRequest::Hold) => ("update_hold", None, None),
+        ControlRequest::Update(UpdateRequest::Commit) => ("update_retire", None, None),
     }
 }
 

@@ -10,6 +10,7 @@ says anything about deployment, HTTPS or platform durability.
 """
 
 import base64
+import hmac
 import json
 import os
 from pathlib import Path
@@ -435,6 +436,17 @@ def _exercise(binary, root, processes):
     version = subprocess.check_output([binary, "--version"], text=True).strip().rsplit(" ", 1)[1]
     eventually(lambda: f"bob\t{version}\t20" in status("a"), "inbound peer version")
     eventually(lambda: f"alice\t{version}\t20" in status("b"), "outbound peer version")
+    # A downloaded program checks itself against a profile before 'massrelay update' lets it
+    # replace anything: it reads the profile without taking it over and reaches the pinned
+    # relay from a throwaway identity. The runtime and its live shell are not disturbed.
+    report = json.loads(cli("a", "update-self-check").stdout)
+    assert (report["version"], report["endpoint"]) == (version, a), report
+    # Only an installed background service is updated. A foreground run is refused before
+    # anything is downloaded, and keeps serving.
+    foreground = cli("a", "update", check=False)
+    assert foreground.returncode != 0, foreground
+    assert "installed background service" in foreground.stderr, foreground.stderr
+    assert shows_connection("a", "inbound", "bob", "shell")
     before_rename = peers("a")[b]
     cli("a", "rename", b, "bob-local")
     assert peers("a")[b] == [before_rename[0], "bob-local", *before_rename[2:]]
@@ -625,6 +637,51 @@ def _exercise(binary, root, processes):
                 finish(again)
         finally:
             stop(follower)
+    # ------------------------------------------------- retirement for an update
+    # 'massrelay update' never stops a service from outside. It asks the runtime, over the
+    # authenticated control channel, to close admission if idle, and then, on that same
+    # connection, to retire and end itself. This speaks that protocol to a real runtime.
+    def control(state):
+        path = root / state / "private-experimental-0" / "private-runtime.json"
+        eventually(path.exists, f"{state} control marker")
+        marker = json.loads(path.read_text())
+        host, port = marker["addr"].rsplit(":", 1)
+        secret = bytes(marker["key"])
+        sock = socket.create_connection((host, int(port)), timeout=30)
+        challenge = os.urandom(32)
+        sock.sendall(challenge)
+        expected = hmac.new(secret, b"massrelay private runtime experimental-1" + challenge, "sha256")
+        assert hmac.compare_digest(read_exactly(sock, 32), expected.digest())
+        theirs = read_exactly(sock, 32)
+        sock.sendall(hmac.new(secret, b"massrelay private client experimental-1" + theirs, "sha256").digest())
+        return sock
+
+    def send(sock, value):
+        data = json.dumps(value).encode()
+        sock.sendall(len(data).to_bytes(4, "big") + data)
+
+    def receive(sock):
+        return json.loads(read_exactly(sock, int.from_bytes(read_exactly(sock, 4), "big")))
+
+    retiring = run("a")
+    # A hold that is given up ends nothing: the runtime serves on.
+    held = control("a")
+    send(held, {"Update": "Hold"})
+    identity = receive(held)["Update"]["Held"]["identity"]
+    assert (identity["pid"], identity["endpoint"]) == (retiring.pid, a), identity
+    held.close()
+    time.sleep(1)
+    assert retiring.poll() is None and "Runtime: running" in status("a")
+    # A commit on a standing hold retires exactly that runtime, which then ends itself with
+    # the status that makes a service manager start the installed program again.
+    held = control("a")
+    send(held, {"Update": "Hold"})
+    assert receive(held)["Update"]["Held"]["identity"]["pid"] == retiring.pid
+    send(held, "Commit")
+    assert receive(held) == {"Update": "Retired"}
+    assert retiring.wait(timeout=30) == 75, retiring.returncode
+    assert "Runtime: not running" in status("a")
+    held.close()
     print("Private discovery end to end passed")
 
 

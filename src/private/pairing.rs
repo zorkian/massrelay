@@ -57,6 +57,18 @@
 //! open is refused with `Refusal::Stopping`, and the membership gate is
 //! closed (no read, handoff, apply or record).
 //!
+//! `Owner::hold_if_idle` is the updater's ordering point. Under the registry
+//! lock it checks that no authorization, session or exposure is registered
+//! and, only then, closes admission: until the returned `AdmissionHold` is
+//! dropped, no exchange starts or commits, no service opens and no exposure
+//! is registered (each is refused with `Refusal::Stopping`). Decisions,
+//! cutoffs and grant changes still apply. Unlike `retire`, a hold is undone
+//! by dropping it, so a device whose updater went away serves again.
+//! `AdmissionHold::retire` is the only way a hold becomes a stop: under the
+//! same lock it checks that this hold is still the registry's and that the
+//! registry is still empty, and only then moves the owner to stopping. A hold
+//! that lapsed or was replaced retires nothing.
+//!
 //! A cutoff persists the local cutoff first (only its failure fails the
 //! call), flags every session under the registry lock, then saves the
 //! declined pairing and finally stages the network removal; `Cutoff`
@@ -503,8 +515,49 @@ impl Owner {
             .stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
         reg.flag(&Ending::All(why.into()));
+        if let Some((_, flag)) = &reg.hold {
+            flag.set(why);
+        }
         drop(reg);
         self.sessions.changed.notify_waiters();
+    }
+
+    /// Close admission if, and only if, nothing is registered: no
+    /// authorization (a connection in any state after its exchange), no
+    /// service session and no exposure. The check and the closing are one
+    /// step under the registry lock, so a session either registered first
+    /// (and this reports it) or is refused afterwards. Admission reopens when
+    /// the hold is dropped.
+    pub fn hold_if_idle(&self) -> Result<AdmissionHold, Activity> {
+        let mut reg = self.sessions.inner.lock().expect("sessions lock");
+        let activity = Activity {
+            connections: reg.entries.values().filter(|e| e.service.is_none()).count(),
+            exposures: reg.holders.len(),
+            held: reg.hold.is_some(),
+            stopping: reg.stopping.is_some(),
+        };
+        if activity.held || activity.stopping || !reg.entries.is_empty() || !reg.holders.is_empty()
+        {
+            return Err(activity);
+        }
+        reg.next += 1;
+        let id = reg.next;
+        let flag = Arc::new(Flag::default());
+        reg.hold = Some((id, flag.clone()));
+        Ok(AdmissionHold {
+            sessions: self.sessions.clone(),
+            id,
+            flag,
+        })
+    }
+
+    /// Whether an update's hold is in force: admission is closed, and a commit on the hold's
+    /// connection would retire this owner.
+    pub fn held(&self) -> bool {
+        match self.sessions.inner.lock() {
+            Ok(reg) => reg.hold.is_some(),
+            Err(poisoned) => poisoned.into_inner().hold.is_some(),
+        }
     }
 
     pub fn live_sessions(&self) -> usize {
@@ -583,6 +636,9 @@ struct Registry {
     global: u64,
     /// Set once by `Owner::retire`; never cleared.
     stopping: Option<String>,
+    /// The admission hold of a pending update, and the flag that tells its
+    /// holder the owner retired (see `Owner::hold_if_idle`).
+    hold: Option<(u64, Arc<Flag>)>,
     /// Live exposures only (never persisted), and their holders by instance.
     exposed: Grants,
     holders: BTreeMap<u64, Holder>,
@@ -676,6 +732,79 @@ struct Sessions {
     changed: tokio::sync::Notify,
     /// Lock-free mirror of `Registry::stopping` (for `Gate::admits`).
     stopping: std::sync::atomic::AtomicBool,
+}
+
+/// What kept `Owner::hold_if_idle` from closing admission.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Activity {
+    /// Authorized connections, inbound and outbound, in any state.
+    pub connections: usize,
+    /// Live temporary exposures.
+    pub exposures: usize,
+    /// Another hold is already in place.
+    pub held: bool,
+    pub stopping: bool,
+}
+
+/// Closed admission on an idle registry (see `Owner::hold_if_idle`).
+/// Dropping it reopens admission, unless the owner retired meanwhile.
+pub struct AdmissionHold {
+    sessions: Arc<Sessions>,
+    id: u64,
+    flag: Arc<Flag>,
+}
+
+impl AdmissionHold {
+    /// Permanently retire the owner, as `Owner::retire` does, if and only if
+    /// this hold is still in force on an empty, running registry. The check
+    /// and the transition are one step under the registry lock. Returns
+    /// whether this call retired the owner.
+    pub fn retire(&self, why: &str) -> bool {
+        let mut reg = match self.sessions.inner.lock() {
+            Ok(reg) => reg,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let held = reg.hold.as_ref().is_some_and(|(id, _)| *id == self.id);
+        if !held || reg.stopping.is_some() || !reg.entries.is_empty() || !reg.holders.is_empty() {
+            return false;
+        }
+        reg.stopping = Some(why.into());
+        self.sessions
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        reg.flag(&Ending::All(why.into()));
+        self.flag.set(why);
+        drop(reg);
+        self.sessions.changed.notify_waiters();
+        true
+    }
+
+    /// Resolve when the owner retires (the runtime is stopping).
+    pub async fn retired(&self) -> String {
+        loop {
+            let notified = self.flag.notify.notified();
+            let mut notified = pin!(notified);
+            notified.as_mut().enable();
+            if let Some(r) = self.flag.get() {
+                return r;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for AdmissionHold {
+    fn drop(&mut self) {
+        let mut reg = match self.sessions.inner.lock() {
+            Ok(reg) => reg,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if reg.hold.as_ref().is_some_and(|(id, _)| *id == self.id) {
+            reg.hold = None;
+        }
+        drop(reg);
+        self.sessions.changed.notify_waiters();
+    }
 }
 
 /// One authorized session on one connection. Dropping it unregisters it.
@@ -1249,6 +1378,16 @@ impl<'d, 'o, M: Mailbox> Peers<'d, 'o, M> {
         Ok(reg)
     }
 
+    /// `running`, also refused while an update holds admission closed. Every
+    /// step that starts or registers a connection, session or exposure takes it.
+    fn admitting(&self) -> Result<std::sync::MutexGuard<'_, Registry>, PairError> {
+        let reg = self.running()?;
+        if reg.hold.is_some() {
+            return Err(Refusal::Stopping.into());
+        }
+        Ok(reg)
+    }
+
     /// Run a short local device step (invite issue) only while the owner is
     /// not stopping, ordered against `Owner::retire` by the registry lock.
     pub fn while_running<T>(&self, f: impl FnOnce() -> T) -> Result<T, PairError> {
@@ -1563,7 +1702,7 @@ impl<'d, 'o, M: Mailbox> Peers<'d, 'o, M> {
         if let Some(t) = &target {
             wire::check_target(t).map_err(|e| PairError::Local(format!("{e:#}")))?;
         }
-        let mut reg = self.running()?;
+        let mut reg = self.admitting()?;
         let g = self.device.store().lock()?;
         let (alias, generation) = self.read_locked(&g, |view, st| {
             if let Some(why) = view.ineligible(peer) {
@@ -1770,7 +1909,7 @@ impl<'d, 'o, M: Mailbox> Peers<'d, 'o, M> {
         }
         let binding = link.channel_binding()?;
         let remote = link.remote_key();
-        let reg = self.running()?;
+        let reg = self.admitting()?;
         let snapshot = reg.snapshot(&remote);
         let g = self.device.store().lock()?;
         let mine = self.read_locked(&g, |view, st| {
@@ -1920,8 +2059,13 @@ impl<'d, 'o, M: Mailbox> Peers<'d, 'o, M> {
         let remote = link.remote_key();
         let sessions = self.owner.sessions.clone();
         let owner = self.owner.instance;
-        self.transition_then(
-            |view, st| {
+        self.transition_reg(
+            |reg, view, st| {
+                // An exchange that began before an update's hold must not
+                // commit under it.
+                if reg.hold.is_some() {
+                    return Err(Refusal::Stopping.into());
+                }
                 if let Some(why) = view.ineligible(&remote) {
                     if let Some(p) = st.peer_mut(&remote) {
                         p.pairing = None;
@@ -2048,7 +2192,7 @@ impl<'d, 'o, M: Mailbox> Peers<'d, 'o, M> {
         auth: &Authorization,
         service: Service,
     ) -> Result<SessionHandle, PairError> {
-        let mut reg = self.running()?;
+        let mut reg = self.admitting()?;
         if auth.owner != self.owner.instance {
             return Err(Refusal::StaleExchange("authorization from another runtime owner").into());
         }

@@ -3184,6 +3184,102 @@ mod pairing {
         });
     }
 
+    /// The updater's ordering point: admission closes only when nothing is registered, and
+    /// while it is closed nothing new registers.
+    #[test]
+    fn an_update_hold_closes_admission_only_while_nothing_is_live() {
+        let (_n, alice, bob, _carol) = three();
+        let (oa, ob) = (owner(&alice), owner(&bob));
+        let (pa, pb) = (
+            Peers::new(&alice.dev, &oa).unwrap(),
+            Peers::new(&bob.dev, &ob).unwrap(),
+        );
+        approve_both(&pa, &alice, &pb, &bob);
+        let (aa, ab) = pair(&pa, &alice, &pb, &bob);
+        pb.grant(&alice.ep, tcp(9001)).unwrap();
+        // A live session keeps the device busy, and asking does not disturb it.
+        let session = pb.open(&ab, tcp(9001)).unwrap();
+        let busy = ob.hold_if_idle().err().unwrap();
+        assert_eq!((busy.connections, busy.exposures, busy.held), (1, 0, false));
+        assert!(session.status().is_ok() && ab.status().is_ok());
+        drop(session);
+        // So does its authorized connection alone, and a temporary exposure.
+        assert_eq!(ob.hold_if_idle().err().map(|a| a.connections), Some(1));
+        drop((aa, ab));
+        let exposure = pb.expose(&alice.ep, tcp(9002), None).unwrap();
+        assert_eq!(ob.hold_if_idle().err().map(|a| a.exposures), Some(1));
+        assert!(exposure.cancelled().is_none());
+        drop(exposure);
+
+        let hold = ob.hold_if_idle().ok().unwrap();
+        assert!(ob.hold_if_idle().err().unwrap().held, "one hold at a time");
+        // Nothing starts or registers under the hold; local decisions still apply.
+        let (la, lb) = link(&alice, &bob);
+        assert_eq!(
+            refused(pb.exchange(lb.clone()).map(drop)),
+            Refusal::Stopping
+        );
+        assert_eq!(
+            refused(pb.expose(&alice.ep, tcp(9002), None)),
+            Refusal::Stopping
+        );
+        assert!(pb.grant(&alice.ep, tcp(9003)).unwrap());
+        assert_eq!(ob.live_sessions(), 0);
+        // An updater that goes away reopens admission.
+        drop(hold);
+        let (x, y) = exchange(&pa, &la, &pb, &lb);
+        let (_aa, ab) = (x.unwrap(), y.unwrap());
+        pb.open(&ab, tcp(9001)).unwrap();
+    }
+
+    #[test]
+    fn an_exchange_racing_an_update_hold_never_registers_under_it() {
+        let (_n, alice, bob, _carol) = three();
+        let (oa, ob) = (owner(&alice), owner(&bob));
+        let (pa, pb) = (
+            Peers::new(&alice.dev, &oa).unwrap(),
+            Peers::new(&bob.dev, &ob).unwrap(),
+        );
+        approve_both(&pa, &alice, &pb, &bob);
+        // An exchange that began before the hold cannot commit under it.
+        let (la, lb) = link(&alice, &bob);
+        let (ea, eb) = (pa.exchange(la).unwrap(), pb.exchange(lb).unwrap());
+        let (offer_a, offer_b) = (ea.offer(), eb.offer());
+        let (_ca, conf_a) = ea.on_offer(&offer_b).unwrap();
+        let (cb, _conf_b) = eb.on_offer(&offer_a).unwrap();
+        let hold = ob.hold_if_idle().ok().unwrap();
+        assert_eq!(refused(cb.finish(&conf_a).map(drop)), Refusal::Stopping);
+        assert_eq!(ob.live_sessions(), 0);
+        drop(hold);
+
+        // Racing: either the connection registered first and the hold reports it, or the
+        // hold came first and the connection is refused. Never both.
+        for _ in 0..40 {
+            let (la, lb) = link(&alice, &bob);
+            let (ea, eb) = (pa.exchange(la).unwrap(), pb.exchange(lb).unwrap());
+            let (offer_a, offer_b) = (ea.offer(), eb.offer());
+            let (_ca, conf_a) = ea.on_offer(&offer_b).unwrap();
+            let (cb, _conf_b) = eb.on_offer(&offer_a).unwrap();
+            let start = std::sync::Barrier::new(2);
+            std::thread::scope(|s| {
+                let committing = s.spawn(|| {
+                    start.wait();
+                    cb.finish(&conf_a)
+                });
+                start.wait();
+                let hold = ob.hold_if_idle();
+                let committed = committing.join().unwrap();
+                match (&hold, &committed) {
+                    (Ok(_), Ok(_)) => panic!("a connection registered under a hold"),
+                    (Ok(_), Err(_)) => assert_eq!(ob.live_sessions(), 0),
+                    (Err(busy), Ok(_)) => assert_eq!(busy.connections, 1),
+                    // The hold lost to a commit that then failed for its own reasons.
+                    (Err(_), Err(_)) => {}
+                }
+            });
+        }
+    }
+
     #[test]
     fn one_runtime_owner_per_profile() {
         let (n, alice, bob, _carol) = three();
@@ -5011,6 +5107,528 @@ mod runtime {
                 other => panic!("unexpected frame {other:?}"),
             }
         }
+    }
+
+    // ------------------------------------------------------------- updates
+
+    use crate::private::runtime::{UpdateReply, UpdateRequest};
+    use crate::update::tests::{FAST, Patient, prepare};
+    use crate::update::{Held, Host, Outcome, Service as Managed, live_hold, transact};
+
+    fn update(request: UpdateRequest) -> ControlRequest {
+        ControlRequest::Update(request)
+    }
+
+    /// Send shell input and read output until the shell exits.
+    async fn finish_shell(sh: &mut tokio::net::TcpStream, input: &[u8]) -> (i32, String) {
+        wire::frame(sh, input).await.unwrap();
+        let mut out = vec![];
+        loop {
+            let f = tokio::time::timeout(T, wire::read_frame(sh))
+                .await
+                .unwrap()
+                .unwrap();
+            match f.split_first() {
+                Some((1, data)) => out.extend_from_slice(data),
+                Some((3, code)) => {
+                    let code = i32::from_be_bytes(code.try_into().unwrap());
+                    return (code, String::from_utf8_lossy(&out).into());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Two paired devices with alice allowed a shell on bob, whose update holds last `lease`.
+    async fn shell_pair(
+        n: &Net,
+        book: &Book,
+        lease: Duration,
+    ) -> (Member, Member, Runtime<FsMailbox>, Runtime<FsMailbox>) {
+        let alice = create(n, "alice", Clock::System);
+        let bob = join(n, &alice, "bob", Clock::System);
+        let ra = run(&alice, book, n.mailbox.clone(), None).await;
+        let rb = start(
+            &bob.path,
+            bob.secret.to_bytes(),
+            bob.ep,
+            book,
+            &n.mailbox,
+            lease,
+        )
+        .await
+        .unwrap();
+        cmd(&alice, approve(&bob, "bob")).await;
+        cmd(&bob, approve(&alice, "alice")).await;
+        // The first exchange pairs.
+        shell_to(&alice, "bob").await;
+        let enable = ControlRequest::Enable {
+            peer: "alice".into(),
+            service: Service::Shell,
+        };
+        assert_eq!(cmd(&bob, enable).await, ControlReply::Changed(true));
+        (alice, bob, ra, rb)
+    }
+
+    /// Start a runtime from owned values, as a service manager starts a service again.
+    async fn start(
+        path: &std::path::Path,
+        secret: [u8; 32],
+        ep: EndpointKey,
+        book: &Book,
+        mailbox: &FsMailbox,
+        lease: Duration,
+    ) -> anyhow::Result<Runtime<FsMailbox>> {
+        let e = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&secret))
+            .relay_mode(RelayMode::Disabled)
+            .alpns(vec![SERVICE_ALPN.to_vec()])
+            .bind()
+            .await?;
+        book.lock().unwrap().insert(ep, addr(&e));
+        let addresses = book.clone();
+        let mut cfg = Config::new(path);
+        cfg.shell = Some("/bin/sh".into());
+        cfg.sync_every = None;
+        cfg.hold_lease = lease;
+        cfg.addresses = Arc::new(move |k| addresses.lock().unwrap().get(k).cloned());
+        Runtime::start(cfg, mailbox.clone(), Clock::System, e)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))
+    }
+
+    /// Ask for a shell until the destination admits it.
+    async fn shell_when_admitted(m: &Member, peer: &str) -> tokio::net::TcpStream {
+        let admitted = async {
+            loop {
+                let (sh, r, life) = shell_to(m, peer).await;
+                if r == ControlReply::Shell {
+                    // The lifetime socket lives as long as the test's shell.
+                    std::mem::forget(life);
+                    return sh;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        tokio::time::timeout(T, admitted).await.unwrap()
+    }
+
+    /// Ask for a hold until the runtime is idle and grants it. With the hold comes the
+    /// identity of the runtime that granted it, on the same connection.
+    async fn hold_when_idle(
+        m: &Member,
+    ) -> (tokio::net::TcpStream, crate::private::runtime::Identity) {
+        let held = async {
+            loop {
+                let (socket, reply) = rt::request(&m.path, update(UpdateRequest::Hold))
+                    .await
+                    .unwrap();
+                if let ControlReply::Update(UpdateReply::Held { identity, .. }) = reply {
+                    return (socket, identity);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        tokio::time::timeout(T, held).await.unwrap()
+    }
+
+    /// The second step on a hold's connection: the reply, or `None` if the connection is gone.
+    async fn commit(socket: &mut tokio::net::TcpStream) -> Option<ControlReply> {
+        wire::send(socket, UpdateRequest::Commit).await.ok()?;
+        tokio::time::timeout(T, wire::recv(socket))
+            .await
+            .unwrap()
+            .ok()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "opens loopback UDP/TCP sockets and a native PTY"]
+    async fn an_update_hold_waits_for_live_sessions_and_reopens_when_the_updater_leaves() {
+        let n = net();
+        let book = Book::default();
+        let (alice, bob, ra, rb) = shell_pair(&n, &book, rt::HOLD_LEASE).await;
+        let (mut sh, r, life) = shell_to(&alice, "bob").await;
+        assert_eq!(r, ControlReply::Shell);
+
+        // Both ends of the live shell are busy, and asking leaves the shell alone.
+        for m in [&bob, &alice] {
+            assert_eq!(
+                cmd(m, update(UpdateRequest::Hold)).await,
+                ControlReply::Update(UpdateReply::Busy {
+                    connections: 1,
+                    exposures: 0,
+                    held: false
+                })
+            );
+        }
+        let (code, out) = finish_shell(&mut sh, b"\x01printf 'still_%s\\n' here; exit 3\r").await;
+        assert_eq!(code, 3);
+        assert!(out.contains("still_here"), "{out}");
+        drop((sh, life));
+
+        // Once the session is gone the hold is granted, and kept while its socket is open. It
+        // names the runtime it holds.
+        let (socket, held) = hold_when_idle(&bob).await;
+        assert_eq!(held.pid, std::process::id());
+        assert_eq!(held.endpoint, key(&bob));
+        assert_eq!(rb.live_sessions(), 0);
+        assert!(matches!(
+            cmd(&bob, update(UpdateRequest::Hold)).await,
+            ControlReply::Update(UpdateReply::Busy { held: true, .. })
+        ));
+        // The runtime still answers, and says which process and program it is.
+        let ControlReply::Update(UpdateReply::Identity(identity)) =
+            cmd(&bob, update(UpdateRequest::Identify)).await
+        else {
+            panic!("identity");
+        };
+        assert_eq!(identity.pid, std::process::id());
+        assert_eq!(identity.endpoint, key(&bob));
+        assert_eq!(identity.version, env!("CARGO_PKG_VERSION"));
+        // While the hold stands it says so: it is not to be taken for a settled runtime.
+        assert!(identity.held && held.held);
+        // Admission is closed: a new shell is refused and registers nothing.
+        let (_, r, _) = shell_to(&alice, "bob").await;
+        assert!(matches!(r, ControlReply::Error(_)), "{r:?}");
+        assert_eq!(rb.live_sessions(), 0);
+        // A commit is only the second step of a hold: on its own it retires nothing.
+        assert!(matches!(
+            cmd(&bob, update(UpdateRequest::Commit)).await,
+            ControlReply::Error(_)
+        ));
+
+        // The updater going away without committing reopens admission. Nothing was stopped.
+        drop(socket);
+        let mut sh = shell_when_admitted(&alice, "bob").await;
+        let (code, _) = finish_shell(&mut sh, b"\x01exit 0\r").await;
+        assert_eq!(code, 0);
+        drop(sh);
+
+        // A stop that arrives under a hold ends the hold's wait at once.
+        let _held = hold_when_idle(&bob).await;
+        let stopping = std::time::Instant::now();
+        let stopped = rb.stop().await;
+        assert!(stopped.aborted.is_empty() && stopped.owner_released);
+        assert!(stopping.elapsed() < Duration::from_secs(5));
+        ra.stop().await;
+    }
+
+    /// A hold whose lease ran out is gone: a commit sent after that retires nothing, and the
+    /// runtime serves on. Only a commit on a hold that still stands retires the runtime, and
+    /// then that runtime ends itself, whether or not the updater is still there.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "opens loopback UDP/TCP sockets and a native PTY"]
+    async fn a_stale_hold_retires_nothing_and_a_standing_one_makes_that_runtime_end_itself() {
+        let n = net();
+        let book = Book::default();
+        let lease = Duration::from_millis(400);
+        let (alice, bob, ra, rb) = shell_pair(&n, &book, lease).await;
+        let retired = rb.retired();
+        let ends_itself = |within: Duration| {
+            let retired = retired.clone();
+            async move {
+                tokio::time::timeout(within, retired.notified())
+                    .await
+                    .is_ok()
+            }
+        };
+
+        // The lease runs out before the commit.
+        let (mut socket, _) = hold_when_idle(&bob).await;
+        tokio::time::sleep(lease * 3).await;
+        assert_eq!(commit(&mut socket).await, None, "the stale hold answered");
+        let ControlReply::Status(view) = cmd(&bob, ControlRequest::Status).await else {
+            panic!("status");
+        };
+        assert!(view.running);
+        // The runtime did not retire, is no longer held, and admits again: a peer gets a
+        // shell and keeps it.
+        let ControlReply::Update(UpdateReply::Identity(identity)) =
+            cmd(&bob, update(UpdateRequest::Identify)).await
+        else {
+            panic!("identity");
+        };
+        assert!(!identity.held);
+        let mut sh = shell_when_admitted(&alice, "bob").await;
+        assert!(
+            !ends_itself(Duration::from_millis(300)).await,
+            "a lapsed hold retired the runtime"
+        );
+        // With that shell live, nothing can be held or retired.
+        assert!(matches!(
+            cmd(&bob, update(UpdateRequest::Hold)).await,
+            ControlReply::Update(UpdateReply::Busy { connections: 1, .. })
+        ));
+        assert_eq!(finish_shell(&mut sh, b"\x01exit 0\r").await.0, 0);
+        drop(sh);
+
+        // A commit within the lease retires the runtime that granted the hold, and that
+        // runtime asks for its own stop at once. Nothing else has to stop it.
+        let (mut socket, _) = hold_when_idle(&bob).await;
+        assert_eq!(
+            commit(&mut socket).await,
+            Some(ControlReply::Update(UpdateReply::Retired))
+        );
+        // From the moment it retired, and so already when it confirms, it no longer
+        // identifies itself as a runtime that serves.
+        assert_eq!(
+            cmd(&bob, update(UpdateRequest::Identify)).await,
+            ControlReply::Update(UpdateReply::Retired)
+        );
+        assert!(ends_itself(T).await);
+        assert_eq!(rb.live_sessions(), 0);
+        // Until it has ended it admits nothing, however long the lease.
+        tokio::time::sleep(lease * 2).await;
+        let (_, r, _) = shell_to(&alice, "bob").await;
+        assert!(matches!(r, ControlReply::Error(_)), "{r:?}");
+        assert!(matches!(
+            cmd(&bob, update(UpdateRequest::Hold)).await,
+            ControlReply::Error(_)
+        ));
+        let stopped = rb.stop().await;
+        assert!(stopped.aborted.is_empty() && stopped.owner_released);
+        ra.stop().await;
+    }
+
+    /// Bob's runtime as an installed service, in this process. Nothing here can stop it: like
+    /// the real one, it stops itself when an update retires it, and a manager that restarts
+    /// failed services (systemd's `Restart=on-failure`, launchd) then starts it again.
+    struct InProcess {
+        path: PathBuf,
+        secret: [u8; 32],
+        ep: EndpointKey,
+        book: Book,
+        mailbox: FsMailbox,
+        events: PathBuf,
+        /// The fixture's program file, which stands in for the test binary the runtime
+        /// really runs from.
+        program: Mutex<PathBuf>,
+        running: Mutex<Option<Runtime<FsMailbox>>>,
+        /// Runtimes that ended themselves, and the sessions each had when it did.
+        ended: Mutex<Vec<usize>>,
+        manager: tokio::sync::Mutex<()>,
+        handle: tokio::runtime::Handle,
+    }
+
+    impl InProcess {
+        /// Run `runtime` as the service's process, the way `massrelay run` does: when an
+        /// update retires it, it stops itself, and the manager starts the service again.
+        fn serve(self: &Arc<Self>, runtime: Runtime<FsMailbox>) {
+            let retired = runtime.retired();
+            *self.running.lock().unwrap() = Some(runtime);
+            let service = self.clone();
+            let ended: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+                Box::pin(async move {
+                    retired.notified().await;
+                    let runtime = service.running.lock().unwrap().take();
+                    if let Some(runtime) = runtime {
+                        service.ended.lock().unwrap().push(runtime.live_sessions());
+                        runtime.stop().await;
+                    }
+                    service.launch().await.unwrap();
+                });
+            self.handle.spawn(ended);
+        }
+
+        /// The manager starts the service, unless it is running. One start at a time, as a
+        /// service manager orders its own restart and a start request.
+        async fn launch(self: &Arc<Self>) -> anyhow::Result<()> {
+            let _manager = self.manager.lock().await;
+            if self.running.lock().unwrap().is_some() {
+                return Ok(());
+            }
+            let started = start(
+                &self.path,
+                self.secret,
+                self.ep,
+                &self.book,
+                &self.mailbox,
+                rt::HOLD_LEASE,
+            )
+            .await?;
+            self.serve(started);
+            Ok(())
+        }
+    }
+
+    /// The service as the updater sees it.
+    struct Installed(Arc<InProcess>);
+
+    impl Managed for Installed {
+        fn label(&self) -> String {
+            "in-process runtime".into()
+        }
+
+        fn events(&self) -> PathBuf {
+            self.0.events.clone()
+        }
+
+        fn launches(&self, _: &std::path::Path) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+
+        fn state(&self) -> anyhow::Result<crate::update::Manager> {
+            let running = self.0.running.lock().unwrap().is_some();
+            Ok(if running {
+                crate::update::Manager::Running(std::process::id())
+            } else {
+                crate::update::Manager::Stopped
+            })
+        }
+
+        fn start(&self) -> anyhow::Result<()> {
+            self.0.handle.block_on(self.0.launch())
+        }
+    }
+
+    impl Host for Installed {
+        fn service(&self) -> &dyn Managed {
+            self
+        }
+
+        fn identify(&self) -> anyhow::Result<crate::private::runtime::Identity> {
+            let service = &self.0;
+            let mut identity = service
+                .handle
+                .block_on(crate::update::identify(&service.path))?;
+            identity.executable = service.program.lock().unwrap().to_str().map(str::to_owned);
+            Ok(identity)
+        }
+
+        fn hold(&self) -> anyhow::Result<Held> {
+            let program = self.0.program.lock().unwrap().clone();
+            Ok(match live_hold(&self.0.handle, &self.0.path)? {
+                Held::Yes(hold) => {
+                    let mut identity = hold.identity().clone();
+                    identity.executable = program.to_str().map(str::to_owned);
+                    Held::Yes(Box::new(Renamed(hold, identity)))
+                }
+                busy => busy,
+            })
+        }
+
+        fn released(&self) -> bool {
+            Owner::acquire(&self.0.path).is_ok()
+        }
+    }
+
+    /// A real hold whose runtime is named by the fixture's program file.
+    struct Renamed(
+        Box<dyn crate::update::Hold>,
+        crate::private::runtime::Identity,
+    );
+
+    impl crate::update::Hold for Renamed {
+        fn identity(&self) -> &crate::private::runtime::Identity {
+            &self.1
+        }
+
+        fn lease(&self) -> Duration {
+            self.0.lease()
+        }
+
+        fn commit(&mut self) -> bool {
+            self.0.commit()
+        }
+    }
+
+    /// The whole transaction over a real runtime: it waits while a shell is live, replaces the
+    /// program and has the runtime end itself only once the device is idle, verifies the
+    /// runtime that takes over through its control channel, and puts the previous program
+    /// back when the new one is not what was promised. Nothing but the runtime's own
+    /// retirement ever ends it: the service the updater is given cannot be stopped.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "opens loopback UDP/TCP sockets and a native PTY"]
+    async fn an_update_preserves_a_live_shell_then_switches_and_reverts_a_wrong_program() {
+        let n = net();
+        let book = Book::default();
+        let (alice, bob, ra, rb) = shell_pair(&n, &book, rt::HOLD_LEASE).await;
+        let scratch = tempfile::tempdir().unwrap();
+        let service = Arc::new(InProcess {
+            path: bob.path.clone(),
+            secret: bob.secret.to_bytes(),
+            ep: bob.ep,
+            book: book.clone(),
+            mailbox: n.mailbox.clone(),
+            events: scratch.path().join("events.jsonl"),
+            program: Mutex::default(),
+            running: Mutex::default(),
+            ended: Mutex::default(),
+            manager: tokio::sync::Mutex::default(),
+            handle: tokio::runtime::Handle::current(),
+        });
+        service.serve(rb);
+        let version = env!("CARGO_PKG_VERSION");
+        let switch = |old: &'static str, new: &'static str, promised: &'static str| {
+            let prepared = prepare(old, new, version, promised, &key(&bob));
+            let installed = prepared.installed.clone();
+            *service.program.lock().unwrap() = installed.clone();
+            let host = Installed(service.clone());
+            let task = tokio::task::spawn_blocking(move || {
+                let outcome = transact(
+                    &host,
+                    &prepared.state_dir,
+                    prepared.staging,
+                    prepared.journal,
+                    FAST,
+                    &Patient,
+                );
+                (outcome, prepared.root)
+            });
+            (task, installed)
+        };
+
+        // A live shell: the update waits, the program stays, the shell keeps working.
+        let (mut sh, r, life) = shell_to(&alice, "bob").await;
+        assert_eq!(r, ControlReply::Shell);
+        let (task, installed) = switch("old program", "new program", version);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!task.is_finished());
+        assert_eq!(std::fs::read(&installed).unwrap(), b"old program");
+        assert!(service.ended.lock().unwrap().is_empty());
+        let (code, out) = finish_shell(&mut sh, b"\x01printf 'kept_%s\\n' alive; exit 4\r").await;
+        assert_eq!(code, 4);
+        assert!(out.contains("kept_alive"), "{out}");
+        drop((sh, life));
+
+        // Idle: the program is replaced, the runtime ends itself, and the one that takes
+        // over answers for the same device.
+        let (outcome, _root) = tokio::time::timeout(T, task).await.unwrap().unwrap();
+        assert_eq!(outcome, Outcome::Updated);
+        assert_eq!(std::fs::read(&installed).unwrap(), b"new program");
+        assert_eq!(*service.ended.lock().unwrap(), [0], "it ended itself, idle");
+        let ControlReply::Status(view) = cmd(&bob, ControlRequest::Status).await else {
+            panic!("status");
+        };
+        assert!(view.running);
+        assert_eq!(view.endpoint, key(&bob));
+        // Its pairings and grants are intact: the peer gets a shell again.
+        let mut sh = shell_when_admitted(&alice, "bob").await;
+        assert_eq!(finish_shell(&mut sh, b"\x01exit 0\r").await.0, 0);
+        drop(sh);
+
+        // A program that is not the promised version: the previous bytes go back. This
+        // fixture's runtime reports the same version whatever its "program" file says, so
+        // what takes over reads as the previous version serving again.
+        let (task, installed) = switch("new program", "wrong program", "999.0.0");
+        let (outcome, _root) = tokio::time::timeout(T, task).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                &outcome,
+                Outcome::Unchanged(cause) | Outcome::RolledBack(cause) if cause.contains("999.0.0")
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(std::fs::read(&installed).unwrap(), b"new program");
+        assert!(service.ended.lock().unwrap().iter().all(|live| *live == 0));
+        let mut sh = shell_when_admitted(&alice, "bob").await;
+        assert_eq!(finish_shell(&mut sh, b"\x01exit 0\r").await.0, 0);
+        drop(sh);
+
+        // The test's own teardown.
+        let rb = service.running.lock().unwrap().take().unwrap();
+        rb.stop().await;
+        ra.stop().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

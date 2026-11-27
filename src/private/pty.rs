@@ -117,6 +117,7 @@ mod unix {
             .map_err(other)?;
         let mut command = shell.map_or_else(CommandBuilder::new_default_prog, CommandBuilder::new);
         command.env("TERM", "xterm-256color");
+        command.env(crate::private::HOST_ENV, std::process::id().to_string());
         let mut child = pair.slave.spawn_command(command).map_err(other)?;
         drop(pair.slave);
         let (exit_tx, exited) = oneshot::channel();

@@ -108,6 +108,144 @@ pub fn control(dir: &Path, action: ServiceAction) -> Result<()> {
     Ok(())
 }
 
+/// An installed service, for `massrelay update`.
+pub struct Managed {
+    dir: PathBuf,
+    unit: String,
+    path: PathBuf,
+}
+
+pub fn managed(dir: &Path) -> Result<Managed> {
+    let dir = dir
+        .canonicalize()
+        .context("resolve the device state directory")?;
+    let (units, unit) = profile_unit(&dir)?;
+    let path = units.join(&unit);
+    ensure!(
+        read_unit(&path)?.is_some(),
+        "no installed service for this profile. Run massrelay install first"
+    );
+    ensure!(
+        bounded(&["show-environment"])?.success,
+        "could not reach your systemd user manager"
+    );
+    Ok(Managed { dir, unit, path })
+}
+
+impl crate::update::Service for Managed {
+    fn label(&self) -> String {
+        self.unit.clone()
+    }
+
+    fn events(&self) -> PathBuf {
+        self.dir.join("connections.jsonl")
+    }
+
+    fn launches(&self, program: &Path) -> Result<bool> {
+        let unit = read_unit(&self.path)?.context("the service unit was removed")?;
+        if !starts(&String::from_utf8_lossy(&unit), program, &self.dir)? {
+            return Ok(false);
+        }
+        // What the manager would run can differ from the file: a drop-in, or an edit it has
+        // not loaded.
+        let shown = bounded(&[
+            "show",
+            "--property=ExecStart",
+            "--property=NeedDaemonReload",
+            &self.unit,
+        ])?;
+        ensure!(shown.success, "systemctl --user show failed");
+        loaded(&shown.stdout, program, &self.dir)
+    }
+
+    fn state(&self) -> Result<crate::update::Manager> {
+        let shown = bounded(&[
+            "show",
+            "--property=ActiveState",
+            "--property=MainPID",
+            &self.unit,
+        ])?;
+        ensure!(shown.success, "systemctl --user show failed");
+        manager_state(&shown.stdout)
+    }
+
+    fn start(&self) -> Result<()> {
+        // A program that failed repeatedly may have exhausted the unit's start limit.
+        let _ = bounded(&["reset-failed", &self.unit]);
+        let started = bounded(&["start", &self.unit])?;
+        ensure!(
+            started.success,
+            "systemctl --user start {} failed: {}",
+            self.unit,
+            started.stderr.trim()
+        );
+        Ok(())
+    }
+}
+
+/// What `systemctl show` says of a unit, as the update reads it. Only `inactive` and `failed`
+/// mean that nothing runs and nothing is about to: a unit that is activating (which includes
+/// waiting for its automatic restart), deactivating or reloading is in between.
+fn manager_state(shown: &str) -> Result<crate::update::Manager> {
+    use crate::update::Manager;
+    let property = |name: &str| {
+        shown
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
+            .with_context(|| format!("systemctl --user show printed no {name}"))
+    };
+    let pid: u32 = property("MainPID")?
+        .trim()
+        .parse()
+        .context("read the service's process ID")?;
+    Ok(match property("ActiveState")?.trim() {
+        "active" if pid != 0 => Manager::Running(pid),
+        "inactive" | "failed" => Manager::Stopped,
+        state => Manager::Pending(format!("as {state}")),
+    })
+}
+
+/// `systemctl --user`, within the limit an update gives one request to a service manager.
+fn bounded(args: &[&str]) -> Result<crate::update::Finished> {
+    crate::update::run_within(
+        Command::new("systemctl").arg("--user").args(args),
+        crate::update::MANAGER_LIMIT,
+    )
+    .context("run systemctl --user")
+}
+
+/// Whether every command a generated unit starts is `program` running the profile in `dir`.
+fn starts(unit: &str, program: &Path, dir: &Path) -> Result<bool> {
+    let expected = format!(
+        "ExecStart={} --state-dir {} run ",
+        argument(program, ":")?,
+        argument(dir, "")?
+    );
+    let mut commands = unit.lines().filter(|line| line.starts_with("ExecStart="));
+    Ok(commands
+        .next()
+        .is_some_and(|line| line.starts_with(&expected))
+        && commands.next().is_none())
+}
+
+/// Whether the unit as the manager has it loaded (`systemctl show`) starts only `program`
+/// running the profile in `dir`, and matches the unit file on disk.
+fn loaded(shown: &str, program: &Path, dir: &Path) -> Result<bool> {
+    let text = |path: &Path| {
+        path.to_str()
+            .map(str::to_owned)
+            .with_context(|| format!("path is not UTF-8: {}", path.display()))
+    };
+    let (program, dir) = (text(program)?, text(dir)?);
+    let expected = format!("ExecStart={{ path={program} ; argv[]={program} --state-dir {dir} run ");
+    let mut commands = shown.lines().filter(|line| line.starts_with("ExecStart="));
+    Ok(commands
+        .next()
+        .is_some_and(|line| line.starts_with(&expected))
+        && commands.next().is_none()
+        && shown.lines().any(|line| line == "NeedDaemonReload=no"))
+}
+
 fn profile_unit(dir: &Path) -> Result<(PathBuf, String)> {
     let default = default_state_dir()?.canonicalize().ok();
     let unit = unit_name(dir, default.as_deref());
@@ -223,6 +361,58 @@ mod tests {
         let source = render(binary, dir, &log)?;
         assert!(source.lines().any(|line| line
             == r#"ExecStart=":/home/A & B/bin/massrelay" --state-dir "/home/A & B/$HOME/%%i \"profile\"" run --log-file "/home/A & B/$HOME/%%i \"profile\"/connections.jsonl""#));
+        // An update only replaces the exact program the unit starts for this profile.
+        assert!(starts(&source, binary, dir)?);
+        assert!(!starts(
+            &source,
+            Path::new("/home/A & B/bin/massrelay2"),
+            dir
+        )?);
+        assert!(!starts(&source, Path::new("/home/A & B/bin/mass"), dir)?);
+        assert!(!starts(&source, binary, &log)?);
+        let twice = format!("{source}ExecStart=/bin/true\n");
+        assert!(!starts(&twice, binary, dir)?);
+
+        // The manager's loaded view must agree: this is what it prints for that unit.
+        let shown = |path: &str, reload: &str| {
+            format!(
+                "ExecStart={{ path={path} ; argv[]={path} --state-dir /home/A & B/$HOME/%i \"profile\" run --log-file /home/A & B/$HOME/%i \"profile\"/connections.jsonl ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }}\nNeedDaemonReload={reload}\n"
+            )
+        };
+        let current = shown("/home/A & B/bin/massrelay", "no");
+        assert!(loaded(&current, binary, dir)?);
+        // A drop-in that starts another program, or adds a command.
+        assert!(!loaded(&shown("/opt/other/massrelay", "no"), binary, dir)?);
+        let added = format!("ExecStart={{ path=/bin/true ; argv[]=/bin/true ; }}\n{current}");
+        assert!(!loaded(&added, binary, dir)?);
+        // Only a unit that is plainly not running counts as stopped.
+        use crate::update::Manager;
+        let state = |active: &str, pid: u32| {
+            manager_state(&format!("MainPID={pid}\nActiveState={active}\n")).unwrap()
+        };
+        assert_eq!(state("active", 4242), Manager::Running(4242));
+        assert_eq!(state("inactive", 0), Manager::Stopped);
+        assert_eq!(state("failed", 0), Manager::Stopped);
+        for between in ["activating", "deactivating", "reloading", "maintenance"] {
+            assert!(
+                matches!(state(between, 0), Manager::Pending(_)),
+                "{between}"
+            );
+            assert!(
+                matches!(state(between, 4242), Manager::Pending(_)),
+                "{between}"
+            );
+        }
+        assert!(matches!(state("active", 0), Manager::Pending(_)));
+        assert!(manager_state("ActiveState=active\n").is_err());
+
+        // A unit file changed on disk that the manager has not loaded yet.
+        assert!(!loaded(
+            &shown("/home/A & B/bin/massrelay", "yes"),
+            binary,
+            dir
+        )?);
+        assert!(!loaded(&current, binary, &log)?);
         Ok(())
     }
 }

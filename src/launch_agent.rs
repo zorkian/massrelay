@@ -133,6 +133,153 @@ pub fn control(dir: &Path, action: ServiceAction) -> Result<()> {
     Ok(())
 }
 
+/// An installed LaunchAgent, for `massrelay update`.
+pub struct Managed {
+    dir: PathBuf,
+    job: Job,
+    domain: String,
+}
+
+pub fn managed(dir: &Path) -> Result<Managed> {
+    let dir = dir
+        .canonicalize()
+        .context("resolve the device state directory")?;
+    let job = Job::for_profile(&dir)?;
+    let installed = fs::symlink_metadata(&job.plist).is_ok_and(|metadata| metadata.is_file());
+    ensure!(
+        installed,
+        "no installed service for this profile. Run massrelay install first"
+    );
+    let domain = bounded_domain()?;
+    Ok(Managed { dir, job, domain })
+}
+
+impl Managed {
+    fn target(&self) -> String {
+        format!("{}/{}", self.domain, self.job.label)
+    }
+
+    /// What launchd prints for the job, when it is loaded.
+    fn loaded(&self) -> Result<Option<String>> {
+        let printed = bounded(&mut launchctl("print", &self.target()))?;
+        Ok(printed.success.then_some(printed.stdout))
+    }
+}
+
+/// `login_domain`, with each request bounded, for the update.
+fn bounded_domain() -> Result<String> {
+    let uid = bounded(Command::new("/usr/bin/id").arg("-u")).context("read the user ID")?;
+    ensure!(uid.success, "read the user ID failed");
+    let uid = uid.stdout.trim().parse::<u32>()?;
+    ensure!(
+        uid != 0,
+        "manage MassRelay from your Mac account without sudo"
+    );
+    let domain = format!("gui/{uid}");
+    let session =
+        bounded(&mut launchctl("print", &domain)).context("find the macOS login session")?;
+    ensure!(session.success, "find the macOS login session failed");
+    Ok(domain)
+}
+
+/// A command, within the limit an update gives one request to a service manager.
+fn bounded(command: &mut Command) -> Result<crate::update::Finished> {
+    crate::update::run_within(command, crate::update::MANAGER_LIMIT)
+}
+
+impl crate::update::Service for Managed {
+    fn label(&self) -> String {
+        self.job.label.clone()
+    }
+
+    fn events(&self) -> PathBuf {
+        self.job.events.clone()
+    }
+
+    fn launches(&self, program: &Path) -> Result<bool> {
+        let extracted = bounded(
+            Command::new("/usr/bin/plutil")
+                .args(["-extract", "ProgramArguments", "json", "-o", "-", "--"])
+                .arg(&self.job.plist),
+        )
+        .context("read the LaunchAgent's program")?;
+        ensure!(extracted.success, "read the LaunchAgent's program failed");
+        let arguments: Vec<String> = serde_json::from_str(&extracted.stdout)?;
+        let expected = [
+            path_text(program)?,
+            "--state-dir",
+            path_text(&self.dir)?,
+            "run",
+        ];
+        let starts = |arguments: &[String]| {
+            arguments.len() >= expected.len() && arguments.iter().zip(expected).all(|(a, b)| a == b)
+        };
+        if !starts(&arguments) {
+            return Ok(false);
+        }
+        // launchd reads the plist when it loads the job, so a loaded job can differ from the
+        // file. A job that is not loaded will be loaded from the file.
+        Ok(match self.loaded()? {
+            Some(printed) => job_arguments(&printed).is_some_and(|loaded| starts(&loaded)),
+            None => true,
+        })
+    }
+
+    /// A job that is not loaded is stopped. A loaded job with a process is running. A loaded
+    /// job without one is neither: launchd keeps such a job alive and is about to start it.
+    fn state(&self) -> Result<crate::update::Manager> {
+        use crate::update::Manager;
+        Ok(match self.loaded()? {
+            None => Manager::Stopped,
+            Some(printed) => match job_pid(&printed) {
+                Some(pid) => Manager::Running(pid),
+                None => Manager::Pending("as loaded, with no process yet".into()),
+            },
+        })
+    }
+
+    /// Load the job, which starts it. A loaded job is launchd's to start, and is left to it.
+    fn start(&self) -> Result<()> {
+        if self.loaded()?.is_some() {
+            return Ok(());
+        }
+        let mut command = launchctl("bootstrap", &self.domain);
+        command.arg(&self.job.plist);
+        let started = bounded(&mut command).context("start the LaunchAgent")?;
+        ensure!(
+            started.success,
+            "start the LaunchAgent failed: {}",
+            started
+                .stderr
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        Ok(())
+    }
+}
+
+/// The process ID in `launchctl print` output for a running job.
+fn job_pid(printed: &str) -> Option<u32> {
+    printed
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("pid = ")?.trim().parse().ok())
+}
+
+/// The arguments in `launchctl print` output for a loaded job.
+fn job_arguments(printed: &str) -> Option<Vec<String>> {
+    let mut lines = printed.lines().map(str::trim);
+    lines.find(|line| *line == "arguments = {")?;
+    let mut arguments = vec![];
+    for line in lines {
+        if line == "}" {
+            return Some(arguments);
+        }
+        arguments.push(line.to_owned());
+    }
+    None
+}
+
 fn login_domain() -> Result<String> {
     let uid = checked(Command::new("/usr/bin/id").arg("-u"), "read the user ID")?;
     let uid = std::str::from_utf8(&uid.stdout)?.trim().parse::<u32>()?;
@@ -292,6 +439,25 @@ mod tests {
         assert_eq!(default.label, LABEL);
         assert_ne!(default.plist, custom.plist);
         assert_ne!(default.events, custom.events);
+        assert_eq!(
+            job_pid("gui/501/com.massrelay.client = {\n\tstate = running\n\tpid = 4242\n}"),
+            Some(4242)
+        );
+        assert_eq!(
+            job_pid("\tstate = not running\n\tlast exit code = 0\n"),
+            None
+        );
+        assert_eq!(
+            job_arguments(
+                "x = {\n\tprogram = /a b/massrelay\n\targuments = {\n\t\t/a b/massrelay\n\t\t--state-dir\n\t\t/s\n\t\trun\n\t}\n\tpid = 7\n}"
+            ),
+            Some(
+                ["/a b/massrelay", "--state-dir", "/s", "run"]
+                    .map(String::from)
+                    .to_vec()
+            )
+        );
+        assert_eq!(job_arguments("x = {\n\tstate = running\n}"), None);
         let source = custom.render(&binary, &dir)?;
         let file = stage(temp.path(), source.as_bytes())?;
         let args = checked(

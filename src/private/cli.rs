@@ -77,6 +77,8 @@ const INVITE_PREFIX: &str = "mrprivinv0_";
 const INVITE_FORMAT: &str = "massrelay-private-invite/experimental-0";
 /// Transport ALPN of the throwaway endpoint that checks a relay's incarnation.
 const CHECK_ALPN: &[u8] = b"massrelay/mailbox-check/experimental-1";
+/// The exit status of a runtime that an update retired, outside Windows (`EX_TEMPFAIL`).
+const RETIRED_EXIT: i32 = 75;
 /// How often a waiting join looks for its reply.
 const JOIN_POLL: Duration = Duration::from_secs(2);
 
@@ -289,7 +291,7 @@ pub async fn execute(state_dir: &Path, command: Command) -> Result<i32> {
                     "the runtime failed; run it in a terminal for details",
                 );
             }
-            ran?
+            return ran;
         }
         Command::Status => status(&dir).await?,
         Command::Rename {
@@ -450,6 +452,36 @@ pub fn check_enrolled(state_dir: &Path) -> Result<()> {
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub fn claim_owner(state_dir: &Path) -> Result<Owner> {
     Owner::acquire(&state_dir.join(DIR_NAME)).map_err(|error| anyhow!("{error:?}"))
+}
+
+/// The candidate's side of an update's preflight: read this profile the way `status` does,
+/// writing nothing, and check the pinned relay from a throwaway identity on a temporary
+/// endpoint. Returns the device's endpoint ID. Never listens with the device's identity.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+pub async fn check_profile_for_update(state_dir: &Path) -> Result<String> {
+    let dir = state_dir.join(DIR_NAME);
+    let profile = load(&dir)?;
+    let path = dir.clone();
+    let view = blocking(move || {
+        let device = Device::open(&path, Offline, Clock::System).map_err(membership)?;
+        let state = device.state().map_err(membership)?;
+        ensure!(
+            state.net.is_some() && state.terminal.is_none(),
+            "this device is not an enrolled member"
+        );
+        runtime::offline_status(&device).map_err(|e| anyhow!("{e:?}"))
+    })
+    .await??;
+    let endpoint = hex(profile.secret().public().as_bytes());
+    ensure!(
+        view.endpoint == endpoint,
+        "the profile's key and its membership state name different devices"
+    );
+    let bind = SocketAddr::from(([0, 0, 0, 0], 0));
+    tokio::time::timeout(Duration::from_secs(40), check_relay(&profile.locator, bind))
+        .await
+        .context("the pinned relay did not answer in time")??;
+    Ok(endpoint)
 }
 
 pub fn profile_exists(state_dir: &Path) -> bool {
@@ -982,7 +1014,7 @@ async fn run(
     log_file: PathBuf,
     bind: SocketAddr,
     sync_every: u64,
-) -> Result<()> {
+) -> Result<i32> {
     let mut profile = load(dir)?;
     ensure!(sync_every > 0, "--sync-every must be at least one second");
     // A duplicate must not use this profile's key to register at the relay.
@@ -1069,7 +1101,13 @@ async fn run(
         );
         eprintln!("Press Ctrl-C to stop.");
     }
-    let signal = crate::shutdown().await;
+    // A runtime that an update retired serves nothing and ends itself here, by the same
+    // ordered stop. Nothing outside it is asked to stop it.
+    let retired = runtime.retired();
+    let signal = tokio::select! {
+        signal = crate::shutdown() => Some(signal),
+        _ = retired.notified() => None,
+    };
     let stopped = runtime.stop().await;
     if !stopped.aborted.is_empty() {
         diagnostics::event(
@@ -1096,8 +1134,25 @@ async fn run(
         eprintln!("Stopped; the profile is released.");
     }
     diagnostics::quiet(Level::Info, "the runtime stopped");
-    signal?;
-    Ok(())
+    match signal {
+        Some(signal) => {
+            signal?;
+            Ok(0)
+        }
+        // Under the Windows service manager a clean stop is never started again, and the
+        // updater starts the service once the program is replaced.
+        None if cfg!(windows) => Ok(0),
+        // Elsewhere the program is already replaced under this process. Ending with a
+        // failure status makes a service manager that restarts failed services (systemd's
+        // `Restart=on-failure`, launchd's `KeepAlive`) start it, even if the updater is gone.
+        None => {
+            diagnostics::quiet(
+                Level::Info,
+                "retired for an update; ending so that the installed program takes over",
+            );
+            Ok(RETIRED_EXIT)
+        }
+    }
 }
 
 // ------------------------------------------------------------ status, peers

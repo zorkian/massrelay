@@ -106,8 +106,8 @@ use super::membership::{
     Advance, Device, Dispatch, Error as MembershipError, Gate, MemberView, Polled, Settle, Stop,
 };
 use super::pairing::{
-    Approved, Authorization, Cutoff, Exposure, Owner, PAIRING_ALPN, PairError, PairingState, Peers,
-    Refusal, SessionHandle, read_bounded,
+    Activity, AdmissionHold, Approved, Authorization, Cutoff, Exposure, Owner, PAIRING_ALPN,
+    PairError, PairingState, Peers, Refusal, SessionHandle, read_bounded,
 };
 
 /// ALPN of the private service listener.
@@ -413,6 +413,27 @@ impl<M: Mailbox + Send + Sync + 'static> Node<M> {
 
     pub fn stopping(&self) -> bool {
         self.owner.stopping()
+    }
+
+    /// Close admission if nothing is live (see `Owner::hold_if_idle`).
+    pub fn hold_if_idle(&self) -> Result<AdmissionHold, Activity> {
+        self.owner.hold_if_idle()
+    }
+
+    /// Whether an update's hold is in force (see `Owner::held`).
+    pub fn held(&self) -> bool {
+        self.owner.held()
+    }
+
+    /// Permanently stop through a hold that is still in force (see
+    /// `AdmissionHold::retire`), then ask the mailbox to end calls in flight.
+    /// Returns whether this call retired the owner.
+    pub fn retire_held(&self, hold: &AdmissionHold, why: &str) -> bool {
+        let retired = hold.retire(why);
+        if retired {
+            self.device.mailbox().shutdown();
+        }
+        retired
     }
 
     /// Native PTY workers (reapers) still running, including any whose

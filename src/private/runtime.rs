@@ -62,6 +62,41 @@
 //! registry lock, so a stalled relay never delays a local cutoff, decline or
 //! stop.
 //!
+//! # Updates
+//!
+//! `massrelay update` (`crate::update`) replaces the installed program only
+//! while nothing is using this device. `Update(Identify)` tells it which
+//! process, program and version answers for the profile now. The rest is two
+//! steps on one authenticated control connection:
+//!
+//! 1. `Update(Hold)` asks the owner's registry, in one step under its lock,
+//!    whether any authorization, session or exposure is live and, if none
+//!    is, closes admission (`Owner::hold_if_idle`). The reply is `Busy` with
+//!    what is live, or `Held` with this runtime's identity, so the updater
+//!    knows on the hold's own connection exactly which process it holds. A
+//!    hold lasts while its connection stays open, for at most the lease. When
+//!    it lapses, admission reopens and the device serves as before. A hold
+//!    alone never stops anything. One hold at a time; a second is answered
+//!    `Busy`.
+//! 2. `Commit`, sent on that connection, retires this runtime: under the same
+//!    lock, only if that hold is still in force and the registry still
+//!    empty, the owner moves to stopping (`AdmissionHold::retire`), and the
+//!    reply is `Retired`. A commit that arrives after the hold lapsed finds
+//!    its connection closed and retires nothing.
+//!
+//! `Identify` never shows a runtime that may be ending as one that serves:
+//! while a hold is in force the identity says so (`held`), and from the
+//! moment the runtime retires, which is before it answers the commit, the
+//! answer is `Retired`.
+//!
+//! A retired runtime then ends itself through its ordinary stop
+//! (`Runtime::retired`). Nothing outside it is asked to stop it, so what
+//! ends is exactly the runtime that was idle when it retired, and never a
+//! process that took its place. On Unix it ends as a failure, so that a
+//! service manager which restarts failed services starts the program that is
+//! installed by then; under the Windows service manager it ends cleanly, and
+//! the updater starts the service.
+//!
 //! # Stop
 //!
 //! `stop` first moves the owner to stopping (`Node::retire_all`, under the
@@ -224,7 +259,57 @@ pub enum ControlRequest {
         lifetime_port: u16,
         lifetime_key: [u8; 32],
     },
+    /// Coordination with `massrelay update`. A runtime that predates it drops the connection.
+    Update(UpdateRequest),
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpdateRequest {
+    /// Which process, program and version serves this profile.
+    Identify,
+    /// Close admission if nothing is live, until this connection ends.
+    Hold,
+    /// The second step on a `Hold` connection: retire the runtime that granted the hold.
+    Commit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpdateReply {
+    Identity(Identity),
+    /// Something is live, another update holds admission, or the runtime is stopping.
+    Busy {
+        connections: usize,
+        exposures: usize,
+        held: bool,
+    },
+    /// Admission is closed and nothing is live, for at most `lease_secs`.
+    Held {
+        lease_secs: u64,
+        /// The runtime that holds: the one a commit on this connection retires.
+        identity: Identity,
+    },
+    /// This runtime is permanently stopping, having ended nothing. The answer to a commit,
+    /// and to any later `Identify` until the process is gone.
+    Retired,
+}
+
+/// The process serving a profile.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Identity {
+    pub pid: u32,
+    /// The program this process was started from, when the system reports it as text.
+    pub executable: Option<String>,
+    pub version: String,
+    pub endpoint: String,
+    /// An update's hold is in force on this runtime: it admits nothing, and a commit on the
+    /// hold's connection retires it. Such a runtime may be about to end, so it is not to be
+    /// taken for a settled, serving one.
+    #[serde(default)]
+    pub held: bool,
+}
+
+/// How long an update's admission hold lasts without its commit.
+pub const HOLD_LEASE: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlReply {
@@ -257,6 +342,7 @@ pub enum ControlReply {
         key: String,
         alias: String,
     },
+    Update(UpdateReply),
     Error(String),
 }
 
@@ -447,6 +533,8 @@ pub struct Config {
     pub addresses: Addresses,
     /// Event log file (`None`: `connections.jsonl` in `dir`).
     pub log_file: Option<PathBuf>,
+    /// How long an update's admission hold lasts without its commit.
+    pub hold_lease: Duration,
 }
 
 impl Config {
@@ -457,6 +545,7 @@ impl Config {
             sync_every: Some(Duration::from_secs(30)),
             addresses: Arc::new(|key| EndpointId::from_bytes(key).ok().map(EndpointAddr::new)),
             log_file: None,
+            hold_lease: HOLD_LEASE,
         }
     }
 }
@@ -466,6 +555,9 @@ struct Shared<M: Mailbox> {
     endpoint: Endpoint,
     addresses: Addresses,
     last_sync: Mutex<Option<String>>,
+    hold_lease: Duration,
+    /// Signalled when an update retired this runtime.
+    retired: Arc<tokio::sync::Notify>,
 }
 
 /// A running private profile. Drop stops admission and retires sessions
@@ -476,6 +568,7 @@ pub struct Runtime<M: Mailbox + Send + Sync + 'static> {
     stop: watch::Sender<bool>,
     tasks: Vec<(&'static str, JoinHandle<()>)>,
     log: Arc<DeviceLog>,
+    retired: Arc<tokio::sync::Notify>,
 }
 
 /// What `stop` achieved.
@@ -526,13 +619,16 @@ impl<M: Mailbox + Send + Sync + 'static> Runtime<M> {
             .map_err(|e| local(&e))?;
         // The baseline later state events are diffed against.
         audit::observe(&node, true);
+        let (stop, stopping) = watch::channel(false);
+        let retired = Arc::new(tokio::sync::Notify::new());
         let shared = Arc::new(Shared {
             node,
             endpoint,
             addresses: config.addresses,
             last_sync: Mutex::new(None),
+            hold_lease: config.hold_lease,
+            retired: retired.clone(),
         });
-        let (stop, stopping) = watch::channel(false);
         let mut tasks = vec![];
 
         let accept = shared
@@ -618,7 +714,14 @@ impl<M: Mailbox + Send + Sync + 'static> Runtime<M> {
             stop,
             tasks,
             log,
+            retired,
         })
+    }
+
+    /// Notified when an update retired this runtime. It serves nothing from then on, and
+    /// nothing else will stop it: stop it and end the process.
+    pub fn retired(&self) -> Arc<tokio::sync::Notify> {
+        self.retired.clone()
     }
 
     /// The event log file.
@@ -758,7 +861,14 @@ async fn serve_control<M: Mailbox + Send + Sync + 'static>(
     if shared.node.stopping() && !matches!(request, ControlRequest::Status | ControlRequest::Peers)
     {
         audit("denied", Some("device_stopping"));
-        let reply = ControlReply::Error("the private runtime is stopping".into());
+        // A runtime that is ending never identifies itself as one that serves: from the
+        // moment it retires, and so before it can say that it has, the answer is this.
+        let reply = match request {
+            ControlRequest::Update(UpdateRequest::Identify) => {
+                ControlReply::Update(UpdateReply::Retired)
+            }
+            _ => ControlReply::Error("the private runtime is stopping".into()),
+        };
         return wire::send(&mut socket, reply).await;
     }
     match request {
@@ -858,6 +968,17 @@ async fn serve_control<M: Mailbox + Send + Sync + 'static>(
                 audit("failed", Some("lifetime_channel_failed"));
             }
             hold_exposure(shared, socket, peer, service, target, lifetime?).await
+        }
+        ControlRequest::Update(UpdateRequest::Identify) => {
+            audit("allowed", None);
+            let reply = ControlReply::Update(UpdateReply::Identity(identity(&shared)));
+            wire::send(&mut socket, reply).await
+        }
+        ControlRequest::Update(UpdateRequest::Hold) => hold_admission(&shared, socket).await,
+        ControlRequest::Update(UpdateRequest::Commit) => {
+            audit("denied", Some("command_rejected"));
+            let reply = ControlReply::Error("a commit follows a hold on its connection".into());
+            wire::send(&mut socket, reply).await
         }
         request => {
             let changes = !matches!(
@@ -976,12 +1097,92 @@ fn manage<M: Mailbox + Send + Sync + 'static>(
             | ControlRequest::Rename { .. }
             | ControlRequest::Shell { .. }
             | ControlRequest::Connect { .. }
-            | ControlRequest::Expose { .. } => {
+            | ControlRequest::Expose { .. }
+            | ControlRequest::Update(_) => {
                 return Err("not a management command".into());
             }
         })
     };
     run().unwrap_or_else(ControlReply::Error)
+}
+
+/// The two steps of an update on one connection (see the module docs). Close admission if
+/// nothing is live and keep it closed while the connection stays open, within the lease.
+/// Then, only if the updater commits while that hold is in force, retire this runtime under
+/// the registry lock and have it end itself. A hold that lapses, is released or is never
+/// committed reopens admission and stops nothing.
+async fn hold_admission<M: Mailbox + Send + Sync + 'static>(
+    shared: &Shared<M>,
+    mut socket: TcpStream,
+) -> Result<()> {
+    let log = shared.node.log();
+    let record = |operation, outcome, reason| log.control(operation, outcome, None, None, reason);
+    let hold = match shared.node.hold_if_idle() {
+        Ok(hold) => hold,
+        Err(activity) => {
+            record("update_hold", "denied", Some("device_busy"));
+            let reply = UpdateReply::Busy {
+                connections: activity.connections,
+                exposures: activity.exposures,
+                held: activity.held,
+            };
+            return wire::send(&mut socket, ControlReply::Update(reply)).await;
+        }
+    };
+    record("update_hold", "allowed", None);
+    let held = UpdateReply::Held {
+        lease_secs: shared.hold_lease.as_secs(),
+        identity: identity(shared),
+    };
+    // The only thing the updater may say next is `Commit`. Anything else, its end or an
+    // error releases the hold.
+    let commit = async {
+        wire::send(&mut socket, ControlReply::Update(held))
+            .await
+            .ok()?;
+        let frame = wire::read_frame_max(&mut socket, 64).await.ok()?;
+        matches!(
+            serde_json::from_slice::<UpdateRequest>(&frame),
+            Ok(UpdateRequest::Commit)
+        )
+        .then_some(())
+    };
+    let lapsed = tokio::select! {
+        biased;
+        _ = hold.retired() => Some("device_stopping"),
+        committed = commit => committed.is_none().then_some("hold_released"),
+        _ = tokio::time::sleep(shared.hold_lease) => Some("hold_expired"),
+    };
+    if let Some(reason) = lapsed {
+        drop(hold);
+        record("update_hold", "failed", Some(reason));
+        return Ok(());
+    }
+    // The linearization point: stopping only if this hold still stands on an empty registry.
+    if !shared.node.retire_held(&hold, "retired for an update") {
+        drop(hold);
+        record("update_retire", "denied", Some("hold_lost"));
+        return Ok(());
+    }
+    record("update_retire", "allowed", None);
+    // Whether or not the updater hears of it, this runtime now ends itself: nothing else is
+    // asked to stop it, so nothing that might have taken its place can be stopped instead.
+    let _ = wire::send(&mut socket, ControlReply::Update(UpdateReply::Retired)).await;
+    shared.retired.notify_one();
+    Ok(())
+}
+
+/// This process as the runtime of its profile.
+fn identity<M: Mailbox + Send + Sync + 'static>(shared: &Shared<M>) -> Identity {
+    Identity {
+        pid: std::process::id(),
+        executable: std::env::current_exe()
+            .ok()
+            .and_then(|path| path.to_str().map(str::to_owned)),
+        version: env!("CARGO_PKG_VERSION").into(),
+        endpoint: hex(&shared.node.endpoint_key()),
+        held: shared.node.held(),
+    }
 }
 
 /// Hold one exposure for as long as the command's lifetime socket stays

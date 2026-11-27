@@ -31,7 +31,10 @@ use sha2::{Digest, Sha256};
 #[cfg(windows)]
 mod native;
 #[cfg(windows)]
-pub use native::{control, install, private_audit, private_marker, serve, serving, until_stopped};
+pub use native::{
+    Managed, control, install, managed, private_audit, private_marker, serve, serving,
+    until_stopped,
+};
 
 #[derive(clap::Args)]
 pub struct InstallOptions {

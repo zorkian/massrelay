@@ -66,6 +66,9 @@ pub const PROTOCOL: &[u8] = b"massrelay-private/experimental-1";
 /// Format of the profile state row.
 pub const STATE_FORMAT: &str = "massrelay-private-membership/experimental-1";
 pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+/// Set in every shell a runtime serves to that runtime's process ID, so a command can tell
+/// that it runs inside one of this device's own shell sessions.
+pub const HOST_ENV: &str = "MASSRELAY_SHELL_HOST";
 /// Invite reservation window.
 pub const INVITE_WINDOW_SECS: u64 = 600;
 /// Tolerated backwards issuer clock step. Within it, the high-water mark is

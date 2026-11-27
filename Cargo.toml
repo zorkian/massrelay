@@ -17,6 +17,8 @@ iroh = { version = "=1.5.0", default-features = false, features = ["tls-ring"] }
 iroh-mdns-address-lookup = "0.6.1"
 iroh-relay = { version = "=1.5.0", default-features = false, features = ["server", "tls-ring"] }
 portable-pty = "0.9"
+# The HTTPS client Iroh already builds, for `massrelay update`.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 subtle = "2"
@@ -56,6 +58,7 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 rcgen = "0.14"
 rustls = { version = "0.23", default-features = false }
+tokio-rustls = { version = "0.26", default-features = false }
 
 [build-dependencies]
 cc = "1"
