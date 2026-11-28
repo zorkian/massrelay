@@ -203,9 +203,16 @@ try {
     $service = Get-DeviceService $name
     Assert ($service.State -eq 'Running' -and $service.ProcessId -ne $first) 'The second install did not restart the service.'
 
+    # Start from a custom shell so installing with the default requires a restart.
+    $otherShell = Join-Path ([Environment]::SystemDirectory) 'cmd.exe'
+    $custom = Invoke-Tool $exe ($install + @('--shell', $otherShell)) $secret
+    Assert ($custom.ExitCode -eq 0) "Installing the custom shell failed: $($custom.Error)"
+    $service = Get-DeviceService $name
+    Assert ($service.PathName.EndsWith("--shell `"$otherShell`"", [StringComparison]::OrdinalIgnoreCase)) "The service does not use the custom shell: $($service.PathName)"
+
     # Installs from a session of the service. A throwaway service, started by the service
     # manager as the device's is, opens a shell as the device does for a peer and installs
-    # from it: first with nothing to change, then registering another shell. It ends that
+    # from it: first with nothing to change, then restoring the default shell. It ends that
     # shell once the install is queued, and the detached process has to finish by itself.
     # Nothing here is skipped: a handoff that cannot start fails the fixture.
     $tests = & cargo +stable test --locked --release --no-run --message-format=json |
@@ -220,7 +227,6 @@ try {
     $hostedProbe = "MassRelayHostedProbe-$($id.Substring(0, 8))"
     $hostedExe = Join-Path $root 'hosted-probe.exe'
     $hostedDone = Join-Path $root 'hosted-probe.result'
-    $otherShell = Join-Path ([Environment]::SystemDirectory) 'cmd.exe'
     $pipeName = "massrelay-fixture-$id"
     Copy-Item -LiteralPath $tests -Destination $hostedExe
     @{
@@ -260,7 +266,8 @@ try {
     $previous = $service.ProcessId
     $service = Get-DeviceService $name
     Assert ($service.State -eq 'Running' -and $service.ProcessId -ne $previous) 'The detached install did not restart the service.'
-    Assert ($service.PathName.EndsWith("--shell `"$otherShell`"", [StringComparison]::OrdinalIgnoreCase)) "The detached install did not register the other shell: $($service.PathName)"
+    $defaultShell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+    Assert ($service.PathName.EndsWith("--shell `"$defaultShell`"", [StringComparison]::OrdinalIgnoreCase)) "The detached install did not register the default shell: $($service.PathName)"
     Assert (Test-Runtime) 'The runtime does not answer after the detached install.'
     Stop-Service -Name $hostedProbe
 

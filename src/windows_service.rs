@@ -102,25 +102,27 @@ fn update_command_line(binary: &str, dir: &str) -> Result<String> {
     ))
 }
 
-/// The command line of a queued install: the confirmed options, with the shell it settled on.
-/// The password is not one of them.
+/// The command line of a queued install. Leave the shell implicit if it was implicit when
+/// the plan was confirmed, so the worker resolves it through the same path.
 fn install_command_line(
     binary: &str,
     dir: &str,
-    shell: &str,
+    shell: Option<&str>,
     allow_administrator: bool,
 ) -> Result<String> {
-    Ok(format!(
-        "{} --state-dir {} install --yes --shell {}{}",
+    let mut command = format!(
+        "{} --state-dir {} install --yes",
         quote(binary)?,
-        quote(dir)?,
-        quote(shell)?,
-        if allow_administrator {
-            " --allow-administrator"
-        } else {
-            ""
-        }
-    ))
+        quote(dir)?
+    );
+    if let Some(shell) = shell {
+        command.push_str(" --shell ");
+        command.push_str(&quote(shell)?);
+    }
+    if allow_administrator {
+        command.push_str(" --allow-administrator");
+    }
+    Ok(command)
 }
 
 /// A password, or bytes holding one, wiped when dropped.
@@ -1075,12 +1077,17 @@ mod tests {
 
         // The command line carries the confirmed options, and nothing about the password.
         assert_eq!(
-            install_command_line(r"C:\a b\massrelay.exe", r"C:\state\", r"C:\sh.exe", true)?,
+            install_command_line(
+                r"C:\a b\massrelay.exe",
+                r"C:\state\",
+                Some(r"C:\sh.exe"),
+                true
+            )?,
             r#""C:\a b\massrelay.exe" --state-dir "C:\state\\" install --yes --shell "C:\sh.exe" --allow-administrator"#
         );
-        assert!(
-            !install_command_line(r"C:\m.exe", r"C:\state", r"C:\sh.exe", false)?
-                .contains("--allow-administrator")
+        assert_eq!(
+            install_command_line(r"C:\m.exe", r"C:\state", None, false)?,
+            r#""C:\m.exe" --state-dir "C:\state" install --yes"#
         );
         Ok(())
     }

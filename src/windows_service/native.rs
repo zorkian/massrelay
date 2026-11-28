@@ -303,7 +303,7 @@ impl super::InstallPlan {
         let command = super::install_command_line(
             &prepared.binary,
             &prepared.dir,
-            &prepared.shell,
+            self.options.shell.as_ref().map(|_| prepared.shell.as_str()),
             self.options.allow_administrator,
         )?;
         let message = super::handoff_message(approval, password.as_ref())?;
@@ -2002,7 +2002,7 @@ mod service_fixture {
         /// The installed program, and the process of the service installed with it.
         program: PathBuf,
         service_process: u32,
-        /// A shell to register in place of the installed one.
+        /// The explicitly configured shell, which the second install replaces with the default.
         other_shell: PathBuf,
         /// A pipe that gives the account's password to this account alone.
         password_pipe: String,
@@ -2024,7 +2024,7 @@ mod service_fixture {
     }
 
     /// Install from a shell made as the service makes a peer's, marked as the installed
-    /// service's own: first with nothing to change, then registering another shell, which
+    /// service's own: first with nothing to change, then registering the default shell, which
     /// restarts it. That shell is ended as soon as the install says it is queued.
     async fn install_from_a_shell(hosted: &Hosted) -> Result<()> {
         // This probe, like the installed service, is started by the service manager. Looked
@@ -2061,9 +2061,10 @@ mod service_fixture {
             );
             // The last line prints text that the typed command does not contain.
             let unchanged = format!(
-                "$env:{}='{}'\r{install} --yes; \"EXIT$LASTEXITCODE.\"\r",
+                "$env:{}='{}'\r{install} --shell '{}' --yes; \"EXIT$LASTEXITCODE.\"\r",
                 crate::private::HOST_ENV,
-                hosted.service_process
+                hosted.service_process,
+                hosted.other_shell.display()
             );
             writer.write_all(unchanged.as_bytes()).await?;
             shown(&mut reader, &mut output, "EXIT0.", true).await?;
@@ -2072,7 +2073,7 @@ mod service_fixture {
                 "the unchanged service was not kept"
             );
 
-            let replacing = format!("{install} --shell '{}'\r", hosted.other_shell.display());
+            let replacing = format!("{install}\r");
             writer.write_all(replacing.as_bytes()).await?;
             shown(&mut reader, &mut output, "Proceed?[y/N]", true).await?;
             writer.write_all(b"y\r").await?;
