@@ -1105,7 +1105,7 @@ fn complete(
 
 // ------------------------------------------------------- service transitions
 
-fn say(text: impl AsRef<str>) {
+pub(crate) fn say(text: impl AsRef<str>) {
     // A closed terminal must not stop an exchange half way.
     let _ = writeln!(io::stdout(), "{}", text.as_ref());
 }
@@ -1162,6 +1162,26 @@ fn observe_for(host: &dyn Host, timing: Timing, limit: Duration) -> Serving {
             Serving::Unsettled(_) if Instant::now() < deadline => timing.pause(),
             seen => return seen,
         }
+    }
+}
+
+/// The installed service of the profile in `state_dir`, for another command to look at. Its
+/// questions block, so they are asked off the async runtime.
+pub(crate) fn installed_service(state_dir: &Path) -> Result<Arc<dyn Host>> {
+    Ok(Arc::new(Live {
+        service: crate::background_service::managed(state_dir)?,
+        state_dir: state_dir.to_path_buf(),
+        handle: tokio::runtime::Handle::current(),
+    }))
+}
+
+/// Wait, as long as an update waits for a start, until the service manager's process answers
+/// the profile's authenticated control channel as a settled runtime.
+pub(crate) fn await_service(host: &dyn Host, timing: Timing) -> Result<Identity> {
+    match observe(host, timing) {
+        Serving::Managed(identity) => Ok(identity),
+        Serving::Stopped => bail!("the service is not running"),
+        Serving::Unsettled(what) => bail!("{what} after {} seconds", timing.verify.as_secs()),
     }
 }
 

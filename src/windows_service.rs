@@ -11,6 +11,10 @@
 //! the runtime waits for shutdown, and a stop request ends that wait, so the runtime stops in
 //! its usual order. The service controller performs the stop and start for a restart.
 //!
+//! An install asked for in a session that depends on the service leaves an unchanged, running
+//! one alone. Otherwise it asks for the password there and hands what is left, with that
+//! password, to a detached process over the pipe that activates it.
+//!
 //! What the install refuses, so the service cannot be turned against its account:
 //!
 //! - a program, shell or state directory that another account can modify or replace (checked
@@ -38,12 +42,15 @@ use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
+use crate::{installer, private::runtime::Identity};
+
 #[cfg(windows)]
 mod native;
 #[cfg(windows)]
 pub use native::{
-    Managed, control, is_default_shell, managed, plan_install, plan_uninstall, private_audit,
-    private_marker, serve, serving, ssh_files, ssh_private_dir, until_stopped, wait_for_activation,
+    Managed, control, handoff, is_default_shell, managed, plan_install, plan_uninstall,
+    private_audit, private_marker, serve, serving, ssh_files, ssh_private_dir, until_stopped,
+    wait_for_activation,
 };
 
 #[derive(clap::Args)]
@@ -80,7 +87,10 @@ fn command_line(binary: &str, dir: &str, name: &str, shell: &str) -> Result<Stri
 /// The log of the last update queued from one of this device's shells, in the state
 /// directory.
 const UPDATE_LOG: &str = "update.log";
-/// Held, in the state directory, for as long as a queued update or its helper runs.
+/// The same for an install.
+const INSTALL_LOG: &str = "install.log";
+/// Held, in the state directory, for as long as a queued update, its helper or a queued
+/// install runs.
 const UPDATE_LOCK: &str = "update.lock";
 
 /// The command line of an update queued from one of this device's shells.
@@ -92,23 +102,131 @@ fn update_command_line(binary: &str, dir: &str) -> Result<String> {
     ))
 }
 
-/// The byte that lets a queued update act.
+/// The command line of a queued install: the confirmed options, with the shell it settled on.
+/// The password is not one of them.
+fn install_command_line(
+    binary: &str,
+    dir: &str,
+    shell: &str,
+    allow_administrator: bool,
+) -> Result<String> {
+    Ok(format!(
+        "{} --state-dir {} install --yes --shell {}{}",
+        quote(binary)?,
+        quote(dir)?,
+        quote(shell)?,
+        if allow_administrator {
+            " --allow-administrator"
+        } else {
+            ""
+        }
+    ))
+}
+
+/// A password, or bytes holding one, wiped when dropped.
+pub(crate) struct Secret<T: Copy + Default = u16>(Vec<T>);
+
+impl<T: Copy + Default> Drop for Secret<T> {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
+    }
+}
+
+fn wipe<T: Copy + Default>(data: &mut [T]) {
+    for item in data {
+        // SAFETY: `item` is a valid, exclusive reference. The volatile write keeps the
+        // compiler from dropping the wipe as a dead store.
+        unsafe { std::ptr::write_volatile(item, T::default()) };
+    }
+}
+
+/// A line of `input`, its newline included, of at most `limit` bytes. It is read a byte at a
+/// time, so that nothing past the line is taken and no buffer but the one returned holds it.
+/// `input` must not buffer either.
+fn read_secret_line(mut input: impl Read, limit: usize) -> std::io::Result<Secret<u8>> {
+    let mut line = Secret(Vec::with_capacity(limit));
+    let mut byte = [0];
+    while line.0.len() < limit && line.0.last() != Some(&b'\n') {
+        match input.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => line.0.push(byte[0]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    wipe(&mut byte);
+    Ok(line)
+}
+
+/// The length of an approval: a SHA-256 digest in hexadecimal.
+const APPROVAL: usize = 64;
+
+/// What a queued install is told once it is activated: the approval, then the number of the
+/// password's UTF-16 units and those units, its final NUL among them. No units mean that the
+/// running service is to be kept.
+fn handoff_message(approval: &str, password: Option<&Secret>) -> Result<Secret<u8>> {
+    ensure!(approval.len() == APPROVAL, "not an install approval");
+    let units = password.map_or(&[][..], |password| &password.0);
+    let count = u32::try_from(units.len()).context("the password is too long to hand over")?;
+    // Room for all of it at once, so that no copy is left behind by a reallocation.
+    let mut message = Secret(Vec::with_capacity(APPROVAL + 4 + units.len() * 2));
+    message.0.extend_from_slice(approval.as_bytes());
+    message.0.extend_from_slice(&count.to_le_bytes());
+    for unit in units {
+        message.0.extend_from_slice(&unit.to_le_bytes());
+    }
+    Ok(message)
+}
+
+/// Read a `handoff_message`, which has to be complete.
+fn read_handoff(mut message: impl Read) -> Result<(String, Option<Secret>)> {
+    const CUT: &str = "the command that queued this install ended before it had handed it \
+        over, so nothing was done";
+    let mut approval = vec![0; APPROVAL];
+    message.read_exact(&mut approval).context(CUT)?;
+    let approval = String::from_utf8(approval).context("not an install approval")?;
+    let mut count = [0; 4];
+    message.read_exact(&mut count).context(CUT)?;
+    let count = u32::from_le_bytes(count) as usize;
+    if count == 0 {
+        return Ok((approval, None));
+    }
+    let mut bytes = Secret(vec![0u8; count.checked_mul(2).context(CUT)?]);
+    message.read_exact(&mut bytes.0).context(CUT)?;
+    let mut password = Secret(Vec::with_capacity(count));
+    password.0.extend(
+        bytes
+            .0
+            .as_chunks()
+            .0
+            .iter()
+            .map(|&unit| u16::from_le_bytes(unit)),
+    );
+    ensure!(
+        password.0.last() == Some(&0),
+        "the password handed over is not terminated"
+    );
+    Ok((approval, Some(password)))
+}
+
+/// The byte that lets a queued process act.
 const ACTIVATE: u8 = b'+';
 
-/// Wait up to `limit` for the activating byte on `gate`. The command that queued the update
-/// holds the only other end, so if that command ends first, however it ends, the pipe closes.
-fn await_activation(mut gate: impl Read + Send + 'static, limit: Duration) -> Result<()> {
+/// Wait up to `limit` for the activating byte on `gate`, and return the gate. The command
+/// that queued this process holds the only other end, so if that command ends first, however
+/// it ends, the pipe closes.
+fn await_activation<R: Read + Send + 'static>(mut gate: R, limit: Duration) -> Result<R> {
     let (send, received) = mpsc::channel();
     // A pipe read has no time limit. A reader left waiting ends with the process.
     thread::spawn(move || {
         let mut byte = [0];
-        let _ = send.send(gate.read_exact(&mut byte).map(|()| byte[0]));
+        let read = gate.read_exact(&mut byte).map(|()| byte[0]);
+        let _ = send.send((read, gate));
     });
-    ensure!(
-        matches!(received.recv_timeout(limit), Ok(Ok(ACTIVATE))),
-        "the command that queued this update did not activate it, so the update did nothing"
-    );
-    Ok(())
+    match received.recv_timeout(limit) {
+        Ok((Ok(ACTIVATE), gate)) => Ok(gate),
+        _ => anyhow::bail!("the command that queued this did not activate it, so nothing was done"),
+    }
 }
 
 /// Start a queued update writing to `log`, a new file of its own, and only once it is
@@ -208,8 +326,8 @@ fn check_removable(
     );
     ensure!(
         !updating,
-        "an update of this service is queued or running; nothing was changed. Run 'massrelay \
-         uninstall' once it has finished"
+        "an update or install of this service is queued or running; nothing was changed. Run \
+         'massrelay uninstall' once it has finished"
     );
     Ok(())
 }
@@ -281,11 +399,17 @@ struct Approval {
     grant: bool,
 }
 
+/// `SERVICE_AUTO_START`, the start type `install` registers.
+const AUTO_START: u32 = 2;
+
 /// An install as shown for confirmation, which displays as the changes it would make. Only
 /// Windows makes one, with `plan_install`, and applies it.
 pub struct InstallPlan {
     options: InstallOptions,
     shown: Approval,
+    /// The runtime the service already runs exactly as this install would register it, which
+    /// is therefore left running.
+    kept: Option<Identity>,
 }
 
 impl InstallPlan {
@@ -296,6 +420,52 @@ impl InstallPlan {
     fn confirm(&self, found: &Approval) -> Result<()> {
         ensure!(*found == self.shown, Self::CHANGED);
         Ok(())
+    }
+
+    /// Decide what a command in a session that depends on `runtime` does about the service,
+    /// which has to be that runtime's. `service` is the registered service's process and
+    /// whether it is fully running, and `current` whether the runtime is this program. A
+    /// password given to be stored means that the service is registered again.
+    fn consider(
+        &mut self,
+        runtime: &Identity,
+        service: Option<(u32, bool)>,
+        current: bool,
+    ) -> Result<()> {
+        ensure!(
+            service.is_some_and(|(process, _)| process == runtime.pid),
+            installer::NOT_THE_SERVICE
+        );
+        let registered = matches!(
+            &self.shown.existing,
+            Some((found, true))
+                if found.command == self.shown.command && found.start == AUTO_START
+        );
+        let exact = registered
+            && service.is_some_and(|(_, running)| running)
+            && current
+            && !self.shown.grant
+            && !self.options.password_stdin;
+        self.kept = exact.then(|| runtime.clone());
+        Ok(())
+    }
+
+    /// Whether applying this leaves the running service alone.
+    pub fn keeps(&self) -> bool {
+        self.kept.is_some()
+    }
+
+    /// Everything a confirmation of this approves, to compare across processes.
+    pub fn approval(&self) -> String {
+        format!("{:?} {:?}", self.shown, self.kept)
+    }
+
+    /// Where a queued install says what it did.
+    pub fn log(&self) -> String {
+        Path::new(&self.shown.dir)
+            .join(INSTALL_LOG)
+            .display()
+            .to_string()
     }
 
     /// Asked where the right would be granted: whether to grant it, which only a plan that
@@ -316,6 +486,17 @@ impl fmt::Display for InstallPlan {
             existing,
             grant,
         } = &self.shown;
+        if self.keeps() {
+            return write!(
+                formatter,
+                "Keep the Windows service {name} running as {account}, without a restart: it is \
+                 already registered as this install would register it\n\
+                 Command line: {command}\n\
+                 The password Windows stored for it is not asked for or checked. To store a new \
+                 one, pass --password-stdin\n\
+                 It records events in the profile directory, {dir}"
+            );
+        }
         let register = match existing {
             None => "Register and start",
             Some((_, false)) => "Reconfigure and start",
@@ -742,6 +923,7 @@ mod tests {
                 allow_administrator: false,
             },
             shown,
+            kept: None,
         };
 
         let over_stopped = plan(approval("massrelay", Some(false), false));
@@ -768,6 +950,168 @@ mod tests {
                 .confirm(&approval("massrelay", Some(false), true))
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_carried_install_keeps_only_the_exact_running_registration() -> Result<()> {
+        let runtime = Identity {
+            pid: 40,
+            executable: None,
+            version: String::new(),
+            endpoint: String::new(),
+            held: false,
+        };
+        let plan = |change: &dyn Fn(&mut Approval, &mut InstallOptions)| {
+            let mut options = InstallOptions {
+                shell: None,
+                password_stdin: false,
+                allow_administrator: true,
+            };
+            let registration = Registration {
+                command: "wanted".into(),
+                account: r".\me".into(),
+                start: AUTO_START,
+            };
+            let mut shown = Approval {
+                dir: r"C:\state".into(),
+                name: "MassRelay-1".into(),
+                account: r"PC\me".into(),
+                command: "wanted".into(),
+                existing: Some((registration, true)),
+                grant: false,
+            };
+            change(&mut shown, &mut options);
+            InstallPlan {
+                options,
+                shown,
+                kept: None,
+            }
+        };
+        let running = Some((runtime.pid, true));
+
+        let mut exact = plan(&|_, _| {});
+        let replacing = exact.approval();
+        exact.consider(&runtime, running, true)?;
+        assert!(exact.keeps());
+        // A finishing process cannot take one for the other.
+        assert_ne!(exact.approval(), replacing);
+
+        // Another program or one not serving normally, and a start or stop under way.
+        for (service, current) in [(running, false), (Some((runtime.pid, false)), true)] {
+            let mut plan = plan(&|_, _| {});
+            plan.consider(&runtime, service, current)?;
+            assert!(!plan.keeps());
+        }
+        // Anything the install would change, and a password that is to be stored.
+        type Change<'a> = &'a dyn Fn(&mut Approval, &mut InstallOptions);
+        let changes: [Change; 4] = [
+            &|shown, _| shown.command = "another shell".into(),
+            &|shown, _| shown.existing.as_mut().unwrap().0.start = AUTO_START + 1,
+            &|shown, _| shown.grant = true,
+            &|_, options| options.password_stdin = true,
+        ];
+        for change in changes {
+            let mut plan = plan(change);
+            plan.consider(&runtime, running, true)?;
+            assert!(!plan.keeps());
+        }
+        // The session depends on something else than this service.
+        for service in [None, Some((41, true))] {
+            let mut plan = plan(&|_, _| {});
+            assert!(plan.consider(&runtime, service, true).is_err());
+            assert!(!plan.keeps());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_queued_install_gets_the_whole_confirmation_and_password_or_does_nothing() -> Result<()> {
+        use std::io::Write as _;
+
+        let patient = Duration::from_secs(30);
+        let approval = "a".repeat(APPROVAL);
+        // Beyond ASCII and the basic plane, with the NUL Windows expects.
+        let password: Vec<u16> = "p+ss wörd \u{1F511}\0".encode_utf16().collect();
+        let sent = |bytes: &[u8]| -> Result<(String, Option<Secret>)> {
+            let (gate, mut command) = std::io::pipe()?;
+            command.write_all(bytes)?;
+            // The command ends, however it ends.
+            drop(command);
+            read_handoff(await_activation(gate, patient)?)
+        };
+        // What follows a handoff stays in the pipe.
+        let (gate, mut command) = std::io::pipe()?;
+        command.write_all(&[ACTIVATE])?;
+        command.write_all(&handoff_message(&approval, None)?.0)?;
+        command.write_all(b"after")?;
+        drop(command);
+        let mut gate = await_activation(gate, patient)?;
+        read_handoff(&mut gate)?;
+        let mut rest = Vec::new();
+        gate.read_to_end(&mut rest)?;
+        assert_eq!(rest, b"after");
+        for given in [Some(Secret(password.clone())), None] {
+            let message = handoff_message(&approval, given.as_ref())?;
+            let mut bytes = vec![ACTIVATE];
+            bytes.extend_from_slice(&message.0);
+            let (confirmed, received) = sent(&bytes)?;
+            assert_eq!(confirmed, approval);
+            assert_eq!(
+                received.as_ref().map(|secret| &secret.0),
+                given.as_ref().map(|secret| &secret.0)
+            );
+            // Cut anywhere, a shortened password included.
+            for end in 0..bytes.len() {
+                assert!(sent(&bytes[..end]).is_err(), "accepted {end} bytes");
+            }
+            // Without the activating byte nothing is read as a confirmation.
+            assert!(sent(&message.0).is_err());
+        }
+        let unterminated = Secret(vec![u16::from(b'x')]);
+        let mut bytes = vec![ACTIVATE];
+        bytes.extend_from_slice(&handoff_message(&approval, Some(&unterminated))?.0);
+        assert!(sent(&bytes).is_err());
+
+        // The command line carries the confirmed options, and nothing about the password.
+        assert_eq!(
+            install_command_line(r"C:\a b\massrelay.exe", r"C:\state\", r"C:\sh.exe", true)?,
+            r#""C:\a b\massrelay.exe" --state-dir "C:\state\\" install --yes --shell "C:\sh.exe" --allow-administrator"#
+        );
+        assert!(
+            !install_command_line(r"C:\m.exe", r"C:\state", r"C:\sh.exe", false)?
+                .contains("--allow-administrator")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_password_line_is_read_without_taking_anything_after_it() -> Result<()> {
+        /// Gives no more than it is asked for, and records the most that was.
+        struct Source<'a>(&'a [u8], usize);
+        impl Read for Source<'_> {
+            fn read(&mut self, into: &mut [u8]) -> std::io::Result<usize> {
+                self.1 = self.1.max(into.len());
+                self.0.read(into)
+            }
+        }
+        for (sent, limit, line, rest) in [
+            (
+                &b"secret\r\nafter"[..],
+                64,
+                &b"secret\r\n"[..],
+                &b"after"[..],
+            ),
+            (b"secret", 64, b"secret", b""),
+            (b"secret", 3, b"sec", b"ret"),
+            (b"", 64, b"", b""),
+        ] {
+            let mut source = Source(sent, 0);
+            assert_eq!(read_secret_line(&mut source, limit)?.0, line);
+            assert_eq!(source.0, rest);
+            // One byte at a time: a pipe is never asked for what follows the line.
+            assert!(source.1 <= 1);
+        }
         Ok(())
     }
 

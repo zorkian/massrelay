@@ -5,11 +5,11 @@ use std::{
     env,
     ffi::{OsStr, c_void},
     fs::{self, File, OpenOptions},
-    io::{self, BufRead as _, Read as _},
+    io,
     os::windows::{
         ffi::OsStrExt as _,
         fs::MetadataExt as _,
-        io::{AsRawHandle as _, FromRawHandle as _},
+        io::{AsHandle as _, AsRawHandle as _, FromRawHandle as _},
     },
     path::{Path, PathBuf},
     ptr::{null, null_mut},
@@ -79,19 +79,24 @@ use windows_sys::Win32::{
     },
 };
 
-use super::{Ace, AceKind, InstallOptions, Role, Security};
+use super::{Ace, AceKind, InstallOptions, Role, Secret, Security};
 use crate::{
     ServiceAction,
+    installer::{self, Handoff, Verify},
     private::{
         cli,
         diagnostics::{self, Level},
+        runtime::Identity,
     },
+    update::say,
 };
 
 mod queued_update;
 pub mod ssh_files;
 
-pub use queued_update::wait_for_activation;
+pub use queued_update::{handoff, wait_for_activation};
+
+const _: () = assert!(super::AUTO_START == SERVICE_AUTO_START);
 
 const ELEVATE: &str =
     "Windows lets only an elevated PowerShell (Run as administrator) manage services";
@@ -112,6 +117,7 @@ const INHERIT_ONLY: u8 = 0x8;
 /// Everything `install` settles before it asks for a password or changes anything.
 struct Prepared {
     dir: String,
+    binary: String,
     shell: String,
     account: Account,
     name: String,
@@ -202,6 +208,7 @@ fn prepare(dir: &Path, options: &InstallOptions) -> Result<Prepared> {
     let grant = !Policy::open()?.may_log_on_as_service(&account)?;
     Ok(Prepared {
         dir,
+        binary,
         shell,
         account,
         name,
@@ -219,19 +226,116 @@ fn prepare(dir: &Path, options: &InstallOptions) -> Result<Prepared> {
 /// files for writing.
 pub fn plan_install(dir: &Path, options: InstallOptions) -> Result<super::InstallPlan> {
     let shown = prepare(dir, &options)?.approval();
-    Ok(super::InstallPlan { options, shown })
+    Ok(super::InstallPlan {
+        options,
+        shown,
+        kept: None,
+    })
 }
 
 impl super::InstallPlan {
+    /// Look again, and require what an install would do to be what was shown.
+    fn confirmed(&self) -> Result<Prepared> {
+        let prepared = prepare(Path::new(&self.shown.dir), &self.options)?;
+        self.confirm(&prepared.approval())?;
+        Ok(prepared)
+    }
+
+    /// For a command in a session that depends on `runtime`, which has to be this profile's
+    /// service. One that is exactly what this install would make is then left running.
+    pub fn carried_by(&mut self, runtime: &Identity) -> Result<()> {
+        let prepared = self.confirmed()?;
+        let service = match &prepared.existing {
+            Some(service) => {
+                let status = process_status(service)?;
+                let running = status.dwCurrentState == SERVICE_RUNNING;
+                Some((status.dwProcessId, running))
+            }
+            None => None,
+        };
+        let current = installer::is_this_program(runtime, Path::new(&prepared.binary));
+        self.consider(runtime, service, current)
+    }
+
     /// Register and start the service, if what an install would replace and do is still as it
     /// was shown. Returns the canonical state directory the service was installed for.
     pub fn apply(self) -> Result<PathBuf> {
-        let confirmed = || {
-            let prepared = prepare(Path::new(&self.shown.dir), &self.options)?;
-            self.confirm(&prepared.approval())?;
-            Ok::<_, anyhow::Error>(prepared)
+        if self.keeps() {
+            return self.keep();
+        }
+        let from_stdin = self.options.password_stdin;
+        self.register_with(|account| password(account, from_stdin), None)
+    }
+
+    /// `apply` in the process a `queue` started, with what that handed over. It counts a
+    /// start only once `serves` finds the runtime answering.
+    pub fn finish(
+        self,
+        handoff: Handoff,
+        serves: &dyn Fn(Option<&Path>) -> Result<()>,
+    ) -> Result<PathBuf> {
+        match handoff.password {
+            Some(password) => self.register_with(|_| Ok(password), Some(serves)),
+            None => self.keep(),
+        }
+    }
+
+    /// Hand this install, as `approval` names it, to a detached process, which neither the
+    /// service's restart nor this session's end reaches. A password is asked for here, and
+    /// goes to that process over their pipe. Returns where it logs.
+    pub fn queue(self, approval: &str) -> Result<String> {
+        let prepared = self.confirmed()?;
+        cli::check_enrolled(Path::new(&prepared.dir))?;
+        let password = if self.keeps() {
+            None
+        } else {
+            let password = password(&prepared.account, self.options.password_stdin)?;
+            // A wrong one is reported while the person who typed it is there to hear it. An
+            // account that has yet to be allowed this logon cannot try it beforehand.
+            if !self.shown.grant {
+                check_logon(&prepared.account, &password)?;
+            }
+            Some(password)
         };
-        let prepared = confirmed()?;
+        // No handle is kept while the password is waited for.
+        drop(prepared);
+        let prepared = self.confirmed()?;
+        let command = super::install_command_line(
+            &prepared.binary,
+            &prepared.dir,
+            &prepared.shell,
+            self.options.allow_administrator,
+        )?;
+        let message = super::handoff_message(approval, password.as_ref())?;
+        queued_update::queue_install(
+            &prepared.account,
+            Path::new(&prepared.dir),
+            &prepared.binary,
+            &command,
+            &message,
+        )
+    }
+
+    /// Leave the service running, if it is still exactly what this install would make.
+    fn keep(mut self) -> Result<PathBuf> {
+        let runtime = self
+            .kept
+            .take()
+            .context("the service was not found running as this install would register it")?;
+        cli::check_enrolled(Path::new(&self.shown.dir))?;
+        self.carried_by(&runtime)?;
+        ensure!(self.keeps(), Self::CHANGED);
+        say(format!("Kept {} running", self.shown.name));
+        Ok(self.shown.dir.into())
+    }
+
+    /// Register the service with the password `password` gives, and restart it.
+    fn register_with(
+        self,
+        password: impl FnOnce(&Account) -> Result<Secret>,
+        serves: Verify,
+    ) -> Result<PathBuf> {
+        let prepared = self.confirmed()?;
         // Only now that the profile is known to be private is its store opened.
         cli::check_enrolled(Path::new(&prepared.dir))?;
         if !prepared
@@ -242,17 +346,23 @@ impl super::InstallPlan {
             let _lock = cli::claim_owner(Path::new(&prepared.dir))
                 .context("stop the foreground massrelay run first")?;
         }
-        let password = password(&prepared.account, self.options.password_stdin)?;
+        let password = password(&prepared.account)?;
         // No handle is kept while the password is waited for, and what is there is looked at
         // again right before the first change.
         drop(prepared);
-        register(&self, confirmed()?, password)
+        register(&self, self.confirmed()?, password, serves)
     }
 }
 
-fn register(plan: &super::InstallPlan, prepared: Prepared, password: Secret) -> Result<PathBuf> {
+fn register(
+    plan: &super::InstallPlan,
+    prepared: Prepared,
+    password: Secret,
+    serves: Verify,
+) -> Result<PathBuf> {
     let Prepared {
         dir,
+        binary,
         shell,
         account,
         name,
@@ -302,12 +412,17 @@ fn register(plan: &super::InstallPlan, prepared: Prepared, password: Secret) -> 
         annotate(service, &mut description)?;
         // A running service takes up its new registration by restarting.
         stop(service)?;
-        start(service)
+        start(service)?;
+        if let Some(serves) = serves {
+            serves(Some(Path::new(&binary))).context("the new service did not come up")?;
+        }
+        Ok::<_, anyhow::Error>(())
     })();
     drop(password);
 
     if let Err(error) = applied {
         let restored = (|| {
+            let mut running_again = false;
             if let Some(service) = &created {
                 let _ = stop(service);
                 // SAFETY: the handle is an open service handle with delete access.
@@ -322,16 +437,28 @@ fn register(plan: &super::InstallPlan, prepared: Prepared, password: Secret) -> 
                 // The account and its (now verified) password stay as stored.
                 reconfigure(service, config.start, &wide(&config.command)?, None)?;
                 if *running {
+                    if serves.is_some() {
+                        // The replacement may be running: only a restart takes up what was
+                        // restored.
+                        stop(service)?;
+                    }
                     start(service)?;
+                    running_again = true;
                 }
             }
             if granted {
                 policy.set_service_logon(&account, false)?;
             }
-            Ok::<_, anyhow::Error>(())
+            if running_again && let Some(serves) = serves {
+                serves(None).context("the restored service did not come up")?;
+            }
+            Ok::<_, anyhow::Error>(running_again)
         })();
         return Err(match restored {
-            Ok(()) => error,
+            Ok(true) if serves.is_some() => {
+                error.context("the previous service was restored and answers")
+            }
+            Ok(_) => error,
             Err(restore) => error.context(format!(
                 "could not restore the previous service state: {restore:#}"
             )),
@@ -1126,25 +1253,8 @@ fn read_security(
 
 // ----------------------------------------------------------------- password
 
-/// NUL-terminated UTF-16 that is wiped when dropped.
-struct Secret(Vec<u16>);
-
-impl Drop for Secret {
-    fn drop(&mut self) {
-        wipe(&mut self.0);
-    }
-}
-
-fn wipe<T: Default>(data: &mut [T]) {
-    for item in data {
-        // SAFETY: `item` is a valid, exclusive reference. The volatile write keeps the
-        // compiler from dropping the wipe as a dead store.
-        unsafe { std::ptr::write_volatile(item, T::default()) };
-    }
-}
-
-/// The account's password, for the service manager to store. It is never written anywhere by
-/// MassRelay.
+/// The account's password, NUL-terminated, for the service manager to store. It is never
+/// written to a file by MassRelay.
 fn password(account: &Account, from_stdin: bool) -> Result<Secret> {
     let mut secret = if from_stdin {
         stdin_line()?
@@ -1172,24 +1282,33 @@ fn password(account: &Account, from_stdin: bool) -> Result<Secret> {
     Ok(secret)
 }
 
+/// This process's standard input without a buffer. The standard library's own handle keeps
+/// what it reads ahead, which must never be a password.
+fn standard_input() -> Result<File> {
+    let handle = io::stdin()
+        .as_handle()
+        .try_clone_to_owned()
+        .context("use standard input")?;
+    Ok(File::from(handle))
+}
+
 fn stdin_line() -> Result<Secret> {
     const LIMIT: usize = 1024;
-    let mut bytes = Vec::with_capacity(LIMIT);
-    let read = io::stdin()
-        .lock()
-        .take(LIMIT as u64)
-        .read_until(b'\n', &mut bytes);
-    let secret = match (read, std::str::from_utf8(&bytes)) {
-        (Err(error), _) => Err(anyhow!(error).context("read the password from standard input")),
-        (Ok(_), Err(_)) => Err(anyhow!("the password on standard input is not UTF-8")),
-        (Ok(_), Ok(text)) => {
-            let mut units = Vec::with_capacity(bytes.len() + 1);
-            units.extend(text.encode_utf16());
-            Ok(Secret(units))
-        }
-    };
-    wipe(&mut bytes);
-    secret
+    let input = standard_input()?;
+    let mut mode = 0;
+    // A console is read as one: its bytes are not UTF-8, and it would echo them.
+    // SAFETY: the handle is open and `mode` is writable.
+    if unsafe { GetConsoleMode(input.as_raw_handle(), &mut mode) } != 0 {
+        return console_line("");
+    }
+    let bytes =
+        super::read_secret_line(input, LIMIT).context("read the password from standard input")?;
+    let text = std::str::from_utf8(&bytes.0)
+        .map_err(|_| anyhow!("the password on standard input is not UTF-8"))?;
+    // Room for the NUL as well, so that adding it leaves no copy behind.
+    let mut units = Vec::with_capacity(bytes.0.len() + 1);
+    units.extend(text.encode_utf16());
+    Ok(Secret(units))
 }
 
 /// Read one line from the console with echo off.
@@ -1210,7 +1329,7 @@ fn console_line(prompt: &str) -> Result<Secret> {
     );
     eprint!("{prompt}");
     let quiet = (mode | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT) & !ENABLE_ECHO_INPUT;
-    let mut secret = Secret(vec![0; LIMIT + 1]);
+    let mut secret: Secret = Secret(vec![0; LIMIT + 1]);
     let mut read = 0u32;
     // SAFETY: `handle` stays open; the buffer is writable for LIMIT UTF-16 units. The
     // console's mode is restored whatever the read returns.
@@ -1811,6 +1930,7 @@ mod service_fixture {
         io::{AsyncReadExt, AsyncWriteExt},
         time::timeout,
     };
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 
     /// Typed into PowerShell, which inspects its own token and exits with what it found: 32,
     /// plus 1 if it is an administrator, 2 at medium integrity, 4 at high integrity and 8 if
@@ -1839,23 +1959,194 @@ mod service_fixture {
     fn scm_powershell_probe() -> Result<()> {
         let config = env::current_exe()?.with_extension("json");
         let probe: Probe = serde_json::from_reader(File::open(config)?)?;
-        serve(&probe.name, probe.state, move || {
+        as_service(
+            &probe.name,
+            probe.state,
+            probe.result,
+            exercise_as_administrator,
+        )
+    }
+
+    /// Run `work` as the service `name` under the service manager, and write what came of it
+    /// to `result`.
+    fn as_service<F: Future<Output = Result<()>> + 'static>(
+        name: &str,
+        state: PathBuf,
+        result: PathBuf,
+        work: impl FnOnce() -> F + Send + 'static,
+    ) -> Result<()> {
+        serve(name, state, move || {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
             runtime.block_on(async {
                 let (_, recorded) = tokio::join!(until_stopped(), async {
-                    let result = match exercise_as_administrator().await {
+                    let came = match work().await {
                         Ok(()) => "ok".into(),
                         Err(error) => format!("{error:#}"),
                     };
-                    fs::write(probe.result, result)
+                    fs::write(result, came)
                 });
                 recorded?;
                 Ok(0)
             })
         })?;
         Ok(())
+    }
+
+    #[derive(Deserialize)]
+    struct Hosted {
+        name: String,
+        state: PathBuf,
+        result: PathBuf,
+        /// The installed program, and the process of the service installed with it.
+        program: PathBuf,
+        service_process: u32,
+        /// A shell to register in place of the installed one.
+        other_shell: PathBuf,
+        /// A pipe that gives the account's password to this account alone.
+        password_pipe: String,
+    }
+
+    #[test]
+    #[ignore = "started by Windows SCM beside a disposable installed service"]
+    fn scm_hosted_install_probe() -> Result<()> {
+        let config = env::current_exe()?.with_extension("json");
+        let hosted: Hosted = serde_json::from_reader(File::open(config)?)?;
+        let (name, state, result) = (
+            hosted.name.clone(),
+            hosted.state.clone(),
+            hosted.result.clone(),
+        );
+        as_service(&name, state, result, move || async move {
+            install_from_a_shell(&hosted).await
+        })
+    }
+
+    /// Install from a shell made as the service makes a peer's, marked as the installed
+    /// service's own: first with nothing to change, then registering another shell, which
+    /// restarts it. That shell is ended as soon as the install says it is queued.
+    async fn install_from_a_shell(hosted: &Hosted) -> Result<()> {
+        // This probe, like the installed service, is started by the service manager. Looked
+        // at independently of what it tests: no job object holds it, so none can excuse a
+        // handoff that fails.
+        let mut member = 0;
+        // SAFETY: the pseudo-handle of this process is always valid; a null job asks about
+        // any job.
+        ensure!(
+            unsafe { IsProcessInJob(GetCurrentProcess(), null_mut(), &mut member) } != 0,
+            "check this process's job membership: {}",
+            io::Error::last_os_error()
+        );
+        ensure!(member == 0, "the probe service runs in a job object");
+
+        let mut password = String::new();
+        let mut pipe = File::open(format!(r"\\.\pipe\{}", hosted.password_pipe))
+            .context("open the password pipe")?;
+        io::Read::read_to_string(&mut pipe, &mut password)?;
+        ensure!(!password.is_empty(), "no password was given");
+
+        let shell = PathBuf::from(powershell()?);
+        let mut pty = Pty::spawn_with_privilege(250, 50, Some(&shell), Arc::new(()), true)
+            .context("start a shell")?;
+        let teardown = pty.teardown();
+        let mut output = Vec::new();
+        {
+            let mut reader = pty.reader();
+            let mut writer = pty.writer();
+            let install = format!(
+                "& '{}' --state-dir '{}' install --allow-administrator",
+                hosted.program.display(),
+                hosted.state.display()
+            );
+            // The last line prints text that the typed command does not contain.
+            let unchanged = format!(
+                "$env:{}='{}'\r{install} --yes; \"EXIT$LASTEXITCODE.\"\r",
+                crate::private::HOST_ENV,
+                hosted.service_process
+            );
+            writer.write_all(unchanged.as_bytes()).await?;
+            shown(&mut reader, &mut output, "EXIT0.", true).await?;
+            ensure!(
+                screen(&output).contains("KeptMassRelay-"),
+                "the unchanged service was not kept"
+            );
+
+            let replacing = format!("{install} --shell '{}'\r", hosted.other_shell.display());
+            writer.write_all(replacing.as_bytes()).await?;
+            shown(&mut reader, &mut output, "Proceed?[y/N]", true).await?;
+            writer.write_all(b"y\r").await?;
+            shown(&mut reader, &mut output, "Passwordfor", true).await?;
+            writer.write_all(format!("{password}\r").as_bytes()).await?;
+            shown(&mut reader, &mut output, "Queued.", false).await?;
+            ensure!(
+                !screen(&output).contains(&password),
+                "the shell showed the password"
+            );
+        }
+        // The session ends here, with whatever still runs on its console.
+        drop(pty);
+        timeout(Duration::from_secs(30), teardown.wait()).await?;
+        Ok(())
+    }
+
+    /// Read the shell's output until its screen shows `wanted`, written without spaces.
+    async fn shown(
+        reader: &mut (impl AsyncReadExt + Unpin),
+        output: &mut Vec<u8>,
+        wanted: &str,
+        show_transcript: bool,
+    ) -> Result<()> {
+        let read = timeout(Duration::from_secs(120), async {
+            let mut chunk = [0u8; 4096];
+            while !screen(output).contains(wanted) {
+                let read = reader.read(&mut chunk).await?;
+                ensure!(read > 0, "the shell's output ended");
+                output.extend_from_slice(&chunk[..read]);
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        read.map_err(|_| anyhow!("it was not shown in 120 seconds"))
+            .flatten()
+            .with_context(|| {
+                if !show_transcript {
+                    return format!("waiting for {wanted:?} after entering the password");
+                }
+                let end = &output[output.len().saturating_sub(4096)..];
+                format!(
+                    "waiting for {wanted:?}; the output ends {:?}",
+                    String::from_utf8_lossy(end)
+                )
+            })
+    }
+
+    /// The text of terminal output without control sequences and spaces, both of which the
+    /// console host places as it redraws.
+    fn screen(output: &[u8]) -> String {
+        let text = String::from_utf8_lossy(output);
+        let mut characters = text.chars();
+        let mut screen = String::new();
+        while let Some(character) = characters.next() {
+            match character {
+                '\x1b' => match characters.next() {
+                    // A control sequence ends with a letter or a sign like one.
+                    Some('[') => {
+                        characters.find(|end| ('@'..='~').contains(end));
+                    }
+                    // A system command ends with a bell or a string terminator.
+                    Some(']') => {
+                        if characters.find(|end| ['\x07', '\x1b'].contains(end)) == Some('\x1b') {
+                            characters.next();
+                        }
+                    }
+                    _ => {}
+                },
+                other if other.is_whitespace() || other.is_control() => {}
+                other => screen.push(other),
+            }
+        }
+        screen
     }
 
     /// The same shells from whatever runs the tests: an elevated terminal has an

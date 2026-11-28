@@ -6982,6 +6982,120 @@ mod runtime {
         ra.stop().await;
     }
 
+    /// The service as `Installed`, whose manager names `pid` as its running process whatever
+    /// is true.
+    struct Claims(Installed, u32);
+
+    impl Managed for Claims {
+        fn label(&self) -> String {
+            self.0.label()
+        }
+
+        fn events(&self) -> PathBuf {
+            self.0.events()
+        }
+
+        fn launches(&self, program: &std::path::Path) -> anyhow::Result<bool> {
+            self.0.launches(program)
+        }
+
+        fn state(&self) -> anyhow::Result<crate::update::Manager> {
+            Ok(crate::update::Manager::Running(self.1))
+        }
+
+        fn start(&self) -> anyhow::Result<()> {
+            self.0.start()
+        }
+    }
+
+    impl Host for Claims {
+        fn service(&self) -> &dyn Managed {
+            self
+        }
+
+        fn identify(&self) -> anyhow::Result<crate::private::runtime::Identity> {
+            self.0.identify()
+        }
+
+        fn hold(&self) -> anyhow::Result<Held> {
+            self.0.hold()
+        }
+
+        fn released(&self) -> bool {
+            self.0.released()
+        }
+    }
+
+    /// A finished install counts a service only once the manager's process answers the
+    /// profile's authenticated control channel: not while a replacement is down or silent,
+    /// and not another process. The restored runtime then serves the same peer again.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "opens loopback UDP/TCP sockets and a native PTY"]
+    async fn a_failed_replacement_is_noticed_and_the_restored_service_serves_its_peer_again() {
+        let n = net();
+        let book = Book::default();
+        let (alice, bob, ra, rb) = shell_pair(&n, &book, rt::HOLD_LEASE).await;
+        let scratch = tempfile::tempdir().unwrap();
+        let program = scratch.path().join("massrelay");
+        std::fs::write(&program, "program").unwrap();
+        let service = Arc::new(InProcess {
+            path: bob.path.clone(),
+            secret: bob.secret.to_bytes(),
+            ep: bob.ep,
+            book: book.clone(),
+            mailbox: n.mailbox.clone(),
+            events: scratch.path().join("events.jsonl"),
+            program: Mutex::new(program.clone()),
+            running: Mutex::default(),
+            ended: Mutex::default(),
+            manager: tokio::sync::Mutex::default(),
+            handle: tokio::runtime::Handle::current(),
+        });
+        service.serve(rb);
+        // The checks block, as they do in the finishing process.
+        let serves = |claimed: Option<u32>, program: Option<PathBuf>| {
+            let installed = Installed(service.clone());
+            tokio::task::spawn_blocking(move || {
+                let program = program.as_deref();
+                match claimed {
+                    Some(pid) => crate::installer::serves(&Claims(installed, pid), program, FAST),
+                    None => crate::installer::serves(&installed, program, FAST),
+                }
+                .map_err(|error| error.to_string())
+            })
+        };
+        serves(None, Some(program.clone())).await.unwrap().unwrap();
+        // The runtime answers, but the manager's process is another one.
+        let error = serves(Some(std::process::id() + 1), None)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("not the installed service"), "{error}");
+
+        // The replacement replaces nothing: the old runtime is gone.
+        let old = service.running.lock().unwrap().take().unwrap();
+        old.stop().await;
+        let error = serves(None, None).await.unwrap().unwrap_err();
+        assert!(error.contains("not running"), "{error}");
+        // One that the manager calls running, but that never answers.
+        let error = serves(Some(std::process::id()), None)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("does not answer"), "{error}");
+
+        // Restored: it answers control for this device, and its peer gets a shell again.
+        service.launch().await.unwrap();
+        serves(None, Some(program.clone())).await.unwrap().unwrap();
+        let mut sh = shell_when_admitted(&alice, "bob").await;
+        assert_eq!(finish_shell(&mut sh, b"\x01exit 0\r").await.0, 0);
+        drop(sh);
+
+        let rb = service.running.lock().unwrap().take().unwrap();
+        rb.stop().await;
+        ra.stop().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "opens loopback UDP/TCP sockets"]
     async fn control_is_separate_authenticated_and_owner_exclusive() {

@@ -323,6 +323,38 @@ impl Host for Fake {
     }
 }
 
+/// What an install's finishing process asks before it counts a start, here of the scripted
+/// service: `crate::private::tests` asks it of a real runtime.
+#[test]
+fn a_finished_install_counts_only_the_managers_answering_program() {
+    let current = env!("CARGO_PKG_VERSION");
+    let prepared = prepare(current, "unused", current, "999.0.0", "device");
+    let host = fake(&prepared);
+    let installed = prepared.installed.clone();
+    let serves = |program: Option<&Path>| crate::installer::serves(&host, program, FAST);
+    serves(Some(&installed)).unwrap();
+    let other = prepared.root.path().join("other");
+    put(&other, current).unwrap();
+    assert!(serves(Some(&other)).is_err());
+
+    // The manager's process may run without answering, or answer as another release.
+    for (program, silent, answers) in [("silent", true, false), ("0.0.1", false, true)] {
+        put(&installed, program).unwrap();
+        let mut state = host.state.lock().unwrap();
+        state.mute = silent.then(|| program.to_owned());
+        state.running = None;
+        assert!(state.launch());
+        drop(state);
+        assert_eq!(serves(None).is_ok(), answers, "{program}");
+        assert!(serves(Some(&installed)).is_err(), "{program}");
+    }
+    host.state.lock().unwrap().running = None;
+    assert!(serves(None).is_err());
+    put(&installed, current).unwrap();
+    Service::start(&host).unwrap();
+    serves(Some(&installed)).unwrap();
+}
+
 /// An update prepared the way `run` leaves it before the transaction.
 pub(crate) struct Prepared {
     pub root: tempfile::TempDir,

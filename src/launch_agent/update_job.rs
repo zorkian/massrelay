@@ -1,7 +1,9 @@
-//! The one-shot LaunchAgent that runs `massrelay update` for a command that may not outlive
-//! the wait: one typed into a shell that the update waits to see end.
+//! The one-shot LaunchAgents that run `massrelay update` or `massrelay install` for a
+//! command that may not outlive it: one typed into a shell that the update waits to see end,
+//! or that the install's restart ends.
 //!
-//! There is one such job per profile, loaded into the same login domain as the service. Its
+//! There is one such job of each kind per profile, loaded into the same login domain as the
+//! service. Its
 //! property list stays in the state directory, outside `LaunchAgents`, so no later login loads
 //! it. It has neither `RunAtLoad` nor `KeepAlive`: it runs once, when it is kickstarted. It
 //! stays loaded after it ends, which keeps its exit status readable, until the next one
@@ -26,6 +28,7 @@ use anyhow::{Context, Result, ensure};
 
 use super::{escape_xml, path_text, stage};
 use crate::{
+    installer,
     private::{HOST_ENV, SSH_ENV},
     update::Finished,
 };
@@ -51,11 +54,31 @@ struct Ace {
 /// Reads the extended access control list of exactly the object at a path.
 type ReadAcl<'a> = &'a dyn Fn(&Path) -> Result<Vec<Ace>>;
 
+/// What a job runs.
+#[derive(Clone, Copy)]
+pub(super) enum Command<'a> {
+    Update,
+    /// Finish the install a command confirmed, as `approval` names it.
+    Install {
+        approval: &'a str,
+    },
+}
+
+impl Command<'_> {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Update => "update",
+            Self::Install { .. } => "install",
+        }
+    }
+}
+
 pub(super) struct OneShot<'a> {
     /// The login domain of the installed service.
     pub domain: &'a str,
     pub label: String,
-    /// The installed program, by its canonical path.
+    pub command: Command<'a>,
+    /// The program the service runs: for an update by its canonical path.
     pub program: &'a Path,
     /// The profile's canonical state directory.
     pub dir: &'a Path,
@@ -75,26 +98,32 @@ impl OneShot<'_> {
         launchctl: &dyn Fn(&[&str]) -> Result<Finished>,
         acl: ReadAcl,
     ) -> Result<String> {
-        check_directory(self.dir, acl).context("check the update job's state directory")?;
+        let name = self.command.name();
+        check_directory(self.dir, acl)
+            .with_context(|| format!("check the {name} job's state directory"))?;
+        let program = self.program.canonicalize().with_context(|| {
+            format!("find {}; the {name} was not queued", self.program.display())
+        })?;
+        // An update replaces the file at this path. An install only runs the program that is
+        // already running, by the path its approval names.
         ensure!(
-            self.program
-                .canonicalize()
-                .is_ok_and(|found| found == self.program),
+            matches!(self.command, Command::Install { .. }) || program == self.program,
             "{} is not the canonical path of a program; the update was not queued",
             self.program.display()
         );
-        self.program
+        program
             .ancestors()
+            .chain(self.program.ancestors())
             .try_for_each(|path| check_acl(path, acl))
-            .context("check the update program's access control lists")?;
+            .with_context(|| format!("check the {name} program's access control lists"))?;
         let logs = self
             .log
             .parent()
-            .context("the update log has no directory")?;
-        prepare_log_directory(logs, acl).context("prepare the update log's directory")?;
-        let log = logs.join(self.log.file_name().context("the update log has no name")?);
-        let lock_path = self.dir.join("update-job.lock");
-        let plist = self.dir.join("update-job.plist");
+            .context("the job's log has no directory")?;
+        prepare_log_directory(logs, acl).context("prepare the job log's directory")?;
+        let log = logs.join(self.log.file_name().context("the job's log has no name")?);
+        let lock_path = self.dir.join(format!("{name}-job.lock"));
+        let plist = self.dir.join(format!("{name}-job.plist"));
         for file in [&lock_path, &plist, &log] {
             match fs::symlink_metadata(file) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -116,14 +145,22 @@ impl OneShot<'_> {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&lock_path)
-            .context("open the update job's lock")?;
+            .with_context(|| format!("open the {name} job's lock"))?;
         // A new file can inherit entries from its directory.
         check_file(&lock_path, acl)?;
-        lock_queue(&lock, LOCK_LIMIT).context("lock the update job")?;
+        lock_queue(&lock, LOCK_LIMIT).with_context(|| format!("lock the {name} job"))?;
 
-        let printed = launchctl(&["print", &target]).context("look for an earlier update job")?;
+        let printed = launchctl(&["print", &target])
+            .with_context(|| format!("look for an earlier {name} job"))?;
         if printed.success {
             if !idle(&printed.stdout) {
+                // An update under way does what was asked. An install under way was
+                // confirmed by someone else's command, so this one is not queued.
+                ensure!(
+                    matches!(self.command, Command::Update),
+                    "an install is already queued or running as {target}; nothing was queued. \
+                     {follow}"
+                );
                 return Ok(format!(
                     "An update is already queued or running as {target}; no other was started. \
                      {follow} If it is stuck, remove it with 'launchctl bootout {target}' and \
@@ -135,46 +172,52 @@ impl OneShot<'_> {
 
         stage(self.dir, self.render(&log)?.as_bytes())?
             .persist(&plist)
-            .context("save the update job's property list")?;
+            .with_context(|| format!("save the {name} job's property list"))?;
         // A new file, private to this account, in place of an earlier run's output.
         stage(logs, b"")?
             .persist(&log)
-            .context("create the update log")?;
+            .with_context(|| format!("create the {name} log"))?;
         check_file(&plist, acl)?;
         check_file(&log, acl)?;
 
         let loaded = launchctl(&["bootstrap", self.domain, path_text(&plist)?])
-            .context("load the update job")?;
+            .with_context(|| format!("load the {name} job"))?;
         ensure!(
             loaded.success,
-            "could not load the update job {target}: {}",
+            "could not load the {name} job {target}: {}",
             one_line(&loaded.stderr)
         );
         // Without `-k`, a job that already runs is left running.
-        let started = launchctl(&["kickstart", &target]).context("start the update job")?;
+        let started =
+            launchctl(&["kickstart", &target]).with_context(|| format!("start the {name} job"))?;
         ensure!(
             started.success,
-            "could not start the update job {target}: {}. Inspect it with 'launchctl print \
-             {target}', or run 'massrelay update' again",
+            "could not start the {name} job {target}: {}. Inspect it with 'launchctl print \
+             {target}', or run 'massrelay {name}' again",
             one_line(&started.stderr)
         );
-        Ok(format!(
-            "The update now runs in the background as {target}. It waits for every connection \
-             and temporary exposure on this device to end, including a MassRelay shell this \
-             command runs in. {follow} While it is still waiting, 'launchctl bootout {target}' \
-             cancels it."
-        ))
+        Ok(match self.command {
+            Command::Update => format!(
+                "The update now runs in the background as {target}. It waits for every \
+                 connection and temporary exposure on this device to end, including a MassRelay \
+                 shell this command runs in. {follow} While it is still waiting, 'launchctl \
+                 bootout {target}' cancels it."
+            ),
+            Command::Install { .. } => {
+                format!("The install now runs in the background as {target}. {follow}")
+            }
+        })
     }
 
     /// Remove a loaded job that is not running, and wait until launchd no longer knows it.
     fn remove(&self, target: &str, launchctl: &dyn Fn(&[&str]) -> Result<Finished>) -> Result<()> {
-        let removed = launchctl(&["bootout", target]).context("remove the finished update job")?;
+        let removed = launchctl(&["bootout", target]).context("remove the finished job")?;
         let deadline = Instant::now() + REMOVAL_LIMIT;
         // What is asked for is that the job is gone, whatever `bootout` itself reported.
         while launchctl(&["print", target])?.success {
             ensure!(
                 Instant::now() < deadline,
-                "could not remove the finished update job {target}: {}",
+                "could not remove the finished job {target}: {}",
                 one_line(&removed.stderr)
             );
             thread::sleep(Duration::from_millis(100));
@@ -191,6 +234,20 @@ impl OneShot<'_> {
         // script text.
         let script = escape_xml(&format!("unset {HOST_ENV} {SSH_ENV}; exec \"$0\" \"$@\""));
         let label = &self.label;
+        let name = self.command.name();
+        let (confirmed, environment) = match self.command {
+            Command::Update => (String::new(), String::new()),
+            // The approval was shown to be confirmed; it is not secret.
+            Command::Install { approval } => (
+                "\n    <string>--yes</string>".into(),
+                format!(
+                    "\n  <key>EnvironmentVariables</key>\n  <dict>\n    <key>{}</key>\n    \
+                     <string>{}</string>\n  </dict>",
+                    installer::QUEUED,
+                    escape_xml(approval)
+                ),
+            ),
+        };
         Ok(format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -206,8 +263,8 @@ impl OneShot<'_> {
     <string>{program}</string>
     <string>--state-dir</string>
     <string>{dir}</string>
-    <string>update</string>
-  </array>
+    <string>{name}</string>{confirmed}
+  </array>{environment}
   <key>StandardOutPath</key>
   <string>{log}</string>
   <key>StandardErrorPath</key>
@@ -283,8 +340,8 @@ fn check_file(path: &Path, acl: ReadAcl) -> Result<()> {
     let own = unsafe { libc::geteuid() };
     ensure!(
         metadata.is_file() && metadata.uid() == own && metadata.mode() & 0o022 == 0,
-        "{} is not a file that only this account can change. Remove it and run 'massrelay \
-         update' again",
+        "{} is not a file that only this account can change. Remove it and run the command \
+         again",
         path.display()
     );
     check_acl(path, acl)
@@ -300,8 +357,8 @@ fn check_acl(path: &Path, acl: ReadAcl) -> Result<()> {
             _ => false,
         }),
         "the access control list of {path} may let another account change it. See it with \
-         'ls -lde \"{path}\"', remove what allows changes with 'chmod -a', and run 'massrelay \
-         update' again",
+         'ls -lde \"{path}\"', remove what allows changes with 'chmod -a', and run the \
+         command again",
         path = path.display()
     );
     Ok(())
@@ -512,6 +569,7 @@ mod tests {
         let job = OneShot {
             domain: "gui/501",
             label: "com.massrelay.client.update".into(),
+            command: super::Command::Update,
             program: &program,
             dir: &dir,
             log: &log,
@@ -622,6 +680,162 @@ mod tests {
     }
 
     #[test]
+    fn the_install_job_runs_the_confirmed_install_outside_a_session() -> Result<()> {
+        let (_temp, root) = private_directory()?;
+        let dir = root.join("A & <B> $HOME");
+        fs::create_dir(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        let program = program(&dir)?;
+        let log = dir.join("Logs/MassRelay-install.log");
+        let job = OneShot {
+            domain: "gui/501",
+            label: "com.massrelay.client.install".into(),
+            command: super::Command::Install {
+                approval: "approved & <so>",
+            },
+            program: &program,
+            dir: &dir,
+            log: &log,
+        };
+        let launchd = Mutex::new(Launchd::default());
+        let run = |args: &[&str]| Launchd::run(&launchd, args);
+
+        job.queue_reading(&run, &no_lists)?;
+        assert_eq!(Launchd::changes(&launchd), ["bootstrap", "kickstart"]);
+        let plist = fs::read_to_string(dir.join("install-job.plist"))?;
+        let arguments = arguments(&plist);
+        assert_eq!(
+            arguments[3..],
+            [
+                path_text(&program)?,
+                "--state-dir",
+                path_text(&dir)?,
+                "install",
+                "--yes"
+            ]
+        );
+        let environment = format!(
+            "<key>EnvironmentVariables</key>\n  <dict>\n    <key>{}</key>\n    \
+             <string>approved &amp; &lt;so&gt;</string>",
+            crate::installer::QUEUED
+        );
+        assert!(plist.contains(&environment), "{plist}");
+        let ran = Command::new(&arguments[0])
+            .args(&arguments[1..])
+            .env(HOST_ENV, "4242")
+            .env(SSH_ENV, "127.0.0.1 50000 127.0.0.1 22")
+            .status()?;
+        assert!(ran.success());
+        assert_eq!(
+            fs::read_to_string(dir.join("massrelay.seen"))?,
+            format!(
+                "removed\nremoved\n--state-dir\n{}\ninstall\n--yes\n",
+                dir.display()
+            )
+        );
+
+        // An install under way is someone's confirmation: another is not taken to be queued.
+        fs::write(&log, "installing")?;
+        assert!(job.queue_reading(&run, &no_lists).is_err());
+        assert!(Launchd::changes(&launchd).is_empty());
+        assert_eq!(fs::read_to_string(&log)?, "installing");
+        assert_eq!(fs::read_to_string(dir.join("install-job.plist"))?, plist);
+        assert!(!dir.join("update-job.plist").exists());
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "starts two disposable jobs in the real macOS login domain"]
+    fn a_queued_install_outlives_the_launch_agent_it_unloads() -> Result<()> {
+        let domain = super::super::bounded_domain()?;
+        let launchctl = |args: &[&str]| super::super::tool("/bin/launchctl", args);
+        let home = directories::BaseDirs::new().context("find the test account's home")?;
+        let temp = tempfile::Builder::new()
+            .prefix(".massrelay-launchd-test-")
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in(home.home_dir())?;
+        let root = temp.path().canonicalize()?;
+        let basename = path_text(Path::new(root.file_name().context("test directory name")?))?;
+        let label = format!("is.qq.massrelay.{basename}");
+        let session = format!("{domain}/{label}.session");
+        let install = format!("{domain}/{label}.install");
+
+        let execute = |name: &str, body: &str| -> Result<_> {
+            let path = root.join(name);
+            fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n"))?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+            Ok(path)
+        };
+        let waiting = execute("session", "echo ready; exec /bin/sleep 60")?;
+        let worker = execute(
+            "install",
+            &format!(
+                r#"
+[ "$1" = --state-dir ]
+[ "$3" = install ]
+[ "$4" = --yes ]
+[ "$MASSRELAY_QUEUED_INSTALL" = approved ]
+[ -z "${{MASSRELAY_SHELL_HOST+x}}" ]
+[ -z "${{SSH_CONNECTION+x}}" ]
+/bin/launchctl bootout {session}
+echo finished
+"#
+            ),
+        )?;
+        let session_log = root.join("session.log");
+        let install_log = root.join("install.log");
+        let wait_for = |log: &Path, text: &str| -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let output = fs::read_to_string(log).unwrap_or_default();
+                if output.lines().any(|line| line == text) {
+                    return Ok(());
+                }
+                ensure!(
+                    Instant::now() < deadline,
+                    "{} contains {output:?}",
+                    log.display()
+                );
+                thread::sleep(Duration::from_millis(50));
+            }
+        };
+        let tested = (|| {
+            OneShot {
+                domain: &domain,
+                label: format!("{label}.session"),
+                command: super::Command::Update,
+                program: &waiting,
+                dir: &root,
+                log: &session_log,
+            }
+            .queue(&launchctl)?;
+            wait_for(&session_log, "ready")?;
+            OneShot {
+                domain: &domain,
+                label: format!("{label}.install"),
+                command: super::Command::Install {
+                    approval: "approved",
+                },
+                program: &worker,
+                dir: &root,
+                log: &install_log,
+            }
+            .queue(&launchctl)?;
+            wait_for(&install_log, "finished")?;
+            ensure!(
+                !launchctl(&["print", &session])?.success,
+                "session job remains"
+            );
+            Ok(())
+        })();
+        for target in [&install, &session] {
+            let _ = launchctl(&["bootout", target]);
+        }
+        tested
+    }
+
+    #[test]
     fn nothing_another_account_could_change_is_handed_to_launchd() -> Result<()> {
         let (_temp, root) = private_directory()?;
         let (dir, logs) = (root.join("state"), root.join("Logs"));
@@ -632,6 +846,7 @@ mod tests {
         let job = OneShot {
             domain: "gui/501",
             label: "com.massrelay.client.update".into(),
+            command: super::Command::Update,
             program: &program,
             dir: &dir,
             log: &log,

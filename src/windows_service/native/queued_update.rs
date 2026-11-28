@@ -1,13 +1,18 @@
-//! `massrelay update` asked for inside one of this device's own shells. The update waits for
-//! every session to end and then the daemon ends, so it has to outlive both: it runs as a
-//! separate process with a console of its own (not the session's pseudoconsole), outside any
-//! job object, with no handle of the session's, writing to a log in the state directory.
+//! `massrelay update` asked for inside one of this device's own shells, and `massrelay
+//! install` asked for in a session that depends on the service. The update waits for every
+//! session to end and then the daemon ends, and the install restarts the daemon, so each has
+//! to outlive both: it runs as a separate process with a console of its own (not the
+//! session's pseudoconsole), outside any job object, with no handle of the session's, writing
+//! to a log in the state directory.
 //!
 //! Only one is queued at a time. `update.lock` admits one opener, and the queuing command, the
 //! updater and its helper pass that handle on, so Windows holds it until the last of them has
-//! ended, however it ends. Each request logs to a new file, which replaces `update.log` only
-//! once its updater is activated, so a refused request leaves the last diagnostics as they
-//! were.
+//! ended, however it ends. Each request logs to a new file, which replaces `update.log` (or
+//! `install.log`) only once its process is activated, so a refused request leaves the last
+//! diagnostics as they were.
+//!
+//! An install is also handed, after the activating byte, what was confirmed and any password
+//! (`handoff`). Neither is written to a file or passed as an argument or variable.
 //!
 //! The queuing command can be ended at any moment, and checks the updater after starting it.
 //! So the updater does nothing until that command writes a byte to its input
@@ -44,6 +49,7 @@ const START_REQUIRED: &str = "nothing was queued: the update could not confirm t
     it in an elevated PowerShell on this device under the account that installed the service";
 
 /// Set for a queued update alone: its input is the gate it waits at before doing anything.
+/// A queued install has `installer::QUEUED` for the same.
 const GATE: &str = "MASSRELAY_QUEUED_UPDATE";
 /// How long a queued update waits for a queuing command that is neither done nor gone.
 const ACTIVATION_LIMIT: Duration = Duration::from_secs(30);
@@ -55,7 +61,74 @@ pub fn wait_for_activation() -> Result<()> {
     if env::var_os(GATE).is_none() {
         return Ok(());
     }
-    super::super::await_activation(io::stdin(), ACTIVATION_LIMIT)
+    super::super::await_activation(io::stdin(), ACTIVATION_LIMIT).map(drop)
+}
+
+/// For `massrelay install` to call before it reads anything. A queued install waits to be
+/// activated and gets what it was handed; any other install gets nothing.
+pub fn handoff() -> Result<Option<Handoff>> {
+    if env::var_os(installer::QUEUED).is_none() {
+        return Ok(None);
+    }
+    // Read without a buffer: the password must not stay in the standard library's.
+    let gate = super::super::await_activation(standard_input()?, ACTIVATION_LIMIT)?;
+    let (approval, password) = super::super::read_handoff(gate)?;
+    Ok(Some(Handoff { approval, password }))
+}
+
+/// Start `command`, the install of the profile in `dir`, detached from this session, handing
+/// it `message`. The caller has checked that only this account and administrators control
+/// `program` and `dir`. Returns the path of its log.
+pub(super) fn queue_install(
+    account: &Account,
+    dir: &Path,
+    program: &str,
+    command: &str,
+    message: &Secret<u8>,
+) -> Result<String> {
+    queue(
+        account,
+        dir,
+        program,
+        command,
+        installer::QUEUED,
+        super::super::INSTALL_LOG,
+        &message.0,
+    )
+}
+
+/// Start `command` as a gated process outside every job, and activate it, followed by
+/// `message`.
+fn queue(
+    account: &Account,
+    dir: &Path,
+    program: &str,
+    command: &str,
+    gate: &str,
+    log_name: &str,
+    message: &[u8],
+) -> Result<String> {
+    let lock = queue_lock(account, dir)?;
+    let log = new_log(account, dir, log_name)?;
+    let latest = dir.join(log_name);
+    let path = super::super::start_logged(log, &latest, |log| {
+        let mut worker = Gated::create(
+            program,
+            command,
+            env::vars_os(),
+            log,
+            &lock,
+            gate,
+            CREATE_BREAKAWAY_FROM_JOB,
+        )?;
+        worker
+            .require_no_job()
+            .and_then(|()| worker.activate(message))
+            .inspect_err(|_| worker.end())
+    })?;
+    path.into_os_string()
+        .into_string()
+        .map_err(|_| anyhow!("the log's path is not Unicode"))
 }
 
 impl Managed {
@@ -81,27 +154,15 @@ impl Managed {
                 .with_context(|| format!("find {}", program.display()))?,
         )?;
         let command = super::super::update_command_line(&program, &self.dir)?;
-        let dir = Path::new(&self.dir);
-        let lock = queue_lock(&account, dir)?;
-        let log = new_log(&account, dir)?;
-        let latest = dir.join(super::super::UPDATE_LOG);
-        let path = super::super::start_logged(log, &latest, |log| {
-            let mut worker = Gated::create(
-                &program,
-                &command,
-                env::vars_os(),
-                log,
-                &lock,
-                CREATE_BREAKAWAY_FROM_JOB,
-            )?;
-            worker
-                .require_no_job()
-                .and_then(|()| worker.activate())
-                .inspect_err(|_| worker.end())
-        })?;
-        path.into_os_string()
-            .into_string()
-            .map_err(|_| anyhow!("the update log's path is not Unicode"))
+        queue(
+            &account,
+            Path::new(&self.dir),
+            &program,
+            &command,
+            GATE,
+            super::super::UPDATE_LOG,
+            &[],
+        )
     }
 }
 
@@ -115,9 +176,9 @@ fn queue_lock(account: &Account, dir: &Path) -> Result<File> {
         .map_err(|error| {
             let context = if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) {
                 format!(
-                    "an update is already queued or running for this profile (or another \
-                     program holds {} open). Its log is update.log beside that file, or the \
-                     file named when it was queued",
+                    "an update or install is already queued or running for this profile (or \
+                     another program holds {} open). Its log is update.log or install.log \
+                     beside that file, or the file named when it was queued",
                     path.display()
                 )
             } else {
@@ -134,19 +195,20 @@ fn queue_lock(account: &Account, dir: &Path) -> Result<File> {
     Ok(lock)
 }
 
-/// A new log for one request, private to the account. Its name is one nothing has, so no
-/// existing file or link is opened. Others may read it and rename it, not write to it. It is
-/// removed again unless it is kept.
-fn new_log(account: &Account, dir: &Path) -> Result<tempfile::NamedTempFile> {
+/// A new log for one request, to become `latest`, private to the account. Its name is one
+/// nothing has, so no existing file or link is opened. Others may read it and rename it, not
+/// write to it. It is removed again unless it is kept.
+fn new_log(account: &Account, dir: &Path, latest: &str) -> Result<tempfile::NamedTempFile> {
     let permissions = PrivateFile::new(account)?;
+    let prefix = format!("{}-", latest.trim_end_matches(".log"));
     tempfile::Builder::new()
-        .prefix("update-")
+        .prefix(&prefix)
         .suffix(".log")
         .make_in(dir, |path| {
             let share = FILE_SHARE_READ | FILE_SHARE_DELETE;
             permissions.open_sharing(path, FILE_APPEND_DATA, share, CREATE_NEW)
         })
-        .with_context(|| format!("create an update log in {}", dir.display()))
+        .with_context(|| format!("create a log in {}", dir.display()))
 }
 
 /// An owned process or thread handle.
@@ -220,8 +282,8 @@ struct Gated {
 impl Gated {
     /// Create `application` under this process's own token, with a hidden console of its own,
     /// in the system directory, with a new gate as its input and `log` as both outputs,
-    /// inheriting those and `held` alone, and with `variables` except the one naming the
-    /// runtime that serves this shell. It runs at once, and is told by `GATE` to wait for
+    /// inheriting those and `held` alone, and with `variables` except those that place it in
+    /// this session. It runs at once, and is told by the variable `waits` to wait for
     /// `activate`.
     fn create(
         application: &str,
@@ -229,6 +291,7 @@ impl Gated {
         variables: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
         log: &File,
         held: &File,
+        waits: &str,
         flags: u32,
     ) -> Result<Self> {
         // Neither end is inheritable; the reading end alone is made so, below.
@@ -257,8 +320,12 @@ impl Gated {
         startup.lpAttributeList = inherit.list.as_mut_ptr().cast();
 
         let variables = variables
-            .filter(|(name, _)| !name.eq_ignore_ascii_case(GATE))
-            .chain([(GATE.into(), "1".into())]);
+            .filter(|(name, _)| {
+                [GATE, installer::QUEUED]
+                    .iter()
+                    .all(|gate| !name.eq_ignore_ascii_case(gate))
+            })
+            .chain([(waits.into(), "1".into())]);
         let environment =
             super::super::environment_block(variables, |text| text.encode_wide().collect());
 
@@ -288,7 +355,7 @@ impl Gated {
         };
         ensure!(
             created != 0,
-            "start the detached update (a job object around this shell may forbid leaving \
+            "start the detached process (a job object around this shell may forbid leaving \
              it): {}",
             io::Error::last_os_error()
         );
@@ -300,29 +367,31 @@ impl Gated {
     }
 
     /// A job object can end its processes when the session or daemon that owns it ends, and
-    /// the limits of an enclosing job cannot be read from here. So the update must be in none.
+    /// the limits of an enclosing job cannot be read from here. So the process must be in
+    /// none.
     fn require_no_job(&self) -> Result<()> {
         let mut member = 0;
         // SAFETY: the process handle is open; a null job asks about any job.
         ensure!(
             unsafe { IsProcessInJob(self.process.0, null_mut(), &mut member) } != 0,
-            "check the update's job membership: {}",
+            "check the new process's job membership: {}",
             io::Error::last_os_error()
         );
         ensure!(
             member == 0,
-            "nothing was queued: Windows kept the update inside a job object, which could end \
-             it along with this shell or the service. Run 'massrelay update' in an elevated \
-             PowerShell on this device"
+            "nothing was queued: Windows kept the new process inside a job object, which could \
+             end it along with this session or the service. Run the command in a MassRelay \
+             shell opened with --elevated, or in an elevated PowerShell on this device"
         );
         Ok(())
     }
 
-    /// Let the process act.
-    fn activate(&mut self) -> Result<()> {
+    /// Let the process act, and give it `message`.
+    fn activate(&mut self, message: &[u8]) -> Result<()> {
         self.gate
             .write_all(&[super::super::ACTIVATE])
-            .context("activate the detached update")
+            .and_then(|()| self.gate.write_all(message))
+            .context("activate the detached process")
     }
 
     /// End a refused process, and wait for it to let go of the lock and its log.
@@ -337,7 +406,10 @@ impl Gated {
 
 #[cfg(test)]
 mod tests {
-    use std::process::{Command, Stdio};
+    use std::{
+        io::Read as _,
+        process::{Command, Stdio},
+    };
 
     use super::super::super::{UPDATE_LOG, plain, quote, start_logged};
     use super::*;
@@ -364,6 +436,69 @@ mod tests {
             .stdin(Stdio::piped())
             .spawn()?;
         std::mem::forget(helper.stdin.take());
+        Ok(())
+    }
+
+    /// Stands in for the process that finishes an install: it takes the handoff as that
+    /// does, and says what is still in its input.
+    #[test]
+    #[ignore = "started by the handoff test as its worker"]
+    fn handoff_worker() -> Result<()> {
+        if env::var_os(installer::QUEUED).is_none() {
+            return Ok(());
+        }
+        let received = handoff()?.context("nothing was handed over")?;
+        let password = received.password.context("no password was handed over")?;
+        println!(
+            "handed {} {}",
+            received.approval,
+            String::from_utf16(&password.0)?.trim_end_matches('\0')
+        );
+        // A buffered reader would have taken this along with the password.
+        let mut rest = String::new();
+        standard_input()?.read_to_string(&mut rest)?;
+        println!("left {rest}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_handed_over_password_is_read_without_buffering_what_follows() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path();
+        let account = Account::current()?;
+        let this = plain(&env::current_exe()?.canonicalize()?)?;
+        let (_, module) = module_path!().split_once("::").context("the test module")?;
+        let command = format!(
+            "{} {module}::handoff_worker --exact --ignored --nocapture",
+            quote(&this)?
+        );
+        let approval = "a".repeat(64);
+        let password: Secret = Secret("a passw\u{f6}rd\0".encode_utf16().collect());
+        let message = super::super::super::handoff_message(&approval, Some(&password))?;
+        let sent = [&message.0[..], b"after"].concat();
+
+        let lock = queue_lock(&account, dir)?;
+        let log = new_log(&account, dir, UPDATE_LOG)?;
+        let mut worker = Gated::create(
+            &this,
+            &command,
+            env::vars_os(),
+            log.as_file(),
+            &lock,
+            installer::QUEUED,
+            0,
+        )?;
+        worker.activate(&sent)?;
+        let Gated { process, gate } = worker;
+        drop(gate);
+        let code = exit_code(&process, ACTIVATION_LIMIT)?;
+        let text = fs::read_to_string(log.path())?;
+        assert_eq!(code, 0, "{text}");
+        assert!(
+            text.contains(&format!("handed {approval} a passw\u{f6}rd")),
+            "{text}"
+        );
+        assert!(text.contains("left after"), "{text}");
         Ok(())
     }
 
@@ -406,17 +541,17 @@ mod tests {
         let lock = queue_lock(&account, dir)?;
         assert!(queue_lock(&account, dir).is_err());
         let missing = plain(&system_directory()?.join("massrelay-no-such-program.exe"))?;
-        let refused = start_logged(new_log(&account, dir)?, &latest, |log| {
-            Gated::create(&missing, "update", marked(), log, &lock, 0).map(drop)
+        let refused = start_logged(new_log(&account, dir, UPDATE_LOG)?, &latest, |log| {
+            Gated::create(&missing, "update", marked(), log, &lock, GATE, 0).map(drop)
         });
         assert!(refused.is_err());
         assert_eq!(fs::read_to_string(&latest)?, "previous");
         assert_eq!(fs::read_dir(dir)?.count(), 2);
 
         // The queuing command is ended before it activates the worker: its handles close.
-        let log = new_log(&account, dir)?;
+        let log = new_log(&account, dir, UPDATE_LOG)?;
         let Gated { process, gate } =
-            Gated::create(&this, &command, marked(), log.as_file(), &lock, 0)?;
+            Gated::create(&this, &command, marked(), log.as_file(), &lock, GATE, 0)?;
         drop(lock);
         assert!(queue_lock(&account, dir).is_err());
         drop(gate);
@@ -443,9 +578,9 @@ mod tests {
             "make the pipe inheritable"
         );
         let mut process = None;
-        let path = start_logged(new_log(&account, dir)?, &latest, |log| {
-            let mut worker = Gated::create(&this, &command, marked(), log, &lock, 0)?;
-            worker.activate()?;
+        let path = start_logged(new_log(&account, dir, UPDATE_LOG)?, &latest, |log| {
+            let mut worker = Gated::create(&this, &command, marked(), log, &lock, GATE, 0)?;
+            worker.activate(&[])?;
             process = Some(worker.process);
             Ok(())
         })?;

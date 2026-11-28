@@ -12,7 +12,11 @@ use directories::BaseDirs;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
-use crate::{ServiceAction, default_state_dir, private::cli};
+use crate::{
+    ServiceAction, default_state_dir,
+    installer::{self, Verify},
+    private::{cli, runtime::Identity},
+};
 
 #[path = "launch_agent/update_job.rs"]
 mod update_job;
@@ -89,7 +93,12 @@ fn prepare(dir: &Path) -> Result<Prepared> {
 }
 
 /// An install as shown for confirmation, which displays as the changes it would make.
-pub struct InstallPlan(Prepared);
+pub struct InstallPlan {
+    shown: Prepared,
+    /// The runtime the job already runs exactly as this install would set it up, which is
+    /// therefore left running.
+    kept: Option<Identity>,
+}
 
 impl fmt::Display for InstallPlan {
     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -101,7 +110,21 @@ impl fmt::Display for InstallPlan {
             previous,
             binary,
             ..
-        } = &self.0;
+        } = &self.shown;
+        if self.keeps() {
+            return write!(
+                formatter,
+                "Keep the LaunchAgent {} running in {domain}, without a restart: its property \
+                 list {} is already as this install would write it\n\
+                 Enable it, so that it also loads at the next login\n\
+                 It runs {} for the profile in {} and records events in {}",
+                job.label,
+                job.plist.display(),
+                binary.display(),
+                dir.display(),
+                job.events.display()
+            );
+        }
         let write = if previous.is_some() {
             "Replace"
         } else {
@@ -129,25 +152,151 @@ impl fmt::Display for InstallPlan {
 /// What `install` would write and load. Changes nothing, and so leaves to `apply` the lint of
 /// the property list and the checks that open the profile's files for writing.
 pub fn plan_install(dir: &Path) -> Result<InstallPlan> {
-    prepare(dir).map(InstallPlan)
+    prepare(dir).map(InstallPlan::new)
 }
 
 impl InstallPlan {
+    fn new(shown: Prepared) -> Self {
+        Self { shown, kept: None }
+    }
+
+    /// For a command in a session that depends on `runtime`, which has to be this profile's
+    /// service. One that is exactly what this install would make is then left running.
+    pub fn carried_by(&mut self, runtime: &Identity) -> Result<()> {
+        self.inspect_carrier(runtime, &tool)
+    }
+
+    fn inspect_carrier(&mut self, runtime: &Identity, run: Tool) -> Result<()> {
+        let Prepared {
+            dir,
+            job,
+            service,
+            loaded,
+            previous,
+            binary,
+            contents,
+            ..
+        } = &self.shown;
+        let printed = run("/bin/launchctl", &["print", service])
+            .with_context(|| format!("look for {service}"))?;
+        ensure!(
+            printed.success && job_pid(&printed.stdout) == Some(runtime.pid),
+            installer::NOT_THE_SERVICE
+        );
+        let running = runtime
+            .executable
+            .as_deref()
+            .map(Path::new)
+            .filter(|program| program.is_file())
+            .context("cannot find the program that would restore this LaunchAgent")?;
+        let arguments = [
+            path_text(running)?,
+            "--state-dir",
+            path_text(dir)?,
+            "run",
+            "--log-file",
+            path_text(&job.events)?,
+        ];
+        let saved = job.render(running, dir)?;
+        ensure!(
+            previous
+                .as_ref()
+                .is_some_and(|plist| plist.contents == saved.as_bytes())
+                && matches!(loaded, Some(Some(loaded))
+                    if loaded.arguments == arguments
+                        && loaded.path.as_deref() == job.plist.to_str())
+                && Loaded::read(&printed.stdout).as_ref()
+                    == loaded.as_ref().and_then(Option::as_ref),
+            "the saved LaunchAgent cannot be verified to restore the service carrying this \
+             session. Nothing was changed"
+        );
+        let exact = saved == *contents && installer::is_this_program(runtime, binary);
+        self.kept = exact.then(|| runtime.clone());
+        Ok(())
+    }
+
+    /// Whether applying this leaves the running job loaded as it is.
+    pub fn keeps(&self) -> bool {
+        self.kept.is_some()
+    }
+
+    /// Everything a confirmation of this approves, to compare across processes.
+    pub fn approval(&self) -> String {
+        format!("{:?} {:?}", self.shown, self.kept)
+    }
+
+    /// Where a queued install says what it did.
+    pub fn log(&self) -> String {
+        self.shown.job.install_log.display().to_string()
+    }
+
     /// Install and load the service, if what it would replace and write is still as it was
     /// shown. Returns the canonical state directory the service was installed for.
     pub fn apply(self) -> Result<PathBuf> {
-        cli::check_enrolled(&self.0.dir)?;
-        register(self.confirm(prepare(&self.0.dir)?)?)
+        self.perform(None)
+    }
+
+    fn perform(self, serves: Verify) -> Result<PathBuf> {
+        cli::check_enrolled(&self.shown.dir)?;
+        let found = self.confirm(prepare(&self.shown.dir)?)?;
+        let Some(runtime) = &self.kept else {
+            let run = |command: &mut Command, action: &str| checked(command, action).map(drop);
+            return register(found, &run, STOP_LIMIT, serves);
+        };
+        let mut found = Self::new(found);
+        found.carried_by(runtime)?;
+        ensure!(found.keeps(), INSTALL_CHANGED);
+        let Prepared {
+            dir, job, service, ..
+        } = found.shown;
+        // Nothing is unloaded for this.
+        checked(&mut launchctl("enable", &service), "enable the LaunchAgent")?;
+        crate::update::say(format!(
+            "Kept {} running\nEvent log       {}",
+            job.label,
+            job.events.display()
+        ));
+        Ok(dir)
+    }
+
+    /// `apply` in the process a `queue` started, which counts a start only once `serves`
+    /// finds the runtime answering.
+    pub fn finish(self, serves: &dyn Fn(Option<&Path>) -> Result<()>) -> Result<PathBuf> {
+        self.perform(Some(serves))
+    }
+
+    /// Hand this install, as `approval` names it, to a job of its own, which neither the
+    /// service's unload nor this session's end reaches. Returns where it logs.
+    pub fn queue(self, approval: &str) -> Result<String> {
+        cli::check_enrolled(&self.shown.dir)?;
+        let found = self.confirm(prepare(&self.shown.dir)?)?;
+        let log = self.log();
+        let label = format!("{}.install", found.job.label);
+        let job = update_job::OneShot {
+            domain: &found.domain,
+            label,
+            command: update_job::Command::Install { approval },
+            program: &found.binary,
+            dir: &found.dir,
+            log: &found.job.install_log,
+        };
+        job.queue(&|args| bounded(Command::new("/bin/launchctl").args(args)))?;
+        Ok(log)
     }
 
     /// Require what an install finds now to be what was shown.
     fn confirm(&self, found: Prepared) -> Result<Prepared> {
-        ensure!(found == self.0, INSTALL_CHANGED);
+        ensure!(found == self.shown, INSTALL_CHANGED);
         Ok(found)
     }
 }
 
-fn register(prepared: Prepared) -> Result<PathBuf> {
+/// Runs a command to its end, failing unless it succeeds. Says what it was for.
+type Run<'a> = &'a dyn Fn(&mut Command, &str) -> Result<()>;
+
+/// Replace the job as `prepared` says, and put back what was there if that fails.
+/// `stop_limit` is how long launchd is given to forget a replacement that does not serve.
+fn register(prepared: Prepared, run: Run, stop_limit: Duration, serves: Verify) -> Result<PathBuf> {
     let Prepared {
         dir,
         job,
@@ -155,8 +304,8 @@ fn register(prepared: Prepared) -> Result<PathBuf> {
         service,
         loaded,
         previous,
+        binary,
         contents,
-        ..
     } = prepared;
     // Only a job that was shown as loaded is unloaded.
     let loaded = loaded.is_some();
@@ -167,24 +316,58 @@ fn register(prepared: Prepared) -> Result<PathBuf> {
     fs::create_dir_all(directory)?;
     fs::create_dir_all(job.events.parent().expect("Logs directory"))?;
     let staged = stage(directory, contents.as_bytes())?;
-    checked(
+    run(
         Command::new("/usr/bin/plutil")
             .arg("-lint")
             .arg(staged.path()),
         "validate the LaunchAgent plist",
     )?;
+    let unload = || {
+        run(
+            &mut launchctl("bootout", &service),
+            "unload the LaunchAgent",
+        )
+    };
+    let load = || {
+        run(
+            launchctl("bootstrap", &domain).arg(&job.plist),
+            "load the LaunchAgent",
+        )
+    };
     if loaded {
-        unload(&service)?;
+        unload()?;
     }
     let registered = (|| {
         staged
             .persist(&job.plist)
             .context("save the LaunchAgent plist")?;
-        checked(&mut launchctl("enable", &service), "enable the LaunchAgent")?;
-        bootstrap(&domain, &job.plist)
+        run(&mut launchctl("enable", &service), "enable the LaunchAgent")?;
+        load()?;
+        if let Some(serves) = serves {
+            serves(Some(&binary)).context("the new service did not come up")?;
+        }
+        Ok::<_, anyhow::Error>(())
     })();
     if let Err(error) = registered {
         let restore = (|| {
+            // A replacement that loaded without serving has to be gone before the previous
+            // job can take its name.
+            let present = || {
+                let mut print = launchctl("print", &service);
+                run(&mut print, "look for the LaunchAgent").is_ok()
+            };
+            if serves.is_some() && present() {
+                unload()?;
+                let deadline = Instant::now() + stop_limit;
+                while present() {
+                    ensure!(
+                        Instant::now() < deadline,
+                        "launchd still has {service} after {} seconds",
+                        stop_limit.as_secs()
+                    );
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
             match previous {
                 Some(previous) => {
                     stage(directory, &previous.contents)?.persist(&job.plist)?;
@@ -196,7 +379,10 @@ fn register(prepared: Prepared) -> Result<PathBuf> {
                 },
             }
             if loaded {
-                bootstrap(&domain, &job.plist)?;
+                load()?;
+                if let Some(serves) = serves {
+                    serves(None).context("the restored service did not come up")?;
+                }
             }
             Ok::<_, anyhow::Error>(())
         })();
@@ -205,7 +391,10 @@ fn register(prepared: Prepared) -> Result<PathBuf> {
                 "could not restore the previous LaunchAgent: {restore:#}"
             )));
         }
-        return Err(error);
+        return Err(match serves {
+            Some(_) if loaded => error.context("the previous service was restored and answers"),
+            _ => error,
+        });
     }
     println!("Loaded {} for this login session", job.label);
     println!("Event log       {}", job.events.display());
@@ -669,6 +858,7 @@ impl Managed {
         update_job::OneShot {
             domain: &self.domain,
             label: format!("{}.update", self.job.label),
+            command: update_job::Command::Update,
             program,
             dir: &self.dir,
             log: &self.job.update_log,
@@ -833,6 +1023,8 @@ struct Job {
     events: PathBuf,
     /// The output of the last update that ran as a job of its own.
     update_log: PathBuf,
+    /// The same for an install.
+    install_log: PathBuf,
 }
 
 impl Job {
@@ -858,6 +1050,7 @@ impl Job {
             plist: library.join("LaunchAgents").join(format!("{label}.plist")),
             events: logs.join(format!("{name}-connections.jsonl")),
             update_log: logs.join(format!("{name}-update.log")),
+            install_log: logs.join(format!("{name}-install.log")),
             label,
         })
     }
@@ -1130,7 +1323,7 @@ mod plan_tests {
         };
 
         // Nothing is installed, and looking makes nothing.
-        let plan = InstallPlan(read("/m")?);
+        let plan = InstallPlan::new(read("/m")?);
         plan.confirm(read("/m")?)?;
         assert!(!plist.parent().unwrap().exists());
         refused(&plan, "/other");
@@ -1139,11 +1332,11 @@ mod plan_tests {
         refused(&plan, "/m");
 
         // A job loaded since the plan showed none would have to be unloaded.
-        let plan = InstallPlan(read("/m")?);
+        let plan = InstallPlan::new(read("/m")?);
         launchd.borrow_mut().service = loaded("/m", 7);
         refused(&plan, "/m");
         // One shown as loaded may restart meanwhile, but not become another, or go.
-        let plan = InstallPlan(read("/m")?);
+        let plan = InstallPlan::new(read("/m")?);
         launchd.borrow_mut().service = loaded("/m", 8);
         plan.confirm(read("/m")?)?;
         for changed in [loaded("/other", 8), None] {
@@ -1157,6 +1350,169 @@ mod plan_tests {
         refused(&plan, "/m");
         assert!(launchd.borrow().changes.is_empty());
         assert_eq!(fs::read_to_string(&plist)?, "installed since");
+        Ok(())
+    }
+
+    #[test]
+    fn a_carried_install_keeps_only_a_job_it_would_not_change() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path().join("profile");
+        let binary = temp.path().join("massrelay");
+        fs::write(&binary, "program")?;
+        let job = || Job::new(temp.path(), &dir, None).unwrap();
+        let source = job().render(&binary, &dir)?;
+        fs::create_dir_all(job().plist.parent().unwrap())?;
+        let runtime = Identity {
+            pid: 99,
+            executable: binary.to_str().map(str::to_owned),
+            version: env!("CARGO_PKG_VERSION").into(),
+            endpoint: String::new(),
+            held: false,
+        };
+        let printed = |events: &Path| {
+            format!(
+                "x = {{\n\tpath = {}\n\tpid = 99\n\targuments = {{\n\t\t{}\n\t\t--state-dir\n\t\t{}\n\
+                 \t\trun\n\t\t--log-file\n\t\t{}\n\t}}\n}}",
+                job().plist.display(),
+                binary.display(),
+                dir.display(),
+                events.display()
+            )
+        };
+        let launchd = RefCell::new(Launchd {
+            session: true,
+            service: Some(printed(&job().events)),
+            ..Default::default()
+        });
+        let run = |program: &str, args: &[&str]| Launchd::run(&launchd, program, args);
+        let carried = |runtime: &Identity| {
+            let read = Prepared::read(dir.clone(), job(), binary.clone(), &run)?;
+            let mut plan = InstallPlan::new(read);
+            plan.inspect_carrier(runtime, &run)?;
+            anyhow::Ok(plan.keeps())
+        };
+
+        fs::write(&job().plist, &source)?;
+        assert!(carried(&runtime)?);
+        let older = Identity {
+            version: "0.0.1".into(),
+            ..runtime.clone()
+        };
+        assert!(!carried(&older)?);
+        // Loaded with something else than the file says.
+        launchd.borrow_mut().service = Some(printed(Path::new("/elsewhere")));
+        assert!(carried(&runtime).is_err());
+        launchd.borrow_mut().service = Some(printed(&job().events));
+        fs::write(&job().plist, job().render(Path::new("/other"), &dir)?)?;
+        assert!(carried(&runtime).is_err());
+        let foreground = Identity {
+            pid: 7,
+            ..runtime.clone()
+        };
+        assert!(carried(&foreground).is_err());
+        assert!(launchd.borrow().changes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_finished_install_that_does_not_serve_gives_way_to_the_previous_job() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path().join("profile");
+        let job = || Job::new(temp.path(), &dir, None).unwrap();
+        let plist = job().plist;
+        fs::create_dir_all(plist.parent().unwrap())?;
+        let (old, new) = (Path::new("/opt/previous"), Path::new("/opt/replacement"));
+        let previous = job().render(old, &dir)?;
+        // Install over the loaded previous job, with a runtime that answers only while the
+        // property list starts one of `answering`.
+        let install = |answering: &[&str], refuse_load: bool| {
+            fs::write(&plist, &previous)?;
+            let prepared = Prepared {
+                dir: dir.clone(),
+                job: job(),
+                domain: "gui/501".into(),
+                service: format!("gui/501/{LABEL}"),
+                loaded: Some(None),
+                previous: plist_file(&plist)?,
+                binary: new.into(),
+                contents: job().render(new, &dir)?,
+            };
+            // Whether launchd has the job, the commands run, and a load still to refuse.
+            let asked = RefCell::new((true, Vec::new(), refuse_load));
+            let run = |command: &mut Command, _: &str| {
+                let verb = command
+                    .get_args()
+                    .next()
+                    .and_then(|verb| verb.to_str())
+                    .context("no verb")?
+                    .to_owned();
+                let (loaded, commands, refuse) = &mut *asked.borrow_mut();
+                commands.push(verb.clone());
+                match verb.as_str() {
+                    "-lint" | "enable" => {}
+                    "print" => ensure!(*loaded, "not loaded"),
+                    "bootout" => {
+                        ensure!(*loaded, "not loaded");
+                        *loaded = false;
+                    }
+                    "bootstrap" => {
+                        ensure!(!*loaded && !std::mem::take(refuse), "refused");
+                        *loaded = true;
+                    }
+                    other => bail!("unexpected {other}"),
+                }
+                Ok(())
+            };
+            let serves = |program: Option<&Path>| {
+                let program = program.map_or_else(String::new, |path| path.display().to_string());
+                asked.borrow_mut().1.push(format!("serves {program}"));
+                let contents = fs::read_to_string(&plist)?;
+                ensure!(
+                    answering.iter().any(|program| contents.contains(program)),
+                    "nothing answers"
+                );
+                Ok(())
+            };
+            let result = register(prepared, &run, Duration::from_secs(5), Some(&serves))
+                .map_err(|error| format!("{error:#}"));
+            let (loaded, commands, _) = asked.into_inner();
+            assert!(loaded, "no job was left loaded: {commands:?}");
+            anyhow::Ok((result, commands, fs::read_to_string(&plist)?))
+        };
+        let replacing = ["-lint", "bootout", "enable", "bootstrap"];
+
+        let (result, commands, left) = install(&["/opt/replacement"], false)?;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(commands[..4], replacing);
+        assert_eq!(commands[4..], ["serves /opt/replacement"]);
+        assert_ne!(left, previous);
+
+        // The silent replacement is unloaded, and seen to be gone, before the old one loads.
+        let (result, commands, left) = install(&["/opt/previous"], false)?;
+        let error = result.unwrap_err();
+        assert!(error.contains("restored and answers"), "{error}");
+        assert_eq!(
+            commands[4..],
+            [
+                "serves /opt/replacement",
+                "print",
+                "bootout",
+                "print",
+                "bootstrap",
+                "serves "
+            ]
+        );
+        assert_eq!(left, previous);
+
+        // One that never loaded leaves nothing to unload.
+        let (result, commands, left) = install(&["/opt/previous"], true)?;
+        assert!(result.is_err());
+        assert_eq!(commands[4..], ["print", "bootstrap", "serves "]);
+        assert_eq!(left, previous);
+
+        let (result, ..) = install(&[], false)?;
+        let error = result.unwrap_err();
+        assert!(error.contains("could not restore"), "{error}");
         Ok(())
     }
 

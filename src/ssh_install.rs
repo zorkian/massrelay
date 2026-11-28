@@ -98,7 +98,7 @@ pub fn register(state_dir: &Path) -> Result<()> {
             "the background service is installed and running, but this account's OpenSSH \
              aliases are not set up for it. Correct this and run 'massrelay install' again",
         )?;
-    println!("SSH config      {}", config.display());
+    crate::update::say(format!("SSH config      {}", config.display()));
     Ok(())
 }
 

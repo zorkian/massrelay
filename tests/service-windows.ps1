@@ -203,6 +203,67 @@ try {
     $service = Get-DeviceService $name
     Assert ($service.State -eq 'Running' -and $service.ProcessId -ne $first) 'The second install did not restart the service.'
 
+    # Installs from a session of the service. A throwaway service, started by the service
+    # manager as the device's is, opens a shell as the device does for a peer and installs
+    # from it: first with nothing to change, then registering another shell. It ends that
+    # shell once the install is queued, and the detached process has to finish by itself.
+    # Nothing here is skipped: a handoff that cannot start fails the fixture.
+    $tests = & cargo +stable test --locked --release --no-run --message-format=json |
+        ForEach-Object { $_ | ConvertFrom-Json } |
+        Where-Object {
+            $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.executable -and
+            $_.target.name -eq 'massrelay' -and $_.target.kind -contains 'bin'
+        } |
+        Select-Object -ExpandProperty executable
+    Assert (@($tests).Count -eq 1) 'Expected one MassRelay unit-test executable.'
+    $credential = [pscredential]::new("$env:COMPUTERNAME\$user", (ConvertTo-SecureString $secret -AsPlainText -Force))
+    $hostedProbe = "MassRelayHostedProbe-$($id.Substring(0, 8))"
+    $hostedExe = Join-Path $root 'hosted-probe.exe'
+    $hostedDone = Join-Path $root 'hosted-probe.result'
+    $otherShell = Join-Path ([Environment]::SystemDirectory) 'cmd.exe'
+    $pipeName = "massrelay-fixture-$id"
+    Copy-Item -LiteralPath $tests -Destination $hostedExe
+    @{
+        name = $hostedProbe; state = $state; result = $hostedDone; program = $exe
+        service_process = $service.ProcessId; other_shell = $otherShell; password_pipe = $pipeName
+    } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'hosted-probe.json') -Encoding utf8NoBOM
+    $pipe = [IO.Pipes.NamedPipeServerStream]::new(
+        $pipeName, [IO.Pipes.PipeDirection]::Out, 1, [IO.Pipes.PipeTransmissionMode]::Byte,
+        [IO.Pipes.PipeOptions]'CurrentUserOnly, Asynchronous')
+    try {
+        New-Service -Name $hostedProbe -BinaryPathName "`"$hostedExe`" scm_hosted_install_probe --ignored --test-threads=1" -Credential $credential -StartupType Manual | Out-Null
+        Start-Service -Name $hostedProbe
+        Assert ($pipe.WaitForConnectionAsync().Wait(60000)) 'The hosted install probe did not ask for the password.'
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes($secret)
+        $pipe.Write($bytes, 0, $bytes.Length)
+        $pipe.WaitForPipeDrain()
+    } finally {
+        $pipe.Dispose()
+    }
+    $deadline = (Get-Date).AddSeconds(420)
+    while (-not (Test-Path -LiteralPath $hostedDone) -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 500
+    }
+    Assert (Test-Path -LiteralPath $hostedDone) 'The hosted install probe did not finish.'
+    # The result may still be being written.
+    Start-Sleep -Seconds 1
+    $output = Get-Content -LiteralPath $hostedDone -Raw
+    Assert ($output -eq 'ok') "Installing from a shell of the service failed: $output"
+    $installLog = Join-Path $state 'install.log'
+    $deadline = (Get-Date).AddSeconds(240)
+    do {
+        Start-Sleep -Milliseconds 500
+        $said = [string](Get-Content -LiteralPath $installLog -Raw)
+    } while ($said -notmatch 'MassRelay installation finished\.' -and (Get-Date) -lt $deadline)
+    Assert ($said -match 'MassRelay installation finished\.') "The detached install did not finish: $said"
+    Assert (-not $said.Contains($secret)) 'The install log contains the password.'
+    $previous = $service.ProcessId
+    $service = Get-DeviceService $name
+    Assert ($service.State -eq 'Running' -and $service.ProcessId -ne $previous) 'The detached install did not restart the service.'
+    Assert ($service.PathName.EndsWith("--shell `"$otherShell`"", [StringComparison]::OrdinalIgnoreCase)) "The detached install did not register the other shell: $($service.PathName)"
+    Assert (Test-Runtime) 'The runtime does not answer after the detached install.'
+    Stop-Service -Name $hostedProbe
+
     foreach ($attempt in 1..2) {
         $stopped = Invoke-Device @('stop')
         Assert ($stopped.ExitCode -eq 0) "stop failed: $($stopped.Error)"
@@ -254,21 +315,12 @@ try {
     Assert ((Get-DeviceService $name).State -eq 'Stopped') 'The service unexpectedly started again after stop.'
 
     if ($ConPty) {
-        $tests = & cargo +stable test --locked --release --no-run --message-format=json |
-            ForEach-Object { $_ | ConvertFrom-Json } |
-            Where-Object {
-                $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.executable -and
-                $_.target.name -eq 'massrelay' -and $_.target.kind -contains 'bin'
-            } |
-            Select-Object -ExpandProperty executable
-        Assert (@($tests).Count -eq 1) 'Expected one MassRelay unit-test executable.'
         $probe = "MassRelayConPtyProbe-$($id.Substring(0, 8))"
         $probeExe = Join-Path $root 'probe.exe'
         $done = Join-Path $root 'probe.result'
         Copy-Item -LiteralPath $tests -Destination $probeExe
         @{ name = $probe; state = $state; result = $done } | ConvertTo-Json |
             Set-Content -LiteralPath (Join-Path $root 'probe.json') -Encoding utf8NoBOM
-        $credential = [pscredential]::new("$env:COMPUTERNAME\$user", (ConvertTo-SecureString $secret -AsPlainText -Force))
         New-Service -Name $probe -BinaryPathName "`"$probeExe`" scm_powershell_probe --ignored --test-threads=1" -Credential $credential -StartupType Manual | Out-Null
         Start-Service -Name $probe
         $scmProbe = Get-DeviceService $probe

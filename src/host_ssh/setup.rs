@@ -31,6 +31,7 @@ use super::{
     owned::{self, Disposition, KeyFile, Record},
     present, read_description, remove, write_private,
 };
+use crate::update::say;
 
 const LOOPBACK: &str = "127.0.0.1";
 /// An address reserved for documentation, standing in for logins from elsewhere.
@@ -928,17 +929,34 @@ impl InstallPlan {
             Planned::Known(_, Ok(Preview { block: Some(_), .. }))
         );
         if !shown_before && install.change.is_some() {
-            println!(
+            say(format!(
                 "Added to {}:\n{}",
                 system.config().display(),
                 indented(&install.block)
-            );
+            ));
         }
         for note in &install.notes {
-            println!("Note: the server's '{note}' stays in force for these logins");
+            say(format!(
+                "Note: the server's '{note}' stays in force for these logins"
+            ));
         }
-        println!("System SSH      {LOOPBACK}:{} is ready", found.port);
+        say(format!(
+            "System SSH      {LOOPBACK}:{} is ready",
+            found.port
+        ));
         Ok(())
+    }
+
+    /// What a confirmation of this plan approves, for a process that is to carry it out
+    /// later to compare with its own: what is shown, and what was found.
+    pub(crate) fn approval(&self) -> String {
+        match &self.planned {
+            Planned::Known(found, _) => format!(
+                "{self}{:?}",
+                (&found.files, found.port, &found.host_key, &found.reload)
+            ),
+            Planned::Deferred(_) => self.to_string(),
+        }
     }
 }
 
