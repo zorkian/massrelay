@@ -267,7 +267,7 @@ pub async fn show(state_dir: &Path, follow: bool, log_file: Option<&Path>) -> Re
     let mut audit_lines = Vec::new();
     let mut audit_error = None;
     for audit in &mut audits {
-        match audit.read(RECENT) {
+        match audit.recent(RECENT) {
             Ok(lines) => audit_lines.extend(lines),
             Err(error) => {
                 // Collect other sources and still show their history.
@@ -320,8 +320,13 @@ async fn follow_audits(audits: &mut [Tail]) -> Result<i32> {
     loop {
         tokio::time::sleep(AUDIT_POLL).await;
         for audit in &mut *audits {
-            if !write_lines(&audit.read(usize::MAX)?)? {
-                return Ok(0);
+            let mut unread = audit.unread()?;
+            while let Some(lines) = unread.next_batch()? {
+                if !write_lines(&lines)? {
+                    return Ok(0);
+                }
+                // Let an interrupt end a long catch-up.
+                tokio::task::yield_now().await;
             }
         }
     }

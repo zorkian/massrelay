@@ -188,7 +188,6 @@ pub const CONTROL: Channel = Channel {
 const STOP_WAIT: Duration = Duration::from_secs(10);
 /// Bound on withdrawing the keys of ended SSH tunnels during `stop`.
 const KEY_WAIT: Duration = Duration::from_secs(2);
-pub const MAX_PING_COUNT: u16 = 1000;
 
 // ------------------------------------------------------------------ protocol
 
@@ -200,7 +199,9 @@ pub enum ControlRequest {
     Invite,
     Ping {
         peer: String,
-        count: u16,
+        /// A runtime that predates counts above 1000 refuses them, and cannot read one
+        /// above `u16::MAX`.
+        count: u64,
         /// Older clients omit this and expect only `PingSample` replies.
         #[serde(default)]
         include_route: bool,
@@ -1361,14 +1362,11 @@ pub(super) fn peer_address(addresses: &Addresses, key: &EndpointKey) -> Result<E
 async fn ping_peer<M: Mailbox + Send + Sync + 'static>(
     shared: &Shared<M>,
     peer: &str,
-    count: u16,
+    count: u64,
     include_route: bool,
     tx: &mut (impl AsyncWrite + Unpin),
 ) -> Result<()> {
-    ensure!(
-        (1..=MAX_PING_COUNT).contains(&count),
-        "ping count must be between 1 and {MAX_PING_COUNT}"
-    );
+    ensure!(count > 0, "ping count must be at least 1");
     let state = shared
         .node
         .pairing_state()

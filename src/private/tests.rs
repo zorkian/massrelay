@@ -3436,6 +3436,23 @@ mod pairing {
             Refusal::NotMember(_)
         ));
         assert_eq!(pb.resolve("alice").unwrap(), Some(alice.ep));
+
+        // Length is not limited, while the other rules still apply to a long alias.
+        let long = "a".repeat(10_000);
+        pb.approve(&long, &carol.ep, false).unwrap();
+        assert_eq!(pb.resolve(&long).unwrap(), Some(carol.ep));
+        for bad in [String::new(), format!("{long} b"), format!("{long}\u{7}")] {
+            assert!(matches!(pb.rename(&long, &bad), Err(PairError::Alias(_))));
+        }
+        assert!(matches!(
+            pb.rename(&long, &super::super::codec::hex(&alice.ep)),
+            Err(PairError::Alias(_))
+        ));
+        let longer = "b".repeat(20_000);
+        assert!(pb.rename(&long, &longer).unwrap());
+        drop(ob);
+        let stored = crate::private::pairing::read_state(&bob.dev).unwrap();
+        assert_eq!(stored.resolve_selector(&longer), Ok(carol.ep));
     }
 
     // ------------------------------------------- integrated guard tests
@@ -5524,6 +5541,41 @@ mod runtime {
             .await;
             assert_eq!(cmd(&bob, shell(true)).await, ControlReply::Changed(true));
 
+            // A new tunnel waits for the lock, past any single attempt's patience, and is
+            // authorized once it is free.
+            let setup = hold();
+            let waiting = ssh_to(&alice, "bob", Some(one_key));
+            let release = async {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                assert_eq!(text(), header);
+                drop(setup);
+            };
+            let ((mut late, reply, late_life), ()) = tokio::join!(waiting, release);
+            assert_eq!(reply, ControlReply::Connected);
+            expect_data(&mut late, BANNER).await;
+            assert_eq!(authorized(&keys).len(), 1);
+            drop((late, late_life));
+            eventually("the late tunnel's key is withdrawn", || {
+                (text() == header).then_some(())
+            })
+            .await;
+            // A cutoff ends such a wait at once, and no key is written afterwards.
+            let setup = hold();
+            let waiting = refused(Some(one_key));
+            let cut = async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let asked = tokio::time::Instant::now();
+                assert_eq!(cmd(&bob, shell(false)).await, ControlReply::Changed(true));
+                asked
+            };
+            let (error, asked) = tokio::join!(waiting, cut);
+            let took = asked.elapsed();
+            assert!(took < Duration::from_millis(1500), "{took:?}: {error}");
+            drop(setup);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(text(), header);
+            assert_eq!(cmd(&bob, shell(true)).await, ControlReply::Changed(true));
+
             // A key file someone else's key is in is left alone.
             let foreign = format!("{header}{} me@laptop\n", ssh_line(&[9; 32]));
             write_private(&bob.path, SSH_KEYS, foreign.as_bytes());
@@ -5586,7 +5638,7 @@ mod runtime {
                 })
             })
             .await;
-            let hosts = alice.path.join(format!("ssh-client-hosts-{}", key(&bob)));
+            let hosts = alice.path.join(format!("ssh-client-hosts-by-endpoint-{}", key(&bob)));
             assert!(
                 std::fs::read_to_string(hosts)
                     .unwrap()
@@ -6007,6 +6059,75 @@ mod runtime {
             assert!(transferred.status.success(), "{transferred:?}");
             assert_eq!(std::fs::read(copy).unwrap(), b"massrelay fixture");
 
+            // Stock local, remote and dynamic forwarding work, as the server's policy
+            // allows.
+            let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let echo_port = echo.local_addr().unwrap().port();
+            let echoing = tokio::spawn(async move {
+                while let Ok((mut stream, _)) = echo.accept().await {
+                    tokio::spawn(async move {
+                        let (mut read, mut write) = stream.split();
+                        let _ = tokio::io::copy(&mut read, &mut write).await;
+                    });
+                }
+            });
+            // Held together, so that the three are different.
+            let free: [_; 3] =
+                std::array::from_fn(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+            let [local, remote, dynamic] = free
+                .each_ref()
+                .map(|held| held.local_addr().unwrap().port());
+            drop(free);
+            let to_echo = |port| format!("127.0.0.1:{port}:127.0.0.1:{echo_port}");
+            let mut forwarding = Command::new("/usr/bin/ssh")
+                .arg("-F")
+                .arg(&transfer_config)
+                .args(["-o", "ExitOnForwardFailure=yes"])
+                .args(["-L", &to_echo(local), "-R", &to_echo(remote)])
+                .args(["-D", &format!("127.0.0.1:{dynamic}")])
+                .args([&transfer.alias, "echo ready; exec /bin/cat"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut ready = String::new();
+            BufReader::new(forwarding.stdout.take().unwrap())
+                .read_line(&mut ready)
+                .await
+                .unwrap();
+            assert_eq!(ready, "ready\n");
+            for (port, socks) in [(local, false), (remote, false), (dynamic, true)] {
+                let exchange = async {
+                    let mut stream = loop {
+                        match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                            Ok(stream) => break stream,
+                            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                        }
+                    };
+                    if socks {
+                        // SOCKS 5 without authentication: connect to the echo server.
+                        stream.write_all(&[5, 1, 0]).await.unwrap();
+                        let mut method = [0; 2];
+                        stream.read_exact(&mut method).await.unwrap();
+                        assert_eq!(method, [5, 0]);
+                        let [high, low] = echo_port.to_be_bytes();
+                        let connect = [5, 1, 0, 1, 127, 0, 0, 1, high, low];
+                        stream.write_all(&connect).await.unwrap();
+                        let mut reply = [0; 10];
+                        stream.read_exact(&mut reply).await.unwrap();
+                        assert_eq!(reply[..2], [5, 0]);
+                    }
+                    stream.write_all(b"forwarded").await.unwrap();
+                    let mut echoed = [0; 9];
+                    stream.read_exact(&mut echoed).await.unwrap();
+                    assert_eq!(&echoed, b"forwarded");
+                };
+                tokio::time::timeout(T, exchange).await.unwrap();
+            }
+            forwarding.kill().await.unwrap();
+            echoing.abort();
+
             let identity = |config: &str| {
                 config
                     .lines()
@@ -6226,6 +6347,11 @@ mod runtime {
         assert!(!config.exists() && !saved.exists() && !identity.exists());
         assert!(authorized(&keys).is_empty());
 
+        // A client that already read an earlier managed config can still use its pin.
+        let previous_hosts = format!("ssh-client-hosts-{}", key(&bob));
+        let previous_pin = format!("massrelay-lab {}\n", server.host_key);
+        write_private(&alice.path, &previous_hosts, previous_pin.as_bytes());
+
         // The file appearing under a running runtime opts the profile in.
         let opt_in = || {
             if !saved.exists() {
@@ -6243,6 +6369,10 @@ mod runtime {
         let listed = || Some(text()).filter(|text| text.contains("Host massrelay-lab mr-lab\n"));
         let removed = || text().is_empty().then_some(());
         let first = eventually("the peer is confirmed", listed).await;
+        assert_eq!(
+            std::fs::read_to_string(alice.path.join(previous_hosts)).unwrap(),
+            previous_pin
+        );
         assert_eq!(
             std::fs::metadata(&config).unwrap().permissions().mode() & 0o777,
             0o600
@@ -6284,13 +6414,15 @@ mod runtime {
         }
 
         // A changed host key stays untrusted until `massrelay ssh` replaces the pin.
-        let hosts = alice.path.join(format!("ssh-client-hosts-{}", key(&bob)));
+        let hosts = alice
+            .path
+            .join(format!("ssh-client-hosts-by-endpoint-{}", key(&bob)));
         let pinned = std::fs::read_to_string(&hosts).unwrap();
         let rotated = start_sshd(&n.root.join("sshd-rotated"), &user, &keys).await;
         describe_ssh(&bob, &user, rotated.port, &rotated.host_key, &keys);
         std::fs::write(
             &fallback_hosts,
-            format!("massrelay-lab {}\n", rotated.host_key),
+            format!("massrelay-{} {}\n", key(&bob), rotated.host_key),
         )
         .unwrap();
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -6355,6 +6487,22 @@ mod runtime {
         cmd(&bob, approve(&alice, "alice")).await;
         assert_eq!(cmd(&bob, shell(true)).await, ControlReply::Changed(true));
         eventually("the new approval is confirmed", listed).await;
+
+        // An alias longer than OpenSSH's host-key lookup buffer still uses the same pin.
+        let long = format!("lab-{}", "x".repeat(1100));
+        let rename = ControlRequest::Rename {
+            peer: key(&bob),
+            alias: long.clone(),
+        };
+        assert_eq!(cmd(&alice, rename).await, ControlReply::Changed(true));
+        let alias = format!("mr-{long}");
+        eventually("the full renamed alias is published", || {
+            text().contains(&alias).then_some(())
+        })
+        .await;
+        let renamed = tokio::time::timeout(T, ssh(&alias)).await.unwrap();
+        assert!(renamed.status.success(), "{renamed:?}");
+        assert_eq!(renamed.stdout, uid.stdout);
 
         // A local cutoff removes the entry without the peer, and a later approval of
         // the same label does not move its alias.
@@ -7544,6 +7692,67 @@ mod runtime {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "opens loopback UDP and TCP sockets"]
+    async fn long_names_aliases_and_ping_counts_cross_the_wire() {
+        let n = net();
+        let alice = create(&n, "alice", Clock::System);
+        let bob = join(&n, &alice, "bob", Clock::System);
+        let book = Book::default();
+        let ra = run(&alice, &book, n.mailbox.clone(), None).await;
+        let rb = run(&bob, &book, n.mailbox.clone(), None).await;
+        // The name is far larger than a QUIC stream's initial window.
+        let (alias, name) = ("a".repeat(100_000), "n".repeat(8 << 20));
+        cmd(&alice, approve(&bob, &alias)).await;
+        cmd(&bob, approve(&alice, "alice")).await;
+        let rename = ControlRequest::RenameSelf { name: name.clone() };
+        assert_eq!(cmd(&bob, rename).await, ControlReply::Done);
+
+        let request = ControlRequest::Ping {
+            peer: alias.clone(),
+            count: u64::MAX,
+            include_route: false,
+        };
+        let (mut ping, reply) = tokio::time::timeout(T, rt::request(&alice.path, request))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, ControlReply::PingStarted);
+        assert!(matches!(
+            tokio::time::timeout(T, wire::recv(&mut ping))
+                .await
+                .unwrap()
+                .unwrap(),
+            ControlReply::PingSample(Some(_))
+        ));
+        // The report arrives on its own stream while the connection is in use.
+        tokio::time::timeout(T, async {
+            loop {
+                let ControlReply::Status(view) = cmd(&alice, ControlRequest::Status).await else {
+                    panic!("unexpected status reply");
+                };
+                let peer = view.peers.iter().find(|p| p.key == key(&bob)).unwrap();
+                if peer.reported_name() == Some(&name) {
+                    assert_eq!(peer.alias.as_deref(), Some(alias.as_str()));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("a long name reaches the paired peer");
+        drop(ping);
+        tokio::time::timeout(T, async {
+            while ra.live_sessions() > 0 || rb.live_sessions() > 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("leaving ends an effectively endless ping");
+        assert!(ra.stop().await.owner_released);
+        assert!(rb.stop().await.owner_released);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     #[ignore = "opens loopback UDP/TCP sockets and a native PTY"]
     async fn a_departing_command_ends_its_session_at_once() {
         let n = net();
@@ -8011,7 +8220,7 @@ mod runtime {
 // ------------------------------------------------------- device display names
 
 mod device_names {
-    use super::super::binding::{BindingError, MAX_DEVICE_NAME, check_device_name};
+    use super::super::binding::{BindingError, SIGNED_NAME_BYTES, check_device_name, signed_name};
     use super::*;
 
     fn create_named(n: &Net, dir_name: &str, name: Option<&str>) -> Member {
@@ -8173,13 +8382,7 @@ mod device_names {
 
     #[test]
     fn device_name_rule() {
-        for ok in [
-            "laptop",
-            "a",
-            "web-01",
-            "Build_box",
-            &"x".repeat(MAX_DEVICE_NAME),
-        ] {
+        for ok in ["laptop", "a", "web-01", "Build_box", &"x".repeat(10_000)] {
             assert_eq!(check_device_name(ok), Ok(()), "{ok}");
         }
         let iroh_form = iroh::SecretKey::from_bytes(&[7; 32]).public().to_string();
@@ -8190,12 +8393,39 @@ mod device_names {
             "tab\t",
             "émile",
             "dot.local",
-            &"x".repeat(MAX_DEVICE_NAME + 1),
+            &format!("{}.", "x".repeat(10_000)),
             &iroh_form,
             &hex_form,
         ] {
             assert!(check_device_name(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// A longer name than a binding holds stays whole on its own device, to be reported
+    /// to paired peers. Members, including older ones, see only the signed prefix.
+    #[test]
+    fn long_names_sign_a_prefix_and_keep_the_whole_name() {
+        use super::super::versions::local_display_name;
+        let n = net();
+        let (first, second) = ("x".repeat(500), "y".repeat(SIGNED_NAME_BYTES + 1));
+        let exact = "z".repeat(SIGNED_NAME_BYTES);
+        let a = create_named(&n, "a", Some(&first));
+        let b = join_named(&n, &a, "b", Some(&second));
+        let c = join_named(&n, &a, "c", Some(&exact));
+        sync(&[&a, &b, &c]);
+        agree(&[&a, &b, &c]);
+
+        let roster = c.dev.named_roster().unwrap();
+        for (member, name) in [(&a, &first), (&b, &second), (&c, &exact)] {
+            assert_eq!(
+                named(&roster, &member.ep).as_deref(),
+                Some(signed_name(name))
+            );
+        }
+        assert_eq!(local_display_name(&a.path).unwrap(), Some(first));
+        assert_eq!(local_display_name(&b.path).unwrap(), Some(second));
+        // The signed name is the whole name, so there is nothing more to report.
+        assert_eq!(local_display_name(&c.path).unwrap(), None);
     }
 
     /// A nameless binding keeps the version 1 encoding exactly; a named one
@@ -8250,6 +8480,17 @@ mod device_names {
         ));
         assert!(matches!(
             CredentialBinding::create_named(&secret, &tag, &mls_key, Some("not ok")),
+            Err(BindingError::Name(_))
+        ));
+        // Older members halt on a longer signed name, so none is written or accepted.
+        let long = "x".repeat(SIGNED_NAME_BYTES + 1);
+        bad.name = Some(long.clone());
+        assert!(matches!(
+            CredentialBinding::decode(&bad.encode()),
+            Err(BindingError::Name(_))
+        ));
+        assert!(matches!(
+            CredentialBinding::create_named(&secret, &tag, &mls_key, Some(&long)),
             Err(BindingError::Name(_))
         ));
     }

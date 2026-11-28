@@ -493,7 +493,9 @@ fn print_table<const N: usize>(rows: &[[String; N]], terminal: bool) {
         let (last, columns) = row.split_last().expect("table columns");
         let mut line = String::new();
         for (cell, width) in columns.iter().zip(widths) {
-            write!(line, "{cell:<width$}  ").expect("write to string");
+            // Pad by hand: a format width panics beyond `u16::MAX`, and names have no limit.
+            line.push_str(cell);
+            line.extend(std::iter::repeat_n(' ', width - cell.chars().count() + 2));
         }
         println!("{line}{last}");
     }

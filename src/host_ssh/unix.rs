@@ -400,8 +400,8 @@ impl System for Unix {
         &self.user
     }
 
-    fn other_user(&self) -> &str {
-        "root"
+    fn other_user(&self) -> Option<&str> {
+        Some("root")
     }
 
     fn config(&self) -> &Path {

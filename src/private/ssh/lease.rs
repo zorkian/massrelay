@@ -10,8 +10,10 @@
 //! authorization is refused while the file holds anything but these lines, blank lines and
 //! comments: a person's own keys belong elsewhere. The file is replaced atomically, by a
 //! writer holding the exclusive lock on `ssh-authorized-keys.lock`. The installer takes
-//! the same lock around setup and removal. Nothing here waits for it on a runtime's
-//! thread: a removal that cannot have it at once is retried until it is done (`Withdrawals`).
+//! the same lock while it changes this file or the server's description, and for the whole of
+//! a removal. Nothing here blocks a runtime's thread on it: an authorization waits for it as
+//! long as its request lasts, and a withdrawal that cannot have it at once is retried until
+//! it is done (`Withdrawals`).
 //!
 //! Each line is tagged with the profile that wrote it. A runtime removes its profile's
 //! lines when it starts, after a crash left them behind.
@@ -39,9 +41,8 @@ pub(super) const KEY_FILE: &str = "ssh-authorized-keys";
 const LOCK_FILE: &str = "ssh-authorized-keys.lock";
 const TAG: &str = "massrelay-lease:";
 const OPTIONS: &str = r#"from="127.0.0.1",expiry-time=""#;
-/// Far above what a runtime can have open.
-const MAX_FILE: u64 = 1 << 20;
-/// How long another writer may hold the lock, or a reader keep the file from being replaced.
+/// How long a reader may keep the file from being replaced, and a withdrawal may wait before
+/// that is reported.
 pub(super) const WAIT: Duration = Duration::from_secs(2);
 pub(super) const RETRY: Duration = Duration::from_millis(10);
 /// The longest pause between attempts to withdraw a key.
@@ -54,12 +55,12 @@ pub(super) struct Lock {
 }
 
 impl Lock {
+    /// Wait while another holds the lock, with no deadline of its own: the caller drops the
+    /// wait when what it is for ends. Any other failure is returned at once.
     pub(super) async fn acquire(profile: &Path) -> Result<Self> {
-        let deadline = Instant::now() + WAIT;
         loop {
             match Self::try_acquire(profile) {
-                Err(error) if Instant::now() >= deadline => return Err(error),
-                Err(_) => tokio::time::sleep(RETRY).await,
+                Err(error) if contended(&error) => tokio::time::sleep(RETRY).await,
                 lock => return lock,
             }
         }
@@ -71,6 +72,13 @@ impl Lock {
             .context("the SSH setup is locked")?;
         Ok(Self { _file: file })
     }
+}
+
+/// Whether `error` says only that another holds the lock.
+fn contended(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<io::Error>()
+        .is_some_and(|error| error.raw_os_error() == fs2::lock_contended_error().raw_os_error())
 }
 
 /// Removes lines from a profile's key file. It is asked where a tunnel ends, which must not
@@ -379,7 +387,7 @@ fn read(file: &Path) -> Result<Option<Current>> {
         Err(error) => return Err(error).context("inspect the SSH key file"),
     };
     ensure!(
-        metadata.is_file() && metadata.len() <= MAX_FILE,
+        metadata.is_file(),
         "{} is not a regular SSH key file",
         file.display()
     );
@@ -507,6 +515,35 @@ mod tests {
             fs::read_to_string(&file)?,
             format!("# header\r\n{other}{foreign}")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_lock_is_waited_for_until_dropped_and_only_while_another_holds_it() -> Result<()> {
+        let profile = tempfile::tempdir()?;
+        let held = Lock::try_acquire(profile.path())?;
+        let mut waiting = std::pin::pin!(Lock::acquire(profile.path()));
+        let early = tokio::time::timeout(WAIT + Duration::from_millis(500), &mut waiting).await;
+        assert!(early.is_err(), "the wait ended while the lock was held");
+        drop(held);
+        drop(tokio::time::timeout(WAIT, waiting).await??);
+        // Any other failure ends it at once.
+        let broken = profile.path().join("broken");
+        fs::create_dir_all(broken.join(LOCK_FILE))?;
+        let failed = tokio::time::timeout(WAIT, Lock::acquire(&broken)).await?;
+        assert!(failed.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_key_file_of_any_size_is_read_and_pruned() -> Result<()> {
+        let profile = tempfile::tempdir()?;
+        let file = profile.path().join(KEY_FILE);
+        let kept = line(2, "00bb:22").repeat(8000);
+        fs::write(&file, format!("{kept}{}", line(1, "00aa:11")))?;
+        assert!(kept.len() > 1 << 20);
+        purge(&Withdrawals::new(profile.path()), OWNER)?;
+        assert_eq!(fs::read_to_string(&file)?, kept);
         Ok(())
     }
 

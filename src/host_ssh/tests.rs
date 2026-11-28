@@ -21,7 +21,7 @@ use tempfile::TempDir;
 use super::{
     AUTHORIZED_KEYS, AUTHORIZED_KEYS_LOCK, InstallPlan, Refused, SERVER_FILE, SETUP_RECORD, Server,
     Unavailable, UninstallPlan, config, lock,
-    setup::System as _,
+    setup::{SETUP_LOCK, System as _},
     unix::{Tools, Unix, account},
 };
 use crate::private::cli;
@@ -54,6 +54,10 @@ exit $status
 const SYSTEMCTL: &str = r#"
 if [ "$1" = reload ]; then
     echo "reload $2" >> "$root/log"
+    if [ -e "$root/hold-reload" ]; then
+        : > "$root/reloading"
+        while [ -e "$root/hold-reload" ]; do sleep 0.05; done
+    fi
     if [ -e "$root/fail-reload" ] || [ -e "$root/fail-all-reloads" ]; then
         rm -f "$root/fail-reload"
         echo 'reload refused' >&2
@@ -601,6 +605,123 @@ fn removal_waits_for_the_runtime_and_leaves_it_nothing_to_write() -> Result<()> 
 
 #[test]
 #[ignore = "needs the system OpenSSH server"]
+fn an_install_leaves_the_runtimes_lock_free_while_the_server_reloads() -> Result<()> {
+    let fixture = Fixture::new("")?;
+    let profile = fixture.profile("state")?;
+    let hold = fixture.root().join("hold-reload");
+    let reloading = fixture.root().join("reloading");
+    // A first install, which nothing is authorized under before the reload, and then one
+    // over a working setup, whose logins are authorized throughout.
+    for working in [false, true] {
+        if working {
+            record(&profile, "made", true)?;
+        }
+        let plan = fixture.install(&profile)?;
+        fs::write(&hold, "")?;
+        let (done, finished) = mpsc::channel();
+        let install = thread::spawn(move || done.send(plan.apply()));
+        for _ in 0..600 {
+            if reloading.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        let observed = (|| {
+            ensure!(reloading.exists(), "the install never reloaded");
+            let keys = fs::File::open(profile.join(AUTHORIZED_KEYS_LOCK))?;
+            fs2::FileExt::try_lock_exclusive(&keys).context("the runtime's lock is held")?;
+            ensure!(Server::load(&profile).is_ok() == working);
+            // A removal of this profile still has to wait.
+            let setup = fs::File::open(profile.join(SETUP_LOCK))?;
+            ensure!(fs2::FileExt::try_lock_exclusive(&setup).is_err());
+            Ok(())
+        })();
+        fs::remove_file(&hold)?;
+        finished.recv_timeout(Duration::from_secs(30))??;
+        install.join().expect("install thread")?;
+        observed?;
+        fs::remove_file(&reloading)?;
+        Server::load(&profile)?;
+        fixture.assert_clean();
+    }
+    // A removal that needs no rights waits for an install of its profile all the same.
+    let other = fixture.profile("other")?;
+    let held = lock(&other, SETUP_LOCK)?;
+    record(&other, "making", false)?;
+    let plan = fixture.uninstall(&other)?;
+    let (done, finished) = mpsc::channel();
+    let removal = thread::spawn(move || done.send(plan.apply()));
+    assert!(finished.recv_timeout(Duration::from_millis(500)).is_err());
+    assert!(other.join(SETUP_RECORD).exists());
+    drop(held);
+    finished.recv_timeout(Duration::from_secs(30))??;
+    removal.join().expect("removal thread")?;
+    assert_unconfigured(&other);
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs the system OpenSSH server"]
+fn every_include_is_followed_to_the_servers_own_nesting_bound() -> Result<()> {
+    let fixture = Fixture::new("")?;
+    let profile = fixture.profile("state")?;
+    let conf = fixture.root().join("etc/conf.d");
+    for number in 0..300 {
+        file(
+            &conf.join(format!("{number:03}.conf")),
+            "# nothing\n",
+            0o644,
+        )?;
+    }
+    // The last of them is read like the first.
+    let last = conf.join("999.conf");
+    let keys = profile.join(AUTHORIZED_KEYS);
+    file(
+        &last,
+        &format!("AuthorizedKeysFile {}\n", keys.display()),
+        0o644,
+    )?;
+    refused(fixture.install(&profile), "outside this account");
+    fs::remove_file(&last)?;
+
+    // A chain as deep as the server allows, each link naming the next one twice, which
+    // must not multiply the work.
+    let nested = fixture.root().join("etc/nested");
+    directory(&nested, 0o755)?;
+    let link = |depth: usize| nested.join(depth.to_string());
+    let both = |depth| {
+        let next = link(depth).display().to_string();
+        format!("Include {next}\nInclude {next}\n")
+    };
+    // `conf.d/chain.conf` is at depth one.
+    file(&conf.join("chain.conf"), &both(2), 0o644)?;
+    for depth in 2..16 {
+        file(&link(depth), &both(depth + 1), 0o644)?;
+    }
+    // The last may name a file that is not there, which then is one too many.
+    file(&link(16), &both(17), 0o644)?;
+    fixture.loopback()?;
+    fixture.install(&profile)?;
+    file(&link(17), "# too deep\n", 0o644)?;
+    // The bound holds for the longest chain to a file that a shorter one also reaches.
+    file(&conf.join("zz.conf"), &both(10), 0o644)?;
+    assert!(fixture.loopback().is_err());
+    refused(fixture.install(&profile), "too deeply");
+    // A cycle among files that all include each other ends there too.
+    fs::remove_file(conf.join("zz.conf"))?;
+    let cycle = fixture.root().join("etc/cycle");
+    directory(&cycle, 0o755)?;
+    let all = format!("Include {}/*\n", cycle.display());
+    for name in ["a", "b", "c"] {
+        file(&cycle.join(name), &all, 0o644)?;
+    }
+    file(&conf.join("chain.conf"), &all, 0o644)?;
+    refused(fixture.install(&profile), "too deeply");
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs the system OpenSSH server"]
 fn every_profile_takes_one_machine_lock_for_a_change() -> Result<()> {
     let fixture = Fixture::new("")?;
     let profile = fixture.profile("state")?;
@@ -806,6 +927,15 @@ fn only_a_key_file_setup_made_is_adopted_or_removed() -> Result<()> {
     assert!(fs::read_to_string(&keys)?.ends_with("massrelay-lease:00aa:11\n"));
 
     fs::remove_file(&keys)?;
+    fixture.install(&profile)?.apply()?;
+    // As many tunnels as are opening, however large that makes the file.
+    let many = format!("{HEADER}{}", lease(&fixture)?.repeat(8000));
+    assert!(many.len() > 1 << 20);
+    file(&keys, &many, 0o600)?;
+    fixture.install(&profile)?.apply()?;
+    assert_eq!(fs::read_to_string(&keys)?, many);
+    fixture.uninstall(&profile)?.apply()?;
+    assert!(!keys.exists());
     fixture.install(&profile)?.apply()?;
     // Readable by others, or holding someone's key.
     fs::set_permissions(&keys, fs::Permissions::from_mode(0o640))?;

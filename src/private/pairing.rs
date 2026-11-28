@@ -149,7 +149,6 @@ const OFFER: &[u8] = b"massrelay-private pairing-offer";
 const CONFIRM: &[u8] = b"massrelay-private pairing-confirm";
 const TRANSCRIPT: &[u8] = b"massrelay-private pairing-transcript";
 const OWNER_LOCK: &str = "runtime-owner.lock";
-const MAX_ALIAS: usize = 64;
 
 // ------------------------------------------------------------------ links
 
@@ -2439,12 +2438,9 @@ pub(super) fn parse_key(s: &str) -> Option<EndpointKey> {
 }
 
 fn check_alias(alias: &str) -> Result<(), PairError> {
-    if alias.is_empty()
-        || alias.len() > MAX_ALIAS
-        || alias.chars().any(|c| c.is_control() || c.is_whitespace())
-    {
+    if alias.is_empty() || alias.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return Err(PairError::Alias(
-            "alias must be 1 to 64 characters without spaces or controls".into(),
+            "alias must be non-empty, without spaces or controls".into(),
         ));
     }
     if parse_key(alias).is_some() {

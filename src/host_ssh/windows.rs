@@ -234,12 +234,12 @@ impl System for Windows {
         &self.user
     }
 
-    fn other_user(&self) -> &str {
-        if self.user == "administrator" {
-            "guest"
-        } else {
-            "administrator"
-        }
+    /// None: outside the system account, the server's test mode can resolve only the
+    /// account running it. Asked about any other, it exits once a `Match Group` line, as in
+    /// the default configuration, needs that account's groups. The block's `Match User`
+    /// names this account literally, which keeps every other account out of it.
+    fn other_user(&self) -> Option<&str> {
+        None
     }
 
     fn config(&self) -> &Path {
@@ -361,11 +361,18 @@ impl System for Windows {
                 )
             }
         };
-        ensure!(
-            success,
-            "sshd failed (it can read its host keys only when elevated: {ELEVATE}): {}",
-            stderr.trim()
-        );
+        if !success {
+            let stderr = stderr.trim();
+            // With administrator rights already held, or for any other complaint, more
+            // rights are not the answer.
+            if access == Access::User && stderr.contains("no hostkeys available") {
+                bail!(
+                    "sshd failed (it can read its host keys only when elevated: {ELEVATE}): \
+                     {stderr}"
+                );
+            }
+            bail!("sshd failed: {stderr}");
+        }
         Ok(stdout)
     }
 
@@ -502,6 +509,146 @@ fn trusted_config_path(path: &Path, directory: bool) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in for a system program, written by another process so that no test thread
+    /// holds it open for writing when it is run.
+    #[cfg(unix)]
+    fn program(path: &Path, root: &Path, body: &str) -> Result<()> {
+        fs::create_dir_all(path.parent().context("no directory")?)?;
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", r#"cat > "$1" && chmod 700 "$1""#, "sh"])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()?;
+        write!(
+            child.stdin.take().context("no input")?,
+            "#!/bin/sh\nroot='{}'\n{body}",
+            root.display()
+        )?;
+        ensure!(
+            child.wait()?.success(),
+            "could not write a stand-in program"
+        );
+        Ok(())
+    }
+
+    /// As Windows' server in an administrator's terminal, it answers about `sam`, who is
+    /// running it, and no other account. The block's key files go to the connections the
+    /// block names, or to every connection while `leak` exists.
+    #[cfg(unix)]
+    const SSHD: &str = r#"
+case "$1" in
+-V) echo OpenSSH_for_Windows_9.5p1 >&2; exit 0 ;;
+-t) exit 0 ;;
+esac
+user=${5#user=}
+user=${user%%,*}
+if [ "$user" != sam ]; then
+    echo "ga_init, unable to resolve user $user" >&2
+    exit 255
+fi
+keys=.ssh/authorized_keys
+covered=
+case "$5" in *,addr=127.0.0.1,laddr=127.0.0.1,lport=2222) covered=yes ;; esac
+if [ -n "$covered" ] || [ -e "$root/leak" ]; then
+    block=$(sed -n 's/^[[:space:]]AuthorizedKeysFile //p' "$3")
+    [ -n "$block" ] && keys=$block
+fi
+printf 'pubkeyauthentication yes\npubkeyacceptedalgorithms ssh-ed25519\n'
+printf 'authorizedkeysfile %s\n' "$keys"
+"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_and_removal_need_no_second_account() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        use super::super::{
+            AUTHORIZED_KEYS, ED25519_PREFIX, InstallPlan, SERVER_FILE, SETUP_RECORD, Server,
+            UninstallPlan, config,
+        };
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let (system, data) = (root.join("system"), root.join("data"));
+        let profile = root.join("profile");
+        fs::create_dir(&profile)?;
+        fs::set_permissions(&profile, fs::Permissions::from_mode(0o700))?;
+        let ssh = data.join("ssh");
+        fs::create_dir_all(&ssh)?;
+        let configuration = ssh.join("sshd_config");
+        let original = "Port 2222\nAuthorizedKeysFile .ssh/authorized_keys\n\
+             Match Group administrators\n    \
+             AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys\n";
+        fs::write(&configuration, original)?;
+        let blob = STANDARD.encode([ED25519_PREFIX, &[7; 32]].concat());
+        fs::write(
+            ssh.join("ssh_host_ed25519_key.pub"),
+            format!("ssh-ed25519 {blob}\n"),
+        )?;
+        for (name, body) in [
+            ("OpenSSH/sshd.exe", SSHD),
+            (
+                "OpenSSH/ssh-keyscan.exe",
+                r#"echo "[127.0.0.1]:2222 $(cat "$root/data/ssh/ssh_host_ed25519_key.pub")""#,
+            ),
+            (
+                "sc.exe",
+                r#"if [ "$1" = qc ]; then
+    echo "BINARY_PATH_NAME   : $root/system/OpenSSH/sshd.exe"
+else
+    echo 'STATE              : 4  RUNNING'
+fi"#,
+            ),
+            ("WindowsPowerShell/v1.0/powershell.exe", "exit 0"),
+        ] {
+            program(&system.join(name), &root, body)?;
+        }
+        let windows = || {
+            Box::new(Windows {
+                user: "sam".into(),
+                system: system.clone(),
+                data: data.clone(),
+                config: configuration.clone(),
+            })
+        };
+
+        // This account's other logins are still asked about, and must not change.
+        fs::write(root.join("leak"), "")?;
+        let error = InstallPlan::new(windows(), profile.clone())?
+            .apply()
+            .expect_err("a change reaching remote logins was accepted");
+        assert!(
+            format!("{error:#}").contains("intended effect for user=sam,host=192.0.2.1"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read_to_string(&configuration)?, original);
+        fs::remove_file(root.join("leak"))?;
+
+        InstallPlan::new(windows(), profile.clone())?.apply()?;
+        let installed = fs::read(&configuration)?;
+        let blocks = config::blocks(&installed)?;
+        let [block] = blocks.as_slice() else {
+            bail!("expected one block, found {blocks:?}");
+        };
+        let managed = block.managed.as_ref().context("the block is not owned")?;
+        assert_eq!((managed.user.as_str(), managed.port), ("sam", 2222));
+        // Everything outside the block, other accounts' settings included, is as it was.
+        assert_eq!(
+            config::splice(&installed, &[(block.span.clone(), String::new())]),
+            original.as_bytes()
+        );
+        assert_eq!(Server::load(&profile)?.user, "sam");
+
+        UninstallPlan::new(windows(), profile.clone())?.apply()?;
+        assert_eq!(fs::read_to_string(&configuration)?, original);
+        for name in [SERVER_FILE, AUTHORIZED_KEYS, SETUP_RECORD] {
+            assert!(!profile.join(name).exists(), "{name}");
+        }
+        Ok(())
+    }
 
     #[cfg(not(windows))]
     #[test]

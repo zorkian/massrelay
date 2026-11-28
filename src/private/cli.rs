@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use crate::mailbox::{self, Bytes, Client, Locator};
 use crate::wire::{self, Service};
 
-use super::binding::{EndpointSecret, check_device_name};
+use super::binding::{EndpointSecret, check_device_name, signed_name};
 use super::codec::{Hash, hex, unhex};
 use super::diagnostics::{self, Level};
 use super::envelope::{InviteToken, SlotId};
@@ -176,8 +176,8 @@ pub enum Command {
         /// Endpoint ID, alias, or device name.
         peer: String,
         /// Number of probes to send.
-        #[arg(short = 'c', long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..=i64::from(runtime::MAX_PING_COUNT)))]
-        count: u16,
+        #[arg(short = 'c', long, default_value_t = 4, value_parser = clap::value_parser!(u64).range(1..))]
+        count: u64,
     },
     /// Approve a member's exact endpoint key under a local alias.
     Approve {
@@ -275,11 +275,7 @@ pub async fn execute(state_dir: &Path, command: Command) -> Result<i32> {
         }
         Command::Join { invite, name, bind } => {
             let (invite, name) = match (invite, name) {
-                (Some(label), None)
-                    if check_device_name(&label).is_ok() && !label.starts_with(INVITE_PREFIX) =>
-                {
-                    (None, Some(label))
-                }
+                (Some(label), None) if is_positional_name(&label) => (None, Some(label)),
                 (invite, name) => (invite, name),
             };
             join(&dir, invite, bind, name).await?;
@@ -652,6 +648,21 @@ fn hostname_command() -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Whether `join`'s one positional argument is a device name and not an invite. Names have
+/// no length limit, so a pasted MassRelay credential (an invite of any version, or a relay
+/// locator) is never taken as one: a name is shared with other devices.
+fn is_positional_name(argument: &str) -> bool {
+    let credential = ["mrprivinv", "mrprivx"].into_iter().any(|prefix| {
+        argument
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.split_once('_'))
+            .is_some_and(|(version, _)| {
+                !version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    });
+    !credential && check_device_name(argument).is_ok()
+}
+
 /// The first label of a hostname, restricted to characters allowed in device names.
 fn host_label(host: &str) -> Option<String> {
     let label: String = host
@@ -668,7 +679,6 @@ fn host_label(host: &str) -> Option<String> {
         })
         .collect();
     let label = label.trim_matches('-');
-    let label = &label[..label.len().min(63)];
     (!label.eq_ignore_ascii_case("localhost") && check_device_name(label).is_ok())
         .then(|| label.to_owned())
 }
@@ -684,6 +694,15 @@ fn relay_locator_input(argument: Option<String>) -> Result<String> {
     io::stdin().read_line(&mut locator)?;
     ensure!(!locator.trim().is_empty(), "a relay locator is required");
     Ok(locator)
+}
+
+fn show_signed_name(name: &str) {
+    let signed = signed_name(name);
+    if signed != name {
+        eprintln!(
+            "Before pairing, peers see this device as {signed}. Updated paired peers receive the full name."
+        );
+    }
 }
 
 async fn create(
@@ -712,6 +731,7 @@ async fn create(
     let (path, key) = (dir.to_path_buf(), profile.key.0);
     let relay_key = *locator.server.id.as_bytes();
     let incarnation = locator.incarnation.0.to_vec();
+    show_signed_name(&name);
     let token = blocking(move || {
         Device::create_network_named(
             &path,
@@ -943,6 +963,7 @@ async fn join(
             crate::storage::save(dir, PROFILE_FILE, &profile)?;
         }
         let (path, key) = (dir.to_path_buf(), profile.key.0);
+        show_signed_name(&name);
         // Persists the exact request before anything is sent.
         blocking(move || {
             Device::begin_join_named(
@@ -1475,7 +1496,7 @@ async fn peer_key(dir: &Path, selector: &str) -> Result<String> {
     Ok(hex(&selected_peer(dir, selector).await?.0.endpoint()))
 }
 
-async fn ping(dir: &Path, peer: &str, count: u16) -> Result<i32> {
+async fn ping(dir: &Path, peer: &str, count: u64) -> Result<i32> {
     let key = peer_key(dir, peer).await?;
     let (mut socket, reply) = runtime::request(
         dir,
@@ -1493,8 +1514,8 @@ async fn ping(dir: &Path, peer: &str, count: u16) -> Result<i32> {
     }
     let peer = crate::visible(peer);
     println!("PING {peer}");
-    let mut sent = 0;
-    let mut received = 0;
+    let mut sent = 0_u64;
+    let mut received = 0_u64;
     let mut min = f64::INFINITY;
     let mut max = 0.0_f64;
     let mut sum = 0.0;
@@ -1532,7 +1553,7 @@ async fn ping(dir: &Path, peer: &str, count: u16) -> Result<i32> {
     }
     println!("--- {peer} ping statistics ---");
     let loss = if sent > 0 {
-        100.0 * f64::from(sent - received) / f64::from(sent)
+        100.0 * (sent - received) as f64 / sent as f64
     } else {
         0.0
     };
@@ -1540,7 +1561,7 @@ async fn ping(dir: &Path, peer: &str, count: u16) -> Result<i32> {
     if received > 0 {
         println!(
             "rtt min/avg/max = {min:.3}/{:.3}/{max:.3} ms",
-            sum / f64::from(received)
+            sum / received as f64
         );
     }
     Ok(i32::from(received == 0))
@@ -1832,6 +1853,51 @@ mod tests {
         }
         assert!(InviteEnvelope::open(&format!("{INVITE_PREFIX}AAAA")).is_err());
         assert!(InviteEnvelope::open(&good.encode().unwrap()).is_err());
+    }
+
+    #[test]
+    fn ping_accepts_any_positive_count() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            command: Command,
+        }
+        let count = |value: &str| {
+            let cli =
+                <Cli as clap::Parser>::try_parse_from(["massrelay", "ping", "p", "-c", value]);
+            cli.ok().and_then(|cli| match cli.command {
+                Command::Ping { count, .. } => Some(count),
+                _ => None,
+            })
+        };
+        for value in [1, 1001, u64::from(u16::MAX) + 1, u64::MAX] {
+            assert_eq!(count(&value.to_string()), Some(value));
+        }
+        for bad in ["0", "-1", "18446744073709551616"] {
+            assert_eq!(count(bad), None, "{bad}");
+        }
+    }
+
+    /// A long positional argument is a name, but a pasted credential never becomes one.
+    #[test]
+    fn join_never_takes_a_credential_for_a_device_name() {
+        assert!(is_positional_name(&"n".repeat(1000)));
+        assert!(is_positional_name("mrprivinvite-laptop"));
+        assert!(is_positional_name("mrprivx-laptop"));
+        assert!(is_positional_name("mrprivinv_laptop"));
+        for credential in [INVITE_PREFIX, "mrprivinv9_", mailbox::LOCATOR_PREFIX] {
+            assert!(!is_positional_name(&format!(
+                "{credential}{}",
+                "A".repeat(100)
+            )));
+        }
+    }
+
+    /// Peer tables hold names and aliases of any length.
+    #[test]
+    fn tables_accept_cells_wider_than_a_format_width() {
+        let long = "n".repeat(usize::from(u16::MAX) + 1);
+        crate::print_table(&[[long, "yes".into()], ["short".into(), "no".into()]], true);
     }
 
     /// Not a check: writes an enrolled profile into the state directory named by

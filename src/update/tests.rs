@@ -1293,6 +1293,48 @@ fn one_update_at_a_time_works_on_a_program_even_across_profiles() {
     open(&other).unwrap();
 }
 
+/// A pipe the test writes. It says so each time its reader asks for more.
+struct Piped {
+    asked: mpsc::Sender<()>,
+    parts: mpsc::Receiver<&'static [u8]>,
+}
+
+impl io::Read for Piped {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let _ = self.asked.send(());
+        let Ok(part) = self.parts.recv() else {
+            return Ok(0);
+        };
+        buffer[..part.len()].copy_from_slice(part);
+        Ok(part.len())
+    }
+}
+
+/// A process that a program started can write, then keep the output open and stay silent for
+/// as long as it likes. The reader stays blocked on it, so what arrived must not be the
+/// reader's to keep.
+#[test]
+fn giving_up_on_a_silent_output_frees_it_while_its_reader_is_still_blocked() {
+    let (asked, reader) = mpsc::channel();
+    let (write, parts) = mpsc::channel::<&[u8]>();
+    let output = Output::collect(Some(Piped { asked, parts }));
+    let next = || reader.recv_timeout(Duration::from_secs(10));
+    next().unwrap();
+    write.send(b"early output").unwrap();
+    // The reader asks again only once it has handed over the first part.
+    next().unwrap();
+    assert_eq!(*output.bytes.lock().unwrap(), b"early output");
+    let kept = Arc::downgrade(&output.bytes);
+    assert!(output.finish(Duration::ZERO).is_none());
+    assert!(
+        kept.upgrade().is_none(),
+        "the blocked reader keeps the output"
+    );
+    // What arrives later is not collected: it ends the reader, which closes the pipe.
+    write.send(b"late output").unwrap();
+    assert_eq!(next(), Err(mpsc::RecvTimeoutError::Disconnected));
+}
+
 #[cfg(unix)]
 mod unix {
     use std::os::unix::fs::PermissionsExt;
@@ -1551,7 +1593,9 @@ mod unix {
         let (_root, installed, state) = installation();
         chmod(&installed, 0o750);
         let server = Server::start().await;
-        server.publish("v9.8.7", b"new program");
+        // Many network reads long, so it reaches the disk in parts.
+        let program = b"new program\n".repeat(1 << 18);
+        server.publish("v9.8.7", &program);
         let source = server.source();
         let client = source.client().unwrap();
         let release = client.latest().await.unwrap();
@@ -1561,7 +1605,7 @@ mod unix {
             .await
             .unwrap();
         let candidate = staging.candidate();
-        assert_eq!(fs::read(&candidate).unwrap(), b"new program");
+        assert!(fs::read(&candidate).unwrap() == program);
         assert_eq!(digest, sha256_file(&candidate).unwrap());
         // Same directory tree as the program, so the swap is a rename on one filesystem.
         assert_eq!(staging.dir.parent(), installed.parent());
@@ -1674,6 +1718,60 @@ mod unix {
             let error = check(root.path(), body, limit).unwrap_err();
             assert!(format!("{error:#}").contains("did not finish"), "{error:#}");
             assert!(started.elapsed() < Duration::from_secs(10), "{body}");
+        }
+    }
+
+    /// Both outputs are collected whole. Each is far longer than a pipe holds, and they are
+    /// written in turns, so the program finishes only if both are read while it runs.
+    #[test]
+    fn long_output_is_collected_whole_from_both_streams() {
+        // 200 lines of 1 KiB on each stream. A failed write ends the script unsuccessfully.
+        let script = "set -e
+line=$(printf '%01023d' 0)
+count=0
+while [ $count -lt 200 ]; do
+    echo $line
+    echo $line >&2
+    count=$((count + 1))
+done
+echo stdout-end
+echo stderr-end >&2";
+        let finished = run_within(Command::new("/bin/sh").args(["-c", script]), MANAGER_LIMIT)
+            .unwrap_or_else(|error| panic!("{error:#}"));
+        let lines = format!("{}\n", "0".repeat(1023)).repeat(200);
+        for (output, end) in [
+            (&finished.stdout, "stdout-end\n"),
+            (&finished.stderr, "stderr-end\n"),
+        ] {
+            assert!(*output == format!("{lines}{end}"), "{} bytes", output.len());
+        }
+        assert!(finished.success);
+    }
+
+    /// Output that is no longer awaited is not kept: a process still writing after the limit
+    /// finds the pipe closed, instead of filling this process's memory for as long as it runs.
+    #[test]
+    fn output_arriving_after_the_limit_is_not_collected() {
+        let root = tempfile::tempdir().unwrap();
+        let released = root.path().join("released");
+        // The program exits at once. What it started writes on until a write fails.
+        let script =
+            r#"(trap '' PIPE; while echo more 2>/dev/null; do sleep 0.05; done; : >"$0") &"#;
+        let error = run_within(
+            Command::new("/bin/sh").args(["-c", script]).arg(&released),
+            // Long enough for the shell to start the writer, even on a busy machine.
+            Duration::from_secs(2),
+        )
+        .err()
+        .unwrap();
+        assert!(format!("{error:#}").contains("did not finish"), "{error:#}");
+        let waiting = Instant::now();
+        while !released.exists() {
+            assert!(
+                waiting.elapsed() < Duration::from_secs(10),
+                "the output is still being read"
+            );
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 }

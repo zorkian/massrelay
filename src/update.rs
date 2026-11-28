@@ -18,7 +18,7 @@
 //! 1. **Checks.** The profile's runtime must answer its authenticated local control channel,
 //!    and must be the process the service manager runs for this profile's installed service,
 //!    started from the program the service's effective definition names.
-//! 2. **Download** (`release`): anonymous, HTTPS only, bounded, checksum verified.
+//! 2. **Download** (`release`): anonymous, HTTPS only, with deadlines, checksum verified.
 //! 3. **Stage** (`Staging`). The candidate is written beside the installed program, in a
 //!    directory that is this account's alone and that no other account can reach around:
 //!    every directory above it is checked before anything is written or run there.
@@ -68,8 +68,8 @@ use std::fs::{self, File};
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -779,9 +779,61 @@ pub(crate) struct Finished {
     pub stderr: String,
 }
 
-/// Run a program within `limit`, with no input, and collect its bounded output. The limit
+/// One of a program's outputs as it arrives. This owns what has arrived, so letting it go
+/// frees that at once, even while its reader is blocked on an output that stays open.
+struct Output {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    ended: mpsc::Receiver<io::Result<u64>>,
+}
+
+/// Where a reader puts what arrives: in its `Output`, which it does not keep alive.
+struct Arrival(Weak<Mutex<Vec<u8>>>);
+
+impl io::Write for Arrival {
+    fn write(&mut self, part: &[u8]) -> io::Result<usize> {
+        // With nothing waiting for it, the reader ends here and closes the pipe.
+        let bytes = self.0.upgrade().ok_or(io::ErrorKind::BrokenPipe)?;
+        let mut bytes = bytes.lock().unwrap_or_else(PoisonError::into_inner);
+        bytes.try_reserve(part.len())?;
+        bytes.extend_from_slice(part);
+        Ok(part.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Output {
+    /// Read `pipe` to its end on a thread of its own.
+    fn collect(pipe: Option<impl io::Read + Send + 'static>) -> Self {
+        let bytes = Arc::default();
+        let mut arrival = Arrival(Arc::downgrade(&bytes));
+        let (done, ended) = mpsc::channel();
+        std::thread::spawn(move || {
+            let read = pipe.map_or(Ok(0), |mut pipe| io::copy(&mut pipe, &mut arrival));
+            // A failed read or allocation is reported, never taken for the end of the output.
+            let _ = done.send(read);
+        });
+        Self { bytes, ended }
+    }
+
+    /// All of the output, once everything that has it open closed it. `None` if that takes
+    /// longer than `wait`.
+    fn finish(self, wait: Duration) -> Option<io::Result<String>> {
+        let ended = self.ended.recv_timeout(wait).ok()?;
+        Some(ended.map(|_| {
+            let mut bytes = self.bytes.lock().unwrap_or_else(PoisonError::into_inner);
+            String::from_utf8(std::mem::take(&mut *bytes))
+                .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+        }))
+    }
+}
+
+/// Run a program within `limit`, with no input, and collect all of its output. The limit
 /// covers the output too: a program that exits but leaves its output open, in a process it
-/// started, does not hold this up. Its readers are left behind and end with that process.
+/// started, does not hold this up. Its readers are left behind, holding none of the output,
+/// and each ends when that process closes the output or next writes to it.
 pub(crate) fn run_within(command: &mut Command, limit: Duration) -> Result<Finished> {
     let deadline = Instant::now() + limit;
     let late = || anyhow!("it did not finish within {} seconds", limit.as_secs());
@@ -791,19 +843,8 @@ pub(crate) fn run_within(command: &mut Command, limit: Duration) -> Result<Finis
         .stderr(Stdio::piped())
         .spawn()
         .context("start the program")?;
-    let collect = |pipe: Option<Box<dyn io::Read + Send>>| {
-        let (done, output) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut text = Vec::new();
-            if let Some(pipe) = pipe {
-                let _ = pipe.take(64 << 10).read_to_end(&mut text);
-            }
-            let _ = done.send(String::from_utf8_lossy(&text).into_owned());
-        });
-        output
-    };
-    let stdout = collect(child.stdout.take().map(|pipe| Box::new(pipe) as _));
-    let stderr = collect(child.stderr.take().map(|pipe| Box::new(pipe) as _));
+    let stdout = Output::collect(child.stdout.take());
+    let stderr = Output::collect(child.stderr.take());
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -815,10 +856,11 @@ pub(crate) fn run_within(command: &mut Command, limit: Duration) -> Result<Finis
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let read = |output: std::sync::mpsc::Receiver<String>| {
+    let read = |output: Output| {
         output
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .map_err(|_| late())
+            .finish(deadline.saturating_duration_since(Instant::now()))
+            .ok_or_else(late)?
+            .context("read the program's output")
     };
     Ok(Finished {
         success: status.success(),

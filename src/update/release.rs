@@ -8,7 +8,7 @@
 //! What is checked before a byte is kept:
 //!
 //! - every request and redirect is HTTPS, with a bounded number of redirects;
-//! - each response has a size limit and a deadline, and stalls time out;
+//! - each response has a deadline, and stalls time out;
 //! - the release is stable (not a draft or prerelease) and its tag is exactly `vMAJOR.MINOR.PATCH`;
 //! - `SHA256SUMS` names this platform's artifact exactly once, and the downloaded bytes hash to
 //!   that value.
@@ -26,10 +26,6 @@ use sha2::{Digest, Sha256};
 pub const REPOSITORY: &str = "zorkian/massrelay";
 const CHECKSUMS: &str = "SHA256SUMS";
 const MAX_REDIRECTS: usize = 5;
-const MAX_METADATA: usize = 1 << 20;
-const MAX_CHECKSUMS: usize = 64 << 10;
-/// Several times the largest released artifact.
-const MAX_ARTIFACT: usize = 256 << 20;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// The longest wait for more bytes of a response.
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -173,18 +169,7 @@ impl Client<'_> {
     /// The latest stable release.
     pub async fn latest(&self) -> Result<Release> {
         let url = format!("{}/repos/{REPOSITORY}/releases/latest", self.source.api);
-        let mut body = Vec::new();
-        self.fetch(
-            &url,
-            "the latest release",
-            MAX_METADATA,
-            METADATA_DEADLINE,
-            |chunk| {
-                body.extend_from_slice(chunk);
-                Ok(())
-            },
-        )
-        .await?;
+        let body = self.document(&url, "the latest release").await?;
         let latest: Latest =
             serde_json::from_slice(&body).context("GitHub's release description is not valid")?;
         ensure!(
@@ -205,18 +190,8 @@ impl Client<'_> {
 
     /// The published SHA-256 of `asset` in `release`.
     pub async fn checksum(&self, release: &Release, asset: &str) -> Result<[u8; 32]> {
-        let mut body = Vec::new();
-        self.fetch(
-            &self.download_url(release, CHECKSUMS),
-            "the release checksums",
-            MAX_CHECKSUMS,
-            METADATA_DEADLINE,
-            |chunk| {
-                body.extend_from_slice(chunk);
-                Ok(())
-            },
-        )
-        .await?;
+        let url = self.download_url(release, CHECKSUMS);
+        let body = self.document(&url, "the release checksums").await?;
         let text = String::from_utf8(body)
             .ok()
             .context("the release checksums are not text")?;
@@ -236,7 +211,6 @@ impl Client<'_> {
         self.fetch(
             &self.download_url(release, asset),
             "the release binary",
-            MAX_ARTIFACT,
             ARTIFACT_DEADLINE,
             |chunk| {
                 hash.update(chunk);
@@ -260,11 +234,24 @@ impl Client<'_> {
         )
     }
 
+    /// A whole response in memory, for a document that is parsed.
+    async fn document(&self, url: &str, what: &str) -> Result<Vec<u8>> {
+        let mut body = Vec::new();
+        self.fetch(url, what, METADATA_DEADLINE, |chunk| {
+            body.try_reserve(chunk.len())
+                .with_context(|| format!("hold {what} in memory"))?;
+            body.extend_from_slice(chunk);
+            Ok(())
+        })
+        .await?;
+        Ok(body)
+    }
+
+    /// Pass a response to `sink` as it arrives.
     async fn fetch(
         &self,
         url: &str,
         what: &str,
-        max: usize,
         deadline: Duration,
         mut sink: impl FnMut(&[u8]) -> Result<()>,
     ) -> Result<()> {
@@ -294,19 +281,7 @@ impl Client<'_> {
                 ),
                 _ => bail!("GitHub answered HTTP {status} for {what}"),
             }
-            let too_large = || anyhow!("{what} is larger than {max} bytes; refusing it");
-            if response
-                .content_length()
-                .is_some_and(|len| len > max as u64)
-            {
-                return Err(too_large());
-            }
-            let mut received = 0usize;
             while let Some(chunk) = response.chunk().await.map_err(unreachable)? {
-                received += chunk.len();
-                if received > max {
-                    return Err(too_large());
-                }
                 sink(&chunk)?;
             }
             Ok(())
@@ -613,7 +588,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "opens a disposable HTTPS server on loopback"]
-    async fn releases_that_are_private_unstable_or_oversized_are_refused() {
+    async fn releases_that_are_private_or_unstable_are_refused() {
         let server = Server::start().await;
         // Nothing is published: what a private repository answers anonymously.
         let error = download(&server).await.unwrap_err();
@@ -632,12 +607,32 @@ mod tests {
             server.route(&latest, Answer::ok(body));
             assert!(download(&server).await.is_err(), "{body}");
         }
+    }
 
-        server.publish("v9.8.7", b"the new program");
-        let sums = format!("/{REPOSITORY}/releases/download/v9.8.7/SHA256SUMS");
-        server.route(&sums, Answer::ok(vec![b'0'; MAX_CHECKSUMS + 1]));
-        let error = download(&server).await.unwrap_err();
-        assert!(format!("{error:#}").contains("larger than"));
+    #[tokio::test]
+    #[ignore = "opens a disposable HTTPS server on loopback"]
+    async fn long_release_documents_and_a_binary_of_many_parts_are_read_whole() {
+        let server = Server::start().await;
+        // Far longer than one network read, with a pattern that shows any part out of place.
+        let program: Vec<u8> = (0..4u32 << 20).map(|index| (index % 251) as u8).collect();
+        server.publish("v9.8.7", &program);
+        // Long release notes, and the wanted checksum at the end of a long list.
+        let notes = "n".repeat(2 << 20);
+        server.route(
+            format!("/repos/{REPOSITORY}/releases/latest"),
+            Answer::ok(format!(r#"{{"tag_name":"v9.8.7","body":"{notes}"}}"#)),
+        );
+        let others: String = (0..2000)
+            .map(|other| format!("{}  massrelay-other-{other}\n", "0".repeat(64)))
+            .collect();
+        let digest = Sha256::digest(&program);
+        server.route(
+            format!("/{REPOSITORY}/releases/download/v9.8.7/SHA256SUMS"),
+            Answer::ok(format!("{others}{digest:x}  {}\n", asset().unwrap())),
+        );
+        let (release, bytes) = download(&server).await.unwrap();
+        assert_eq!(release.version, Version::parse("9.8.7").unwrap());
+        assert!(bytes == program, "{} bytes", bytes.len());
     }
 
     #[tokio::test]

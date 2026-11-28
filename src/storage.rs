@@ -1,5 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
+    io::BufReader,
     path::Path,
 };
 
@@ -28,7 +29,9 @@ pub fn lock(dir: &Path) -> Result<File> {
 pub fn load<T: DeserializeOwned>(dir: &Path, filename: &str) -> Result<T> {
     let path = dir.join(filename);
     let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
-    serde_json::from_reader(file).with_context(|| format!("read {}", path.display()))
+    // Unbuffered, the parser would make a system call for every byte.
+    serde_json::from_reader(BufReader::new(file))
+        .with_context(|| format!("read {}", path.display()))
 }
 
 pub fn save(dir: &Path, filename: &str, value: &impl Serialize) -> Result<()> {

@@ -24,8 +24,6 @@ use super::{Host, Settings, keys, lease};
 
 /// The installer's description of the server, in the private profile.
 const DESCRIPTION: &str = "ssh-server.json";
-/// Bound on this device's open tunnels, and so on its lines in the key file.
-const MAX_TUNNELS: usize = 256;
 
 /// A validated description of this device's system SSH server.
 #[derive(PartialEq, Eq)]
@@ -175,7 +173,6 @@ impl Destination {
         };
         let ends = (v4(stream.local_addr()?)?, v4(stream.peer_addr()?)?);
         let mut open = self.open.lock().expect("SSH tunnels");
-        ensure!(open.len() < MAX_TUNNELS, "too many open SSH tunnels");
         ensure!(open.insert(ends), "the SSH connection is already recorded");
         Ok(Tunnel {
             lease: None,
@@ -187,7 +184,8 @@ impl Destination {
     }
 
     /// Authorize `key` for `tunnel`, which is connected to `target`, while `session` is
-    /// authorized. The server must still be described as it was when connected.
+    /// authorized. The server must still be described as it was when connected. It waits
+    /// for the setup lock until the caller drops it, as when the request ends.
     pub(in crate::private) async fn authorize(
         &self,
         tunnel: &mut Tunnel,
@@ -196,7 +194,8 @@ impl Destination {
         target: &Target,
         key: &[u8; 32],
     ) -> Result<Result<()>, Refusal> {
-        let deadline = Instant::now() + lease::WAIT;
+        // Counts from the first refused replacement; waiting for the lock is no part of it.
+        let mut blocked = None;
         loop {
             let current = Target::locked(profile).await.and_then(|(current, lock)| {
                 ensure!(current == *target, "the SSH server setup changed");
@@ -215,10 +214,13 @@ impl Destination {
                     tunnel.lease = Some(lease);
                     return Ok(Ok(()));
                 }
-                Ok(lease::Grant::Blocked(error)) if Instant::now() >= deadline => {
-                    return Ok(Err(anyhow!(error).context("replace the SSH key file")));
+                Ok(lease::Grant::Blocked(error)) => {
+                    let since = *blocked.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= lease::WAIT {
+                        return Ok(Err(anyhow!(error).context("replace the SSH key file")));
+                    }
+                    tokio::time::sleep(lease::RETRY).await;
                 }
-                Ok(lease::Grant::Blocked(_)) => tokio::time::sleep(lease::RETRY).await,
                 Err(error) => return Ok(Err(error)),
             }
         }

@@ -699,7 +699,13 @@ fn user_domain(run: Tool) -> Result<String> {
 fn check_session(domain: &str, run: Tool) -> Result<()> {
     let session =
         run("/bin/launchctl", &["print", domain]).context("find the macOS login session")?;
-    ensure!(session.success, "find the macOS login session failed");
+    if !session.success {
+        let error = session.stderr.trim();
+        if error.is_empty() {
+            bail!("launchctl print {domain} failed");
+        }
+        bail!("launchctl print {domain} failed: {}", crate::visible(error));
+    }
     Ok(())
 }
 

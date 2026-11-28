@@ -56,7 +56,7 @@ const CONFIG_FILE: &str = "ssh-client.conf";
 const RECORD_FILE: &str = "ssh-client-published.sha256";
 const STATE_FILE: &str = "ssh-client.json";
 const KEY_PREFIX: &str = "ssh-client-key-";
-const HOSTS_PREFIX: &str = "ssh-client-hosts-";
+const HOSTS_PREFIX: &str = "ssh-client-hosts-by-endpoint-";
 /// How long an entry outlives its last confirmation while the peer cannot confirm again.
 const KEEP_OFFLINE: Duration = Duration::from_secs(7 * 24 * 3600);
 /// Host-record requests in flight at once.
@@ -431,13 +431,16 @@ fn block(
     ensure!(Host::valid_user(&host.user), "invalid saved SSH account");
     let name = namespaced(&host.name, namespace);
     let alias = format!("massrelay-{name}");
+    // Host patterns carry the full user alias. OpenSSH's host-key lookup uses a fixed-size
+    // endpoint identifier, so a long display alias cannot overflow its hostname buffer.
+    let key_alias = format!("massrelay-{id}");
     let hosts = format!("{HOSTS_PREFIX}{id}");
-    let known = client::known_host(&alias, &host_key);
+    let known = client::known_host(&key_alias, &host_key);
     replace(dir, &hosts, known.as_bytes())?;
     client::render(&client::Entry {
         managed: true,
         patterns: &format!("{alias} mr-{name}"),
-        alias: &alias,
+        alias: &key_alias,
         user: &host.user,
         identity: &identity,
         known_hosts: &paths.profile.join(hosts),

@@ -249,7 +249,6 @@ pub(super) fn render(entry: &Entry<'_>) -> Result<String> {
          KbdInteractiveAuthentication no\n\
          ForwardAgent no\n\
          ForwardX11 no\n\
-         ClearAllForwardings yes\n\
          PermitLocalCommand no\n\
          StrictHostKeyChecking yes\n\
          CheckHostIP no\n\

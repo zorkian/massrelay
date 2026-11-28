@@ -23,13 +23,18 @@ use openmls::prelude::{BasicCredential, Credential, CredentialType};
 
 use super::PROTOCOL;
 use super::codec::{Dec, DecodeError, Enc, Hash, hash};
+use super::pairing::parse_key;
 
 pub const BINDING_VERSION: u8 = 1;
 /// A binding that also carries the device's display name, signed by the
 /// endpoint key. Version 1 bindings carry no name and stay valid as such.
 pub const NAMED_BINDING_VERSION: u8 = 2;
-/// Longest device display name, in bytes.
-pub const MAX_DEVICE_NAME: usize = 63;
+/// Longest name a binding can carry, in bytes. This is part of the version 2
+/// format: every replica rejects a membership change whose binding exceeds it,
+/// and halts. A longer device name is signed as its first
+/// `SIGNED_NAME_BYTES` bytes and reaches paired peers in full through its name
+/// report (see `versions`).
+pub const SIGNED_NAME_BYTES: usize = 63;
 const BINDING_PURPOSE: &[u8] = b"massrelay-private credential-binding";
 const JOIN_PROOF_PURPOSE: &[u8] = b"massrelay-private join-request-proof";
 
@@ -158,26 +163,43 @@ mod replay {
     }
 }
 
-/// Check a device display name. Every replica applies the same rule when it
-/// decodes a binding, so it never consults local state. Names are ASCII
-/// letters, digits, `-` and `_`, at most `MAX_DEVICE_NAME` bytes, and never
-/// look like an endpoint key, so a name cannot pose as a key selector.
+/// Check a device display name. Names are ASCII letters, digits, `-` and `_`,
+/// and never look like an endpoint key, so a name cannot pose as a key
+/// selector.
 ///
 /// A name is a cosmetic, self-asserted label: it is never authority. Two
 /// devices may carry the same name.
 pub fn check_device_name(name: &str) -> Result<(), String> {
     if name.is_empty()
-        || name.len() > MAX_DEVICE_NAME
         || !name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
-        return Err(format!(
-            "a device name must be 1 to {MAX_DEVICE_NAME} ASCII letters, digits, hyphens or underscores"
-        ));
+        return Err(
+            "a device name must be one or more ASCII letters, digits, hyphens or underscores"
+                .into(),
+        );
     }
-    if name.parse::<iroh::EndpointId>().is_ok() {
+    if parse_key(name).is_some() {
         return Err("a device name must not look like an endpoint key".into());
+    }
+    Ok(())
+}
+
+/// The part of a checked device name that its binding signs.
+pub fn signed_name(name: &str) -> &str {
+    // Names are ASCII, so every byte offset is a character boundary.
+    &name[..name.len().min(SIGNED_NAME_BYTES)]
+}
+
+/// The rule for a name inside a binding. Every replica applies it when it
+/// decodes one, so it never consults local state.
+fn check_signed_name(name: &str) -> Result<(), String> {
+    check_device_name(name)?;
+    if name.len() > SIGNED_NAME_BYTES {
+        return Err(format!(
+            "a signed device name holds at most {SIGNED_NAME_BYTES} bytes"
+        ));
     }
     Ok(())
 }
@@ -190,7 +212,7 @@ pub enum BindingError {
     /// The binding names a different MLS signature key than the leaf uses.
     SignatureKeyMismatch,
     Signature(SigReject),
-    /// The display name breaks `check_device_name`.
+    /// The display name breaks the signed-name rule.
     Name(String),
 }
 
@@ -243,8 +265,8 @@ impl CredentialBinding {
             .expect("a nameless binding is always valid")
     }
 
-    /// A binding carrying `name` (checked with `check_device_name`), or a
-    /// version 1 binding when `name` is `None`.
+    /// A binding carrying `name` (at most `SIGNED_NAME_BYTES`; see
+    /// `signed_name`), or a version 1 binding when `name` is `None`.
     pub fn create_named(
         secret: &EndpointSecret,
         group_tag: &Hash,
@@ -252,7 +274,7 @@ impl CredentialBinding {
         name: Option<&str>,
     ) -> Result<Self, BindingError> {
         if let Some(n) = name {
-            check_device_name(n).map_err(BindingError::Name)?;
+            check_signed_name(n).map_err(BindingError::Name)?;
         }
         let endpoint = secret.public();
         let signature = secret.sign(&Self::signed_message(
@@ -302,7 +324,7 @@ impl CredentialBinding {
         let name = if version == NAMED_BINDING_VERSION {
             let n = String::from_utf8(d.bytes()?)
                 .map_err(|_| BindingError::Name("device name is not UTF-8".into()))?;
-            check_device_name(&n).map_err(BindingError::Name)?;
+            check_signed_name(&n).map_err(BindingError::Name)?;
             Some(n)
         } else {
             None

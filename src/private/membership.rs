@@ -41,7 +41,7 @@ use openmls_traits::types::SignatureScheme;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use super::binding::{CredentialBinding, EndpointKey, EndpointSecret, JoinTranscript};
+use super::binding::{CredentialBinding, EndpointKey, EndpointSecret, JoinTranscript, signed_name};
 use super::codec::{Dec, Hash, hex, random, sha256};
 use super::envelope::{
     InviteKeys, InviteToken, JoinRequest, Op, Receipt, RecordError, Reply, RosterEntry, SlotId,
@@ -57,7 +57,7 @@ use super::policy::{ParentView, Violation};
 use super::store::{Guard, MlsProvider, Store, StoreError, write_marker};
 use super::{
     CIPHERSUITE, CLOCK_ROLLBACK_TOLERANCE_SECS, INVITE_WINDOW_SECS, KEY_PACKAGE_LIFETIME_SECS,
-    KEY_PACKAGE_MAX_LIFETIME_SECS,
+    KEY_PACKAGE_MAX_LIFETIME_SECS, versions,
 };
 use crate::slot_wire::{
     INVITE_REPLY, Incarnation, MEMBERSHIP_SLOT, QueueKeys, SlotAddress, WriteHeader,
@@ -1052,7 +1052,8 @@ impl<M: Mailbox> Device<M> {
     }
 
     /// `create_network`, with this device's display name (see
-    /// `binding::check_device_name`) signed into its credential.
+    /// `binding::check_device_name`) signed into its credential, up to
+    /// `binding::SIGNED_NAME_BYTES`.
     pub fn create_network_named(
         dir: &Path,
         endpoint: &EndpointSecret,
@@ -1069,6 +1070,7 @@ impl<M: Mailbox> Device<M> {
             ));
         }
         let (store, g) = Store::create(dir, &State::new(endpoint.public()))?;
+        versions::enroll_name(store.dir(), name).map_err(internal("device name"))?;
         let file = store.new_mls_file(&g, "epoch")?;
         let group_tag: Hash = random();
         let group_id = random::<16>().to_vec();
@@ -1077,8 +1079,13 @@ impl<M: Mailbox> Device<M> {
                 .map_err(internal("signature key"))?;
             s.store(p.storage())
                 .map_err(internal("store signature key"))?;
-            let binding = CredentialBinding::create_named(endpoint, &group_tag, s.public(), name)
-                .map_err(internal("binding"))?;
+            let binding = CredentialBinding::create_named(
+                endpoint,
+                &group_tag,
+                s.public(),
+                name.map(signed_name),
+            )
+            .map_err(internal("binding"))?;
             let cred = CredentialWithKey {
                 credential: binding.credential(),
                 signature_key: s.public().into(),
@@ -1164,6 +1171,8 @@ impl<M: Mailbox> Device<M> {
         } else {
             Store::create(dir, &State::new(endpoint.public()))?
         };
+        // Saved before the pending join, which a restart resumes without the name.
+        versions::enroll_name(store.dir(), name).map_err(internal("device name"))?;
         let file = store.new_mls_file(&g, "join")?;
         let now = clock.now();
         let (mls_key, kp_bytes, kp_ref) = store.with_mls(&g, &file, true, |p, _| {
@@ -1171,9 +1180,13 @@ impl<M: Mailbox> Device<M> {
                 .map_err(internal("signature key"))?;
             s.store(p.storage())
                 .map_err(internal("store signature key"))?;
-            let binding =
-                CredentialBinding::create_named(endpoint, &token.group_tag, s.public(), name)
-                    .map_err(internal("binding"))?;
+            let binding = CredentialBinding::create_named(
+                endpoint,
+                &token.group_tag,
+                s.public(),
+                name.map(signed_name),
+            )
+            .map_err(internal("binding"))?;
             let cred = CredentialWithKey {
                 credential: binding.credential(),
                 signature_key: s.public().into(),

@@ -4,15 +4,20 @@
 //! A plan only reads: it creates no file, asks for no rights, and asks the server about its
 //! settings only where that needs neither. Applying takes administrator rights and then the
 //! machine's lock, so that one change, its rollback included, ends before another account's
-//! or profile's begins. Nothing replaces `sshd_config` before the server itself, reading a
-//! staged copy, has shown that the only difference is the added key file for this account's
-//! loopback logins. A failure after the replacement puts the previous file back, and a
-//! reload that may not have happened is recorded for the next run.
+//! or profile's begins. It also holds the profile's setup lock, so that an install and a
+//! removal of one profile never overlap, also where the removal needs no rights. An install
+//! holds the lock the runtime authorizes tunnels under only while it reads or changes the
+//! key file or the description, never while it waits for an administrator command or a
+//! reload; a removal holds it throughout. Nothing replaces `sshd_config` before the server
+//! itself, reading a staged copy, has shown that the only difference is the added key file
+//! for this account's loopback logins. A failure after the replacement puts the previous
+//! file back, and a reload that may not have happened is recorded for the next run.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     path::{Component, Path, PathBuf},
+    rc::Rc,
     thread,
     time::Duration,
 };
@@ -30,9 +35,11 @@ use super::{
 const LOOPBACK: &str = "127.0.0.1";
 /// An address reserved for documentation, standing in for logins from elsewhere.
 const REMOTE: (&str, &str) = ("192.0.2.1", "192.0.2.2");
-/// OpenSSH's own bound on nested includes, and far more files than any server has.
+/// OpenSSH's own bound on nested includes.
 const INCLUDE_DEPTH: usize = 16;
-const INCLUDE_FILES: usize = 256;
+/// Held by an install or a removal of a profile's setup, from start to end. The runtime does
+/// not take it.
+pub(super) const SETUP_LOCK: &str = "ssh-setup.lock";
 /// How long a reloaded server has to answer again.
 const ANSWER_ATTEMPTS: usize = 40;
 const DEFAULT_KEY_FILES: [&str; 2] = [".ssh/authorized_keys", ".ssh/authorized_keys2"];
@@ -106,8 +113,9 @@ impl Drop for Staged {
 pub(super) trait System: Send {
     /// The account that is installing, which tunnel logins use.
     fn user(&self) -> &str;
-    /// An account other than [`Self::user`] whose settings must not change.
-    fn other_user(&self) -> &str;
+    /// An account other than [`Self::user`] whose settings must not change, if the server
+    /// can be asked about one.
+    fn other_user(&self) -> Option<&str>;
     /// The server's configuration file.
     fn config(&self) -> &Path;
     /// The canonical form of a directory.
@@ -187,9 +195,13 @@ impl Connection {
     }
 
     /// Logins whose settings must stay exactly as they are.
-    fn untouched(user: &str, other: &str, port: u16) -> Vec<Self> {
+    fn untouched(user: &str, other: Option<&str>, port: u16) -> Vec<Self> {
         let [loopback, _] = Self::covered(user, port);
-        vec![
+        let other = other.map(|other| Self {
+            user: other.to_owned(),
+            ..loopback.clone()
+        });
+        let mut untouched = vec![
             Self {
                 host: REMOTE.0,
                 address: REMOTE.0,
@@ -204,13 +216,11 @@ impl Connection {
             },
             Self {
                 local_port: if port == u16::MAX { 1 } else { port + 1 },
-                ..loopback.clone()
-            },
-            Self {
-                user: other.to_owned(),
                 ..loopback
             },
-        ]
+        ];
+        untouched.extend(other);
+        untouched
     }
 }
 
@@ -271,25 +281,38 @@ struct Change {
     candidate: Vec<u8>,
 }
 
-/// The configuration, first, and every file it includes.
+/// The configuration, first, and every file it includes, each path once.
 fn configuration(system: &dyn System, main: &[u8], access: Access) -> Result<Vec<Vec<u8>>> {
     let mut files = Vec::new();
-    let mut pending = vec![(main.to_vec(), 0)];
-    while let Some((contents, depth)) = pending.pop() {
+    // What each included path holds, and the deepest nesting it is followed at. It is
+    // followed again only through a longer chain, which holds every chain to the server's
+    // bound and so ends include cycles, however many files there are.
+    let mut known = BTreeMap::<PathBuf, (Option<Rc<[u8]>>, usize)>::new();
+    let mut listed = BTreeSet::new();
+    let mut pending = vec![(None, Rc::<[u8]>::from(main), 0)];
+    while let Some((path, contents, depth)) = pending.pop() {
         for arguments in config::arguments(&contents, "include")? {
             for pattern in arguments {
                 for path in included(system, &pattern.value, access)? {
-                    ensure!(
-                        depth < INCLUDE_DEPTH && files.len() + pending.len() < INCLUDE_FILES,
-                        "the SSH server configuration includes too many files"
-                    );
-                    if let Some(contents) = system.read(&path, access)? {
-                        pending.push((contents, depth + 1));
+                    let contents = match known.get(&path) {
+                        Some((_, followed)) if *followed > depth => continue,
+                        Some((contents, _)) => contents.clone(),
+                        None => system.read(&path, access)?.map(Rc::from),
+                    };
+                    known.insert(path.clone(), (contents.clone(), depth + 1));
+                    if let Some(contents) = contents {
+                        ensure!(
+                            depth < INCLUDE_DEPTH,
+                            "the SSH server configuration nests includes too deeply"
+                        );
+                        pending.push((Some(path), contents, depth + 1));
                     }
                 }
             }
         }
-        files.push(contents);
+        if listed.insert(path) {
+            files.push(contents.to_vec());
+        }
     }
     Ok(files)
 }
@@ -604,7 +627,14 @@ impl Survey {
 fn survey(system: &dyn System, profile: &Path, access: Access) -> Result<Survey> {
     system.installed()?;
     let record = Record::load(profile, system.user())?;
-    owned::check_adoptable(system, profile, &record)?;
+    {
+        // An apply reads the key file while the runtime may write it; a plan creates no lock.
+        let _keys = match access {
+            Access::Administrator => Some(lock(profile, AUTHORIZED_KEYS_LOCK)?),
+            Access::User => None,
+        };
+        owned::check_adoptable(system, profile, &record)?;
+    }
     let entry = system.key_file_entry(&profile.join(AUTHORIZED_KEYS))?;
     let original = system.read_config(access)?.ok_or_else(|| {
         anyhow!(Unavailable(format!(
@@ -861,8 +891,7 @@ impl InstallPlan {
         // Before either lock: a password may be typed here.
         system.authorize()?;
         let _machine = system.exclusive()?;
-        // The runtime writes no key while this is held.
-        let _lock = lock(profile, AUTHORIZED_KEYS_LOCK)?;
+        let _setup = lock(profile, SETUP_LOCK)?;
         let found = survey(system, profile, Access::Administrator)?;
         if let Planned::Known(shown, _) = &self.planned {
             ensure!(shown.same_as(&found), CHANGED);
@@ -879,11 +908,16 @@ impl InstallPlan {
         }
 
         let mut record = Record::load(profile, system.user())?;
-        let created = owned::make_key_file(profile, &mut record)?;
+        let created = {
+            let _keys = lock(profile, AUTHORIZED_KEYS_LOCK)?;
+            owned::make_key_file(profile, &mut record)?
+        };
         if let Err(error) = finish(system, profile, &found, &install, &mut record) {
             let undone = if created {
                 record.key_file = KeyFile::Unclaimed;
-                remove(&profile.join(AUTHORIZED_KEYS)).and_then(|()| record.settle(profile))
+                lock(profile, AUTHORIZED_KEYS_LOCK)
+                    .and_then(|_keys| remove(&profile.join(AUTHORIZED_KEYS)))
+                    .and_then(|()| record.settle(profile))
             } else {
                 Ok(())
             };
@@ -943,9 +977,12 @@ fn finish(
         host_key: found.host_key.clone(),
         authorized_keys: profile.join(AUTHORIZED_KEYS),
     };
-    let written = record
-        .save(profile)
-        .and_then(|()| write_private(&profile.join(SERVER_FILE), &serde_json::to_vec(&server)?));
+    let written = record.save(profile).and_then(|()| {
+        let contents = serde_json::to_vec(&server)?;
+        // The runtime reads the description under this lock.
+        let _keys = lock(profile, AUTHORIZED_KEYS_LOCK)?;
+        write_private(&profile.join(SERVER_FILE), &contents)
+    });
     match (written, &install.change) {
         (Err(error), Some(change)) => {
             let failed = restore(system, change, Some(&found.reload), error);
@@ -1476,6 +1513,7 @@ impl ProfileRemoval {
         } else {
             None
         };
+        let _setup = lock(profile, SETUP_LOCK)?;
         // Held to the end: a runtime waiting for it then finds no description and adds no key.
         let _lock = lock(profile, AUTHORIZED_KEYS_LOCK)?;
         let key_file = profile.join(AUTHORIZED_KEYS);
