@@ -10,6 +10,7 @@
 //! the account between check and use.
 
 use std::{
+    cell::LazyCell,
     ffi::{CStr, OsStr},
     fs,
     io::{self, BufRead as _, Write as _},
@@ -29,9 +30,15 @@ use super::{
     setup::{Access, Held, NeedsAdministrator, Reload, Staged, System},
     valid_user,
 };
-use crate::update::{Finished, run_within};
+use crate::{
+    private_group::PrivateGroups,
+    update::{Finished, run_within},
+};
 
 const GROUP_OR_OTHERS_WRITE: u32 = 0o022;
+/// How `sshd -V` names the packaging after the version, for the distributions whose OpenSSH
+/// lets a user private group write (Debian's `user-group-modes` patch).
+const GROUP_MODE_PACKAGES: [&str; 3] = ["Debian-", "Ubuntu-", "Raspbian-"];
 const SERVICES: [&str; 2] = ["ssh.service", "sshd.service"];
 const SOCKETS: [&str; 2] = ["ssh.socket", "sshd.socket"];
 /// What a socket that starts one server for each connection runs.
@@ -91,6 +98,7 @@ pub(super) struct Unix {
     pub macos: bool,
     /// The machine's lock on configuration changes, in a directory only root can write.
     pub lock: PathBuf,
+    pub groups: PrivateGroups,
 }
 
 impl Unix {
@@ -122,6 +130,24 @@ impl Unix {
             tools,
             macos,
             lock: if macos { MAC_LOCK } else { LOCK }.into(),
+            groups: PrivateGroups::SYSTEM,
+        })
+    }
+
+    /// Whether the installed server accepts a directory its owner's private group can write.
+    /// Upstream OpenSSH refuses one, and so does any server that does not show it is
+    /// packaged with the patch that allows it.
+    fn accepts_private_groups(&self) -> bool {
+        // Old servers exit with an error here, after printing their version.
+        run_within(Command::new(&self.tools.sshd).arg("-V"), LIMIT).is_ok_and(|output| {
+            format!("{}{}", output.stdout, output.stderr)
+                .lines()
+                .filter_map(|line| line.strip_prefix("OpenSSH_")?.split_once(' '))
+                .any(|(_, package)| {
+                    GROUP_MODE_PACKAGES
+                        .iter()
+                        .any(|name| package.starts_with(name))
+                })
         })
     }
 
@@ -425,15 +451,21 @@ impl System for Unix {
 
     /// The server's ownership rules (`StrictModes`): every directory from the key file up to
     /// the home directory, or the root, belongs to the account or root and nobody else can
-    /// write to it.
+    /// write to it. Above the private profile, this account's private group may, where the
+    /// server accepts that.
     fn check_key_file(&self, path: &Path) -> Result<()> {
         let directory = path.parent().context("the key file has no directory")?;
+        // Asked at most once, and only about a directory a private group can write.
+        let accepted = LazyCell::new(|| self.accepts_private_groups());
         for part in directory.ancestors() {
             let metadata =
                 fs::metadata(part).with_context(|| format!("check {}", part.display()))?;
             ensure!(
                 (metadata.uid() == self.uid || metadata.uid() == 0)
-                    && metadata.mode() & GROUP_OR_OTHERS_WRITE == 0,
+                    && (metadata.mode() & GROUP_OR_OTHERS_WRITE == 0
+                        || part != directory
+                            && self.groups.allows(part, &metadata, self.uid)
+                            && *accepted),
                 "the SSH server would refuse keys in {}: {} must belong to this account or \
                  root and not be writable by others",
                 directory.display(),

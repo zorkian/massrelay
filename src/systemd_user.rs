@@ -83,9 +83,6 @@ impl Prepared {
         let fragment = property(&shown, "FragmentPath").unwrap_or_default();
         let loaded = (fragment.to_owned(), loaded_commands(&shown));
         let previous = unit_file(&path)?;
-        if was_active {
-            ensure!(previous.is_some(), "an existing service uses {unit}");
-        }
         Ok(Self {
             dir,
             units,
@@ -116,8 +113,7 @@ fn prepare(dir: &Path) -> Result<Prepared> {
 /// An install as shown for confirmation, which displays as the changes it would make.
 pub struct InstallPlan {
     shown: Prepared,
-    /// The runtime the service already runs exactly as this install would set it up, which is
-    /// therefore left running.
+    /// The runtime whose service registration this install leaves alone.
     kept: Option<Identity>,
 }
 
@@ -130,20 +126,24 @@ impl fmt::Display for InstallPlan {
             log,
             binary,
             was_active,
+            was_enabled,
             previous,
             ..
         } = &self.shown;
         if self.keeps() {
-            return write!(
+            write!(
                 formatter,
-                "Keep the systemd user service {unit} running, without a restart: its unit {} \
-                 is already as this install would write it\n\
-                 It runs {} for the profile in {} and records events in {}",
-                path.display(),
-                binary.display(),
-                dir.display(),
-                log.display()
-            );
+                "Keep the systemd user service {unit} running without a restart, using its \
+                 existing registration at {}",
+                path.display()
+            )?;
+            if !was_enabled {
+                write!(
+                    formatter,
+                    "\nSystemd does not report {unit} enabled to start at login"
+                )?;
+            }
+            return Ok(());
         }
         let write = if previous.is_some() {
             "Replace"
@@ -176,7 +176,8 @@ impl InstallPlan {
     }
 
     /// For a command in a session that depends on `runtime`, which has to be this profile's
-    /// service. One that is exactly what this install would make is then left running.
+    /// service. Keep the running registration when it already serves this version or
+    /// when we cannot establish that a restart can be rolled back.
     pub fn carried_by(&mut self, runtime: &Identity) -> Result<()> {
         self.inspect_carrier(runtime, &user_command)
     }
@@ -191,7 +192,6 @@ impl InstallPlan {
             unit,
             path,
             binary,
-            contents,
             log,
             was_active,
             was_enabled,
@@ -210,9 +210,13 @@ impl InstallPlan {
         let shown = succeeded(&args, systemctl(&args)?)?;
         let shown = String::from_utf8_lossy(&shown.stdout);
         ensure!(
-            property(&shown, "MainPID")?.parse() == Ok(runtime.pid),
+            *was_active && property(&shown, "MainPID")?.parse() == Ok(runtime.pid),
             installer::NOT_THE_SERVICE
         );
+        if *was_enabled && installer::is_this_program(runtime, binary) {
+            self.kept = Some(runtime.clone());
+            return Ok(());
+        }
         let running = runtime
             .executable
             .as_deref()
@@ -225,18 +229,8 @@ impl InstallPlan {
             }
             _ => false,
         };
-        ensure!(
-            *loaded_as_written && same_place(Path::new(fragment), path) && rollback,
-            "the saved systemd unit cannot be verified to restore the service carrying this \
-             session. Nothing was changed"
-        );
-        let exact = *was_active
-            && *was_enabled
-            && previous
-                .as_ref()
-                .is_some_and(|file| file.contents == contents.as_bytes())
-            && installer::is_this_program(runtime, binary);
-        self.kept = exact.then(|| runtime.clone());
+        let restorable = *loaded_as_written && same_place(Path::new(fragment), path) && rollback;
+        self.kept = (!restorable).then(|| runtime.clone());
         Ok(())
     }
 
@@ -270,11 +264,22 @@ impl InstallPlan {
         let mut found = Self::new(found);
         found.carried_by(runtime)?;
         ensure!(found.keeps(), INSTALL_CHANGED);
-        let Prepared { dir, unit, log, .. } = found.shown;
+        let Prepared {
+            dir,
+            unit,
+            log,
+            was_enabled,
+            ..
+        } = found.shown;
         crate::update::say(format!(
             "Kept {unit} running\nEvent log       {}",
             log.display()
         ));
+        if !was_enabled {
+            crate::update::say(format!(
+                "Systemd does not report {unit} enabled to start at login"
+            ));
+        }
         Ok(dir)
     }
 
@@ -372,6 +377,10 @@ fn register(
         ..
     } = prepared;
 
+    ensure!(
+        !was_active || previous.is_some(),
+        "an existing service uses {unit}"
+    );
     if !was_active {
         let _lock = cli::claim_owner(&dir).context("stop the foreground massrelay run first")?;
     }
@@ -1517,7 +1526,7 @@ done
     }
 
     #[test]
-    fn a_carried_install_keeps_only_a_service_it_would_not_change() -> Result<()> {
+    fn a_carried_install_restarts_only_if_the_saved_service_can_be_restored() -> Result<()> {
         use std::os::unix::process::ExitStatusExt;
 
         let temp = tempfile::tempdir()?;
@@ -1577,7 +1586,7 @@ done
         write_unit(&path, source.as_bytes())?;
         assert!(carried(true, true, "no", &runtime)?);
         assert!(!carried(true, false, "no", &runtime)?);
-        assert!(carried(true, true, "yes", &runtime).is_err());
+        assert!(carried(true, true, "yes", &runtime)?);
         // An older release, a runtime retiring for an update, and a replaced program, which
         // Linux names as deleted.
         let deleted = format!("{} (deleted)", binary.display());
@@ -1603,7 +1612,7 @@ done
                 ..runtime.clone()
             },
         ] {
-            assert!(carried(true, true, "no", &stale).is_err(), "{stale:?}");
+            assert!(carried(true, true, "no", &stale)?, "{stale:?}");
         }
         // A runtime the service does not run is not replaced from its own session.
         let foreground = Identity {
@@ -1611,19 +1620,29 @@ done
             ..runtime.clone()
         };
         assert!(carried(true, true, "no", &foreground).is_err());
+        assert!(carried(false, true, "no", &runtime).is_err());
+        let older = Identity {
+            version: "0.0.1".into(),
+            ..runtime.clone()
+        };
+        assert!(!carried(true, true, "no", &older)?);
+        assert!(carried(true, true, "yes", &older)?);
         drop_ins.set("/etc/systemd/user/service.d/overrides.conf");
-        assert!(carried(true, true, "no", &runtime).is_err());
+        assert!(carried(true, true, "no", &older)?);
         drop_ins.set("");
         write_unit(
             &path,
             format!("{source}ExecStartPre=/bin/false\n").as_bytes(),
         )?;
-        assert!(carried(true, true, "no", &runtime).is_err());
+        assert!(carried(true, true, "no", &older)?);
         write_unit(
             &path,
             render(&other, &dir, &dir.join("connections.jsonl"))?.as_bytes(),
         )?;
-        assert!(carried(true, true, "no", &runtime).is_err());
+        assert!(carried(true, true, "no", &older)?);
+        fs::remove_file(&path)?;
+        assert!(carried(true, true, "yes", &older)?);
+        write_unit(&path, source.as_bytes())?;
         assert_eq!(fs::read_dir(&units)?.count(), 1);
         Ok(())
     }

@@ -306,8 +306,8 @@ fn own_uid() -> io::Result<u32> {
 }
 
 /// Refuse a directory through which another account could replace what is below it: it must
-/// be a real directory, owned by this account or root, and writable by nobody else unless it
-/// is sticky (where only an entry's owner may replace it).
+/// be a real directory owned by this account or root. It may be group-writable if the
+/// group is private, or sticky where only an entry's owner may replace it.
 #[cfg(unix)]
 fn check_exclusive(dir: &Path, own: u32) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
@@ -324,12 +324,13 @@ fn check_exclusive(dir: &Path, own: u32) -> Result<()> {
     );
     let mode = metadata.mode();
     ensure!(
-        mode & 0o022 == 0 || mode & 0o1000 != 0,
-        "{} can be changed by other accounts (mode {:o}). 'massrelay update' stages and runs \
-         the download below it. Remove that access with 'chmod go-w {}' and run it again",
+        mode & 0o022 == 0
+            || mode & 0o1000 != 0
+            || crate::private_group::private_group_write(dir, &metadata, own),
+        "{} has write permissions that could not be verified as private (mode {:o}). \
+         'massrelay update' stages and runs the download below it",
         dir.display(),
-        mode & 0o7777,
-        dir.display()
+        mode & 0o7777
     );
     Ok(())
 }

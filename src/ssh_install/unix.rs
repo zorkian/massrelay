@@ -3,6 +3,11 @@
 //! The home directory is the password database's, where OpenSSH looks for `~/.ssh`, whatever
 //! `HOME` says. Only this account can create a file it owns, and OpenSSH reads only files
 //! owned by the account or root, so ownership is checked on every file used.
+//!
+//! No other account may be able to write what is used. One exception is a directory on the
+//! way to the profile or to `~/.ssh` that its group can write, when that group is this
+//! account's private group (`private_group`). The private directories and the files are not
+//! excepted.
 
 use std::{
     ffi::{CStr, OsStr},
@@ -20,6 +25,8 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use tempfile::NamedTempFile;
 
+use crate::private_group::PrivateGroups;
+
 /// More than any SSH configuration holds.
 const LIMIT: u64 = 16 * 1024 * 1024;
 const GROUP_OR_OTHERS_WRITE: u32 = 0o022;
@@ -29,6 +36,7 @@ const STICKY: u32 = 0o1000;
 /// The account running the install, which is the one its service runs as.
 pub struct Account {
     uid: u32,
+    pub(super) groups: PrivateGroups,
 }
 
 /// A file as it was read. Equal readings are of the same unchanged file.
@@ -56,7 +64,10 @@ impl Account {
         // SAFETY: these calls have no preconditions and cannot fail.
         let (uid, effective) = unsafe { (libc::getuid(), libc::geteuid()) };
         ensure!(uid == effective, "run massrelay as the account itself");
-        Ok(Self { uid })
+        Ok(Self {
+            uid,
+            groups: PrivateGroups::SYSTEM,
+        })
     }
 
     pub fn home(&self) -> Result<PathBuf> {
@@ -113,7 +124,9 @@ impl Account {
                 part.display()
             );
             ensure!(
-                metadata.mode() & GROUP_OR_OTHERS_WRITE == 0 || metadata.mode() & STICKY != 0,
+                metadata.mode() & GROUP_OR_OTHERS_WRITE == 0
+                    || metadata.mode() & STICKY != 0
+                    || self.groups.allows(part, &metadata, self.uid),
                 "{} is writable by other accounts",
                 part.display()
             );

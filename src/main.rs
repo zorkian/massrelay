@@ -22,6 +22,10 @@ mod mailbox;
 mod mailbox_server;
 #[allow(dead_code)]
 mod private;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+// macOS excuses no group, so it never reads an account database.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+mod private_group;
 #[cfg(unix)]
 mod private_relay;
 #[cfg(unix)]

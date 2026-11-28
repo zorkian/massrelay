@@ -62,7 +62,9 @@ impl Fixture {
 
     /// The uninstall as planned now: what it would show.
     fn removal(&self, state: &Path) -> Result<Removal> {
-        Ok(survey(Account::current()?, &self.home, state))
+        let mut account = Account::current()?;
+        account.groups = self.account.groups;
+        Ok(survey(account, &self.home, state))
     }
 
     fn uninstall(&self, state: &Path) -> Result<()> {
@@ -290,6 +292,78 @@ fn unsafe_files_and_directories_are_refused_unchanged() -> Result<()> {
     assert!(fixture.install(&state).is_err());
     assert_eq!(fs::read_dir(fixture.ssh())?.count(), 0);
     Ok(())
+}
+
+/// The default Linux layout under a umask of 0002: the profile is below
+/// `~/.local/share/massrelay`, and every directory down to there is group-writable.
+#[test]
+#[cfg(target_os = "linux")]
+fn group_writable_directories_pass_only_for_this_accounts_private_group() -> Result<()> {
+    use crate::private_group::{
+        PrivateGroups,
+        tests::{grant_by_acl, private, shared},
+    };
+
+    let mut fixture = Fixture::new()?;
+    let share = fixture.home.join(".local/share");
+    let state = share.join("massrelay");
+    let above = [fixture.home.join(".local"), share.clone(), state.clone()];
+    for directory in &above {
+        private_dir(directory)?;
+    }
+    let above: Vec<_> = above.into_iter().chain([fixture.home.clone()]).collect();
+    for directory in &above {
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o775))?;
+    }
+    let profile = state.join(cli::DIR_NAME);
+    private_dir(&profile)?;
+    let refused = |fixture: &Fixture| {
+        let error = fixture.install(&state).err().context("not refused")?;
+        assert!(
+            format!("{error:#}").contains("writable by other accounts"),
+            "{error:#}"
+        );
+        assert!(!client(&state).exists());
+        anyhow::Ok(())
+    };
+    let chmod = |path: &Path, mode| fs::set_permissions(path, fs::Permissions::from_mode(mode));
+
+    for groups in [shared, |_| None] {
+        fixture.account.groups = PrivateGroups::fixture(groups);
+        refused(&fixture)?;
+        assert!(!fixture.ssh().exists());
+    }
+    fixture.account.groups = PrivateGroups::fixture(private);
+    // Others may write nowhere, and the group may not write the private profile.
+    for (path, unsafe_mode, safe_mode) in [(&share, 0o777, 0o775), (&profile, 0o770, 0o700)] {
+        chmod(path, unsafe_mode)?;
+        refused(&fixture)?;
+        assert!(!fixture.ssh().exists());
+        chmod(path, safe_mode)?;
+    }
+
+    fixture.install(&state)?;
+    for directory in &above {
+        assert_eq!(mode(directory)?, 0o775, "{}", directory.display());
+    }
+    assert_eq!(mode(&profile)?, 0o700);
+    assert_eq!(mode(&client(&state))?, 0o600);
+    fixture.uninstall(&state)?;
+    assert!(fixture.fragments()?.is_empty());
+    assert!(!client(&state).exists());
+
+    // Nor `~/.ssh` and the files, whoever is in the group.
+    chmod(&fixture.ssh(), 0o770)?;
+    refused(&fixture)?;
+    chmod(&fixture.ssh(), 0o700)?;
+    write(&client(&state), b"", 0o660)?;
+    assert!(fixture.install(&state).is_err());
+    assert_eq!(mode(&client(&state))?, 0o660);
+    fs::remove_file(client(&state))?;
+
+    // An access list can let another account write through the group bits.
+    grant_by_acl(&share)?;
+    refused(&fixture)
 }
 
 #[test]

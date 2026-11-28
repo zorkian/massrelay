@@ -1402,14 +1402,25 @@ mod unix {
             assert!(format!("{error:#}").contains(why), "{error:#}");
         };
 
-        // The program's directory can be changed by its group or by everyone.
+        // Group write is acceptable only for a verified private group.
         let (_root, installed, state) = installation();
         let bin = installed.parent().unwrap().to_path_buf();
-        for open in [0o775, 0o757] {
-            chmod(&bin, open);
-            refused(&installed, &state, "can be changed by other accounts");
-            assert!(!bin.join(STAGING).exists(), "nothing was created there");
+        chmod(&bin, 0o775);
+        if crate::private_group::private_group_write(
+            &bin,
+            &fs::metadata(&bin).unwrap(),
+            own_uid().unwrap(),
+        ) {
+            let staging = open(&installed, &state).unwrap();
+            assert_eq!(mode(&staging.dir), 0o700);
+            drop(staging);
+            fs::remove_dir_all(bin.join(STAGING)).unwrap();
+        } else {
+            refused(&installed, &state, "could not be verified as private");
         }
+        chmod(&bin, 0o757);
+        refused(&installed, &state, "could not be verified as private");
+        assert!(!bin.join(STAGING).exists(), "nothing was created there");
         chmod(&bin, 0o755);
 
         // The installed program itself can be rewritten by its group or by everyone, or is a
@@ -1593,10 +1604,8 @@ mod unix {
         };
 
         // The program's own directory is private; one two levels up is not.
-        for open in [0o775, 0o777] {
-            chmod(&outer, open);
-            refused(&installed, "can be changed by other accounts");
-        }
+        chmod(&outer, 0o777);
+        refused(&installed, "could not be verified as private");
         chmod(&outer, 0o755);
 
         // The program is named through a symbolic link to its directory.
@@ -1615,7 +1624,7 @@ mod unix {
         let staging = open(&installed, &state).unwrap();
         chmod(&outer, 0o777);
         let error = Staging::check(&staging.dir).unwrap_err();
-        assert!(format!("{error:#}").contains("can be changed by other accounts"));
+        assert!(format!("{error:#}").contains("could not be verified as private"));
         chmod(&outer, 0o755);
     }
 
