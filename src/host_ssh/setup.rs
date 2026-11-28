@@ -236,8 +236,7 @@ fn effective(
         .to_str()
         .context("the configuration's path is not Unicode")?;
     let arguments = ["-T", "-f", path, "-C", &connection.argument()].map(str::to_owned);
-    // Windows ends each line with a carriage return too.
-    Ok(system.sshd(&arguments, access)?.replace("\r\n", "\n"))
+    Ok(config::effective_output(&system.sshd(&arguments, access)?))
 }
 
 /// What the server must say about a staged configuration.

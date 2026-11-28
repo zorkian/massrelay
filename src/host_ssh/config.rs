@@ -291,7 +291,25 @@ pub(super) fn matches(pattern: &str, name: &str) -> bool {
     pattern[p..].iter().all(|&c| c == '*')
 }
 
-/// The values of a setting in `sshd -T` output.
+/// Normalize directive names in `sshd -T` output. OpenSSH 10.4 uses mixed-case names,
+/// and Windows uses CRLF. Keep values verbatim for the staged configuration comparison.
+pub(super) fn effective_output(output: &str) -> String {
+    let mut normalized = String::with_capacity(output.len());
+    for line in output.split_inclusive('\n') {
+        let crlf = line.strip_suffix("\r\n");
+        let line = crlf.unwrap_or(line);
+        let start = normalized.len();
+        normalized.push_str(line);
+        let name_end = line.find(char::is_whitespace).unwrap_or(line.len());
+        normalized[start..start + name_end].make_ascii_lowercase();
+        if crlf.is_some() {
+            normalized.push('\n');
+        }
+    }
+    normalized
+}
+
+/// The values of a setting in normalized `sshd -T` output.
 pub(super) fn settings<'a>(output: &'a str, key: &'a str) -> impl Iterator<Item = &'a str> {
     output
         .lines()

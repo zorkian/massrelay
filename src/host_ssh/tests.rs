@@ -208,15 +208,17 @@ impl Fixture {
     /// The ssh.service unit, with `options` in its environment file.
     fn service(&self, options: &str) -> Result<()> {
         let root = self.root();
+        let sshd = self.system().tools.sshd;
         fs::write(root.join("default-ssh"), format!("SSHD_OPTS={options}\n"))?;
         fs::write(
             root.join("ssh.service"),
             format!(
                 "LoadState=loaded\nActiveState=active\nMainPID=0\n\
-                 ExecStart={{ path=/usr/sbin/sshd ; argv[]=/usr/sbin/sshd -D $SSHD_OPTS ; \
+                 ExecStart={{ path={sshd} ; argv[]={sshd} -D $SSHD_OPTS ; \
                  ignore_errors=no }}\n\
                  EnvironmentFiles={}/default-ssh (ignore_errors=yes)\n",
-                root.display()
+                root.display(),
+                sshd = sshd.display()
             ),
         )?;
         Ok(())
@@ -241,6 +243,7 @@ impl Fixture {
     fn system(&self) -> Box<Unix> {
         let root = self.root();
         let bin = root.join("bin");
+        let fixture_sshd = bin.join("sshd");
         // SAFETY: geteuid is infallible and has no preconditions.
         let uid = unsafe { libc::geteuid() };
         Box::new(Unix {
@@ -253,7 +256,11 @@ impl Fixture {
                 sudo: bin.join("sudo"),
                 systemctl: bin.join("systemctl"),
                 keyscan: bin.join("ssh-keyscan"),
-                ..Tools::default()
+                sshd: if fixture_sshd.is_file() {
+                    fixture_sshd
+                } else {
+                    Tools::default().sshd
+                },
             },
             macos: false,
             lock: root.join("run/massrelay-sshd.lock"),
@@ -287,7 +294,7 @@ impl Fixture {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        Ok(String::from_utf8(output.stdout)?)
+        Ok(config::effective_output(&String::from_utf8(output.stdout)?))
     }
 
     fn loopback(&self) -> Result<String> {
@@ -355,6 +362,49 @@ impl Fixture {
         }
         assert!(!self.root().join("run/massrelay-sshd.lock").exists());
     }
+}
+
+#[test]
+#[ignore = "needs the system OpenSSH server"]
+fn mixed_case_sshd_output_preserves_the_existing_key_lookup() -> Result<()> {
+    const COMMAND: &str = "/bin/true SSH-Key-Lookup %u";
+    let fixture = Fixture::new(&format!(
+        "AuthorizedKeysFile .ssh/authorized_keys\nAuthorizedKeysCommand {COMMAND}\n\
+         AuthorizedKeysCommandUser {}\n",
+        user()
+    ))?;
+    // Older sshd versions can exercise the same installer path as OpenSSH 10.4.
+    // Change only the names in the real server's dump, leaving every value intact.
+    script(
+        &fixture.root().join("bin/sshd"),
+        &fixture.root(),
+        r#"
+dump=$(/usr/sbin/sshd "$@") || exit $?
+[ -z "$dump" ] || printf '%s\n' "$dump" |
+    awk '{ sub(/^[^[:space:]]+/, toupper($1)); print }'
+"#,
+    )?;
+    fixture.service("")?;
+    let profile = fixture.profile("state")?;
+    let original = fixture.contents();
+    let direct = fixture.remote()?;
+    fixture.install(&profile)?.apply()?;
+    let loopback = fixture.loopback()?;
+    assert_eq!(
+        config::setting(&loopback, "authorizedkeyscommand"),
+        Some(COMMAND)
+    );
+    assert_eq!(
+        fixture.key_files()?,
+        format!(
+            ".ssh/authorized_keys {}",
+            profile.join(AUTHORIZED_KEYS).display()
+        )
+    );
+    assert_eq!(fixture.remote()?, direct);
+    fixture.uninstall(&profile)?.apply()?;
+    assert_eq!(fixture.contents(), original);
+    Ok(())
 }
 
 fn refused<T>(result: Result<T>, why: &str) {
